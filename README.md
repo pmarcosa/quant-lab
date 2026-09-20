@@ -49,6 +49,9 @@ removes *timing* bias, not *selection* bias. A real survivorship-free universe i
 a data-vendor problem, not a code problem, and the docstring says so where
 someone will actually read it.
 
+**[docs/MANUAL.md](docs/MANUAL.md)** is the operating manual: every command, how
+to expand the universe, and an honest list of what is not built.
+
 ## One decision path
 
 A backtest and a live session are not two implementations kept in agreement. They

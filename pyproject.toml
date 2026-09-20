@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quant-lab"
+version = "0.1.0"
+description = "A trading system framework: many strategies, one set of rigorously shared modules."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "ruff>=0.5"]
+ibkr = ["ib_async>=1.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["contracts", "access", "data", "strategies", "engine", "risk", "validation", "execution", "runtime", "reports"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RET"]
+ignore = ["E501"]

@@ -123,6 +123,7 @@ def run_once(
     run: RunId,
     costs: CostModel,
     policy: SizingPolicy,
+    supervisor=None,
 ) -> RunResult:
     """One backtest. The only way research runs anything."""
     portfolio = PortfolioId(TenantId("user"), "research")
@@ -137,6 +138,8 @@ def run_once(
         execution_at=market.window.opens_at,
         broker=broker,
         tradable_at=market.window.fresh_at,
+        lows_at=market.window.lows_at,
+        supervisor=supervisor,
         policy=policy,
     )
 
@@ -158,6 +161,7 @@ def evaluate(
     costs: CostModel,
     policy: SizingPolicy,
     note: str = "",
+    supervisor=None,
 ) -> tuple[RunResult | None, np.ndarray]:
     """Run a backtest and record it. There is no variant that skips the record.
 
@@ -171,7 +175,13 @@ def evaluate(
         return None, np.asarray(already.returns, dtype=float)
 
     result = run_once(
-        market, strategy, schedule, RunId(f"r{abs(hash(label)) % 10**9}"), costs, policy
+        market,
+        strategy,
+        schedule,
+        RunId(f"r{abs(hash(label)) % 10**9}"),
+        costs,
+        policy,
+        supervisor=supervisor,
     )
     returns = periodic_returns(result)
     deviation = float(returns.std(ddof=1)) if returns.size > 1 else 0.0

@@ -23,6 +23,7 @@ from engine.accounting import Book  # noqa: E402
 from engine.decide import SizingPolicy  # noqa: E402
 from engine.run import run_backtest  # noqa: E402
 from execution.simulated import CostModel, SimulatedBroker  # noqa: E402
+from risk.rules import GrossExposureLimit, ProtectiveStop, RiskSupervisor  # noqa: E402
 from runtime.wiring import load_market  # noqa: E402
 from strategies.momentum import MomentumParams, WeeklyMomentum  # noqa: E402
 from validation.metrics import summarise  # noqa: E402
@@ -42,6 +43,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cash-buffer", type=float, default=0.01)
     parser.add_argument("--min-trade", type=float, default=0.005)
     parser.add_argument("--start", default=None, help="Earliest decision date, ISO")
+    parser.add_argument(
+        "--stop", type=float, default=0.12,
+        help="Protective stop distance, anchored to the rotation price. 0 disables it.",
+    )
     parser.add_argument(
         "--rebalance-weeks", type=int, default=1,
         help="Weeks between rotations. The book is marked every week regardless.",
@@ -69,6 +74,10 @@ def main(argv: list[str] | None = None) -> int:
         costs=CostModel(commission_bps=args.cost_bps, slippage_bps=args.slippage_bps)
     )
 
+    supervisor = RiskSupervisor(
+        rules=(GrossExposureLimit(maximum=1.0),),
+        stop=ProtectiveStop(distance=args.stop) if args.stop > 0 else None,
+    )
     result = run_backtest(
         run=RunId(f"bt-{args.freq}-{args.rebalance_weeks}"),
         opening=Book.opening(portfolio, args.capital, schedule[0]),
@@ -78,6 +87,8 @@ def main(argv: list[str] | None = None) -> int:
         marks_at=market.window.marks_at,
         execution_at=market.window.opens_at,
         tradable_at=market.window.fresh_at,
+        lows_at=market.window.lows_at,
+        supervisor=supervisor,
         broker=broker,
         policy=SizingPolicy(
             cash_buffer=args.cash_buffer, min_trade_fraction=args.min_trade
@@ -94,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"orders     {sum(len(s.intents) for s in result.steps):,}")
     print(f"fills      {len(result.all_fills()):,}")
     print(f"unfilled   {broker.unfilled:,} (no print at the execution bar)")
+    if args.stop > 0:
+        print(f"stops hit  {result.stops_fired():,} at {args.stop:.0%} from the rotation price")
     print()
     print(f"{'years':<14}{stats.years:>12.2f}")
     print(f"{'CAGR':<14}{stats.cagr:>11.1%}")

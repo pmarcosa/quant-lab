@@ -56,6 +56,7 @@ class MarketWindow:
 
     opens: pd.DataFrame
     closes: pd.DataFrame
+    lows: pd.DataFrame
     fresh: pd.DataFrame
     index: tuple[datetime, ...]
     schedule: tuple[datetime, ...]
@@ -79,10 +80,11 @@ class MarketWindow:
         horizon = utc(horizon)
         opens: dict[str, pd.Series] = {}
         closes: dict[str, pd.Series] = {}
+        lows: dict[str, pd.Series] = {}
         stamps: dict[tuple[int, int], list[pd.Timestamp]] = {}
 
         for instrument in universe.survivors_only():
-            known = store.as_of(instrument, horizon, fields=["open", "close"])
+            known = store.as_of(instrument, horizon, fields=["open", "low", "close"])
             if known.empty:
                 continue
             iso = known.index.isocalendar()
@@ -93,6 +95,7 @@ class MarketWindow:
             frame = frame[~frame["_week"].duplicated(keep="last")]
             index = pd.MultiIndex.from_tuples(list(frame["_week"]), names=("year", "week"))
             opens[str(instrument)] = pd.Series(frame["open"].astype(float).values, index=index)
+            lows[str(instrument)] = pd.Series(frame["low"].astype(float).values, index=index)
             closes[str(instrument)] = pd.Series(frame["close"].astype(float).values, index=index)
             for week, stamp in zip(index, frame.index, strict=True):
                 stamps.setdefault(week, []).append(stamp)
@@ -102,6 +105,7 @@ class MarketWindow:
 
         close_frame = pd.DataFrame(closes).sort_index()
         open_frame = pd.DataFrame(opens).reindex(close_frame.index)
+        low_frame = pd.DataFrame(lows).reindex(close_frame.index)
         fresh = close_frame.notna() & (close_frame > 0)
 
         # One decision moment per week, at the last close that week plus the
@@ -119,6 +123,7 @@ class MarketWindow:
         return cls(
             opens=open_frame,
             closes=close_frame.ffill(),
+            lows=low_frame,
             fresh=fresh,
             index=index,
             schedule=schedule,
@@ -148,6 +153,21 @@ class MarketWindow:
         """Instruments that actually printed a bar this week, and so may trade."""
         row = self.fresh.iloc[self._position(moment)]
         return frozenset(InstrumentId(name) for name, ok in row.items() if bool(ok))
+
+    def lows_at(self, moment: datetime) -> Mapping[InstrumentId, float]:
+        """The bar's lows: what a resting stop is triggered against.
+
+        A stop is a price the market has to *touch*, not one it has to close at.
+        Checking only opens and closes misses most of the weeks a stop would
+        actually have fired, which makes a backtest with stops look more like one
+        without them.
+        """
+        row = self.lows.iloc[self._position(moment)]
+        return {
+            InstrumentId(name): float(value)
+            for name, value in row.items()
+            if pd.notna(value) and value > 0
+        }
 
     def opens_at(self, moment: datetime) -> Mapping[InstrumentId, float]:
         """Opening prices of this week's bar: where orders fill.

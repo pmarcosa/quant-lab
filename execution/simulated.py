@@ -36,6 +36,7 @@ from contracts.execution import (
     OrderType,
     PositionLedgerEntry,
     Side,
+    TimeInForce,
 )
 from contracts.identifiers import InstrumentId, PortfolioId
 from contracts.temporal import utc
@@ -197,7 +198,12 @@ class SimulatedBroker:
 
     # -- the simulation ----------------------------------------------------
 
-    def advance(self, moment: datetime, prices: Mapping[InstrumentId, float]) -> tuple[Fill, ...]:
+    def advance(
+        self,
+        moment: datetime,
+        prices: Mapping[InstrumentId, float],
+        lows: Mapping[InstrumentId, float] | None = None,
+    ) -> tuple[Fill, ...]:
         """Move the market forward and fill everything working.
 
         Args:
@@ -228,6 +234,11 @@ class SimulatedBroker:
                 continue  # not yet in the market
             reference = prices.get(intent.instrument)
             if reference is None or not (reference > 0):
+                if intent.time_in_force is TimeInForce.GTC:
+                    # A resting order outlives a bar with no print. Cancelling it
+                    # would quietly remove a protective stop on exactly the
+                    # instrument that has stopped trading.
+                    continue
                 # No print, no fill. The third option -- transacting at the last
                 # known price -- is the one that must never happen: it invents
                 # liquidity exactly where there was none, and it does so in the
@@ -244,6 +255,13 @@ class SimulatedBroker:
                 self.unfilled += 1
                 continue
             rules = self.constraints(intent.instrument)
+
+            if intent.order_type is OrderType.STOP:
+                touched = self._stop_touched(intent, reference, lows)
+                if touched is None:
+                    continue  # rests until it is hit or cancelled
+                reference = touched
+
             price = rules.round_price(self.costs.fill_price(reference, intent.side))
             commission = self.costs.commission(intent.quantity, price)
             fill = Fill(
@@ -266,6 +284,36 @@ class SimulatedBroker:
             )
             self._record(intent.portfolio, fill)
         return tuple(fills)
+
+    def _stop_touched(
+        self,
+        intent: OrderIntent,
+        open_price: float,
+        lows: Mapping[InstrumentId, float] | None,
+    ) -> float | None:
+        """The price a resting stop would fill at this bar, or None if untouched.
+
+        Gap handling is the part that matters. If the bar opens *below* a sell
+        stop, the stop did not fill at its level — the market was already past it
+        when trading started, and the honest fill is the open. Filling a gapped
+        stop at its trigger price credits the backtest with an exit that nobody
+        could have got, and it does so precisely in the crashes the stop exists
+        for, which is where the error is largest.
+        """
+        level = intent.stop_price
+        if level is None:  # pragma: no cover - OrderIntent refuses this
+            return None
+        low = None if lows is None else lows.get(intent.instrument)
+
+        if intent.side is Side.SELL:
+            if open_price <= level:
+                return open_price
+            if low is not None and low <= level:
+                return level
+            return None
+        if open_price >= level:
+            return open_price
+        return None
 
     def _record(self, portfolio: PortfolioId, fill: Fill) -> None:
         """Keep the broker's own view of positions, for reconciliation."""

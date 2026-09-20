@@ -22,10 +22,12 @@ from __future__ import annotations
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Protocol
 
 from contracts.errors import ContractViolation
-from contracts.execution import Fill, OrderIntent
+from contracts.execution import Fill, OrderIntent, Side
 from contracts.identifiers import InstrumentId, PortfolioId, RunId
+from contracts.risk import PositionRisk, RiskReview
 from contracts.strategy import Strategy
 from contracts.temporal import Filtration, utc
 from engine.accounting import Book
@@ -42,6 +44,34 @@ PricesAt = Callable[[datetime], Mapping[InstrumentId, float]]
 TradableAt = Callable[[datetime], Collection[InstrumentId]]
 
 
+class RiskSupervision(Protocol):
+    """What the engine needs from a risk layer, and nothing more.
+
+    Declared here as a structural type rather than imported from ``risk/`` so the
+    engine keeps depending on contracts alone: a second risk implementation is a
+    new class, not a change to the loop.
+    """
+
+    def review(
+        self,
+        intents: Sequence[OrderIntent],
+        positions: Mapping[InstrumentId, PositionRisk],
+        equity: float,
+    ) -> RiskReview:
+        ...
+
+    def protective_orders(
+        self,
+        positions: Mapping[InstrumentId, PositionRisk],
+        run: RunId,
+        portfolio: PortfolioId,
+        decision: Decision,
+        constraints_for,
+    ) -> Sequence[OrderIntent]:
+        """Resting orders to place after a rotation. May be empty."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class Step:
     """One decision and everything that followed from it."""
@@ -52,6 +82,8 @@ class Step:
     book_after: Book
     equity_after: float
     marked_at: datetime
+    stopped_out: tuple[str, ...] = ()
+    risk_findings: tuple[str, ...] = ()
 
     @property
     def intents(self) -> tuple[OrderIntent, ...]:
@@ -82,6 +114,10 @@ class RunResult:
     def all_fills(self) -> tuple[Fill, ...]:
         return tuple(f for step in self.steps for f in step.fills)
 
+    def stops_fired(self) -> int:
+        """How many positions a protective stop closed."""
+        return sum(len(step.stopped_out) for step in self.steps)
+
     def decisions(self) -> tuple[Decision, ...]:
         return tuple(step.decision for step in self.steps)
 
@@ -97,6 +133,8 @@ def run_backtest(
     execution_at: PricesAt,
     broker,
     tradable_at: TradableAt | None = None,
+    lows_at: PricesAt | None = None,
+    supervisor: RiskSupervision | None = None,
     policy: SizingPolicy = DEFAULT_SIZING,
 ) -> RunResult:
     """Run ``strategy`` over ``schedule``, one decision per entry.
@@ -112,6 +150,10 @@ def run_backtest(
             the moment after the decision.
         broker: An ``ExecutionPort``. The simulator and a real adapter are
             interchangeable here, which is the point.
+        lows_at: The bar's lows, so resting stops can be triggered on a price the
+            market touched rather than only on one it closed at.
+        supervisor: Optional risk layer. It sees each decision before the orders
+            are sent and may only reduce exposure; the contract enforces that.
         policy: Sizing rules.
 
     Returns:
@@ -131,6 +173,17 @@ def run_backtest(
 
     book = opening
     steps: list[Step] = []
+    # The price each position's stop is measured from. Set at the rotation that
+    # opened or renewed it, and never from the average cost -- see
+    # risk.rules.ProtectiveStop for why that distinction is load-bearing.
+    anchors: dict[InstrumentId, float] = {}
+    # Closed by a stop since the last rotation. These may not be re-entered
+    # before the next one: a stop followed by an immediate re-entry is a round
+    # trip that pays costs and protects nothing.
+    stopped_since_rotation: set[InstrumentId] = set()
+    # Stop order id to instrument. The engine tracks this itself rather than
+    # asking the broker, so the execution port stays as narrow as it is.
+    resting_stops: dict[str, InstrumentId] = {}
     opening_equity = opening.equity(
         {i: marks_at(opening.as_of)[i] for i in opening.positions}
     )
@@ -145,7 +198,7 @@ def run_backtest(
             filtration=filtration,
             marks=marks,
             constraints_for=broker.constraints,
-            tradable=None if tradable_at is None else tradable_at(moment),
+            tradable=_tradable(tradable_at, moment, marks, stopped_since_rotation),
             policy=policy,
         )
 
@@ -156,15 +209,72 @@ def run_backtest(
         execution_time = moments[index + 1] if has_next else moment
         before = book
 
+        # The risk layer sees the decision before anything is sent. It may only
+        # reduce exposure; RiskReview refuses anything else.
+        findings: tuple[str, ...] = ()
+        intents = decision.intents
+        rotated = bool(decision.target.diagnostics.get("rotated", 1.0))
+        if supervisor is not None:
+            exposure = _position_risk(book.at(moment), marks, anchors)
+            review = supervisor.review(intents, exposure, decision.equity)
+            intents = review.approved
+            findings = tuple(f.line() for f in review.findings)
+
+        # Cancel-replace, in that order. A resting stop and a rotation's own sell
+        # are two orders to sell the same shares: if both reach the market the
+        # position goes short, which is how a long-only system acquires a short
+        # book without anyone deciding to.
+        selling = {i.instrument for i in intents if i.side is Side.SELL}
+        for oid, instrument in list(resting_stops.items()):
+            if instrument in selling:
+                broker.cancel(oid)
+                resting_stops.pop(oid, None)
+
         fills: tuple[Fill, ...] = ()
-        if decision.intents and has_next:
-            for intent in decision.intents:
-                broker.submit(intent)
-            fills = broker.advance(execution_time, execution_at(execution_time))
+        for intent in intents:
+            broker.submit(intent)
+        if has_next:
+            lows = None if lows_at is None else lows_at(execution_time)
+            fills = broker.advance(execution_time, execution_at(execution_time), lows)
             book = book.at(execution_time).apply_all(fills)
-        elif decision.intents:
-            for intent in decision.intents:
+
+        stopped = tuple(
+            str(f.instrument) for f in fills if f.client_order_id.endswith("-stop")
+        )
+        for oid in [f.client_order_id for f in fills if f.client_order_id in resting_stops]:
+            resting_stops.pop(oid, None)
+        for name in stopped:
+            stopped_since_rotation.add(InstrumentId(name))
+            # A position closed by a risk mechanism stays closed. Re-entering it
+            # on the next bar because the strategy still likes it turns a stop
+            # into a round trip with costs and no protection. It becomes a
+            # candidate again at the next rotation, like anything else.
+            anchors.pop(InstrumentId(name), None)
+
+        # Stops rest at the broker between rotations and are replaced at each
+        # one, at the new anchor. Leaving an old stop in place would be
+        # protecting a price that is no longer relevant.
+        if rotated:
+            stopped_since_rotation.clear()
+        if supervisor is not None and rotated and has_next:
+            for oid in list(resting_stops):
+                broker.cancel(oid)
+            resting_stops.clear()
+            fill_prices = execution_at(execution_time)
+            for instrument, position in book.positions.items():
+                anchors[instrument] = _anchor_price(
+                    instrument, fill_prices, position.average_cost
+                )
+            marks_now = {**fill_prices, **{i: anchors[i] for i in book.positions}}
+            for intent in supervisor.protective_orders(
+                _position_risk(book, marks_now, anchors),
+                run,
+                book.portfolio,
+                decision,
+                broker.constraints,
+            ):
                 broker.submit(intent)
+                resting_stops[intent.client_order_id] = intent.instrument
 
         marked_at = execution_time if has_next else moment
         prices = execution_at(marked_at) if has_next else marks
@@ -174,14 +284,65 @@ def run_backtest(
                 fills=fills,
                 book_before=before,
                 book_after=book,
-                equity_after=book.equity({i: prices[i] for i in book.positions}),
+                equity_after=book.equity(
+                    {i: prices.get(i, marks[i]) for i in book.positions}
+                ),
                 marked_at=marked_at,
+                stopped_out=stopped,
+                risk_findings=findings,
             )
         )
 
     return RunResult(
         run=run, portfolio=opening.portfolio, steps=tuple(steps), opening_equity=opening_equity
     )
+
+
+def _tradable(
+    tradable_at: TradableAt | None,
+    moment: datetime,
+    marks: Mapping[InstrumentId, float],
+    blocked: Collection[InstrumentId],
+) -> Collection[InstrumentId] | None:
+    """What may be traded now, minus anything a stop just closed."""
+    base = set(marks) if tradable_at is None else set(tradable_at(moment))
+    return base - set(blocked)
+
+
+def _position_risk(
+    book: Book,
+    marks: Mapping[InstrumentId, float],
+    anchors: Mapping[InstrumentId, float],
+) -> dict[InstrumentId, PositionRisk]:
+    """The view of the book a risk rule gets: quantities, marks, weights, anchors."""
+    missing = sorted(str(i) for i in book.positions if i not in marks)
+    if missing:
+        # Guessing a mark here is exactly the silent approximation this layer
+        # exists to prevent.
+        raise ContractViolation(f"cannot assess risk without marks for {missing}")
+    priced = {i: marks[i] for i in book.positions}
+    equity = book.equity(priced)
+    return {
+        instrument: PositionRisk(
+            instrument=instrument,
+            quantity=position.quantity,
+            average_cost=position.average_cost,
+            mark=priced[instrument],
+            weight=(
+                position.market_value(priced[instrument]) / equity if equity > 0 else 0.0
+            ),
+            anchor=anchors.get(instrument),
+        )
+        for instrument, position in book.positions.items()
+    }
+
+
+def _anchor_price(
+    instrument: InstrumentId, prices: Mapping[InstrumentId, float], fallback: float
+) -> float:
+    """The rotation price; the cost basis only when this bar has no print."""
+    price = prices.get(instrument)
+    return float(price) if price and price > 0 else float(fallback)
 
 
 def propose(

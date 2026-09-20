@@ -10,9 +10,10 @@ a universe assembled with hindsight, a live path that quietly takes a shortcut t
 backtest never exercised. So the framework makes the seam between them a single
 object (a `Filtration`) instead of a convention people remember to follow.
 
-Status: **phases 0, 1 and 2 complete** — the contracts and data layer, then the
-engine, a broker adapter and the first strategy. Risk machinery and the
-falsification funnel are next; execution stays proposal-only throughout.
+Status: **phases 0–4 complete** — contracts and data, the engine, the
+falsification funnel and research ledger, and a risk layer that may only reduce
+exposure. Execution stays proposal-only throughout: the system does not send
+orders.
 
 ## What is guaranteed today
 
@@ -23,8 +24,10 @@ pip install -e ".[dev]"
 python scripts/ingest_ibkr_cache.py       # builds var/store from the committed CSVs
 python scripts/demo_causality.py          # asserts the guarantees on that real data
 python scripts/reconcile_conventions.py   # prices the execution conventions
-python scripts/backtest_momentum.py --freq weekly --every 4 --start 2009-02-24
-pytest -q                                 # 196 tests
+python scripts/run_funnel.py              # five gates, on the real data
+python scripts/compare_stops.py           # what a protective stop actually buys
+python scripts/backtest_momentum.py --freq weekly --rebalance-weeks 4 --start 2009-02-24
+pytest -q                                 # 303 tests
 ```
 
 `demo_causality.py` proves three things against 17 years of real IBKR bars:
@@ -79,10 +82,10 @@ runs both conventions through this same engine over 17 years of real bars:
 
 | convention | CAGR | Sharpe | max drawdown |
 |---|---|---|---|
-| fill at the decision bar's close | 27.0% | 1.23 | −21.1% |
-| fill at the next bar's open | 20.2% | 0.88 | −49.3% |
+| fill at the decision bar's close | 27.5% | 1.23 | −20.0% |
+| fill at the next bar's open | 27.1% | 1.13 | −26.2% |
 
-Nearly seven points of annual return and more than half the reported drawdown.
+Half a point of annual return, and six points of drawdown that were never there.
 The previous system used the first convention. The script asserts the direction
 so it stays a regression rather than an anecdote, and runs in CI.
 
@@ -160,18 +163,83 @@ which is the one restatement that actually happens to IBKR data, and the only
 honest way to backtest across one is to be able to ask what the series looked
 like *before* it was rewritten.
 
+## The funnel
+
+Five gates, fixed in the design before any of them ran, which is the only honest
+time to fix a threshold. `scripts/run_funnel.py` runs all of them on the real
+data and writes every trial to the research ledger first.
+
+| gate | verdict | detail |
+|---|---|---|
+| 1. monkey test | pass | 100% of 60 random controls, p=0.000 |
+| 2. CPCV purged + embargoed | pass | 0% negative of 252 folds |
+| 3. walk-forward efficiency | pass | WFE 0.95 over 14 windows |
+| 4a. deflated Sharpe | pass | DSR 0.999 at N_eff 47.2 |
+| 4b. probability of overfitting | pass | PBO 1.2% over 252 partitions |
+| 5. jitter, noise, slippage | pass | 100% kept half the baseline |
+
+Two caveats belong next to that PASS rather than in a footnote. The universe was
+assembled in 2026 and holds no delisted names, so gate 1 neutralises selection
+bias *within* the universe and not the universe's own construction. And the forty
+configurations tried before the ledger existed have no recoverable return series,
+so they are counted at face value rather than de-correlated.
+
+### The ledger
+
+The DSR needs to know how many strategies were tried before the winner was
+chosen, and that number cannot be reconstructed afterwards: nobody remembers the
+configurations that looked bad and were dropped, and those are exactly the ones
+that make the survivor look good. So `validation/ledger.py` has no `skip`, no
+`delete` and no filter. The only way to evaluate a strategy is through
+`Study.evaluate`, and the only way to avoid recording a trial is not to run it.
+
+Hyperparameter optimisation comes after the ledger, never before: optimising
+without a trial count leaves the DSR uncomputable for that line of research,
+permanently.
+
+## Risk
+
+`risk/` may **only reduce exposure**, and the contract enforces it. It may drop
+or shrink a buy, and it may add a sell that closes a position. It may never add a
+buy, and it may never shrink or drop a sell — a sell here is an exit, and
+watering one down leaves exposure on, which is an increase wearing a limit's
+clothes. `RiskReview.__post_init__` refuses all three, so a new rule cannot break
+the invariant by being written carelessly.
+
+The protective stop rests **at the broker**, not in the process: if the machine
+running this is off, the positions are still protected. It is a fixed 12% — the
+same distance for a calm instrument and a volatile one, because volatility enters
+through position *size* — and it is anchored to the **rotation price, never the
+average cost**. Measured on the live book, a stop set from AAPL's average cost
+sat 47% below the market and protected nothing, while one from DIS's sat above
+the market and would have sold immediately. Average cost is information about the
+holder's past, not the instrument's future.
+
+A position a stop closes **stays closed** until the next rotation. And a resting
+stop is cancelled before a rotation's own sell reaches the market, because two
+orders to sell the same shares take a long-only book short.
+
+### What the stop is worth
+
+`scripts/compare_stops.py`, 2009–2026:
+
+| stop | CAGR | Sharpe | max drawdown | stops fired |
+|---|---|---|---|---|
+| none | 25.1% | 1.10 | −25.2% | 0 |
+| fixed 8% | 20.7% | 1.03 | −26.3% | 185 |
+| fixed 10% | 22.3% | 1.05 | −22.6% | 130 |
+| fixed 12% | 23.4% | 1.08 | −24.0% | 90 |
+| fixed 15% | 21.9% | 1.01 | −24.6% | 63 |
+| fixed 20% | 24.0% | 1.09 | −23.4% | 19 |
+
+On this engine the stop does not pay for itself: every distance costs return, and
+the deepest drawdown improves by at most 2.5 points — with one distance (8%)
+making it *worse*. The ordering across distances is not monotonic, which is what
+noise looks like. The default is 12% because that is what the live system runs;
+whether to keep it is a judgement about sleeping at night, not a number this
+table settles.
+
 ## What is not here yet
 
-**Phase 3** is the falsification funnel and the research ledger. Hyperparameter
-optimisation comes after the ledger exists, not before: optimisation without a
-count of trials is how a system discovers something that was never there.
-
-**Phase 4** is risk machinery — protective stops among it. Today's numbers carry
-no stop, which is why the honest drawdown above is −49%. The exit *rules* (trend
-break, RSI reversion, drawdown from the rolling high) belong to the strategy and
-are implemented; a protective stop is a risk mechanism and belongs in `risk/`.
-
-**Phase 5** is paper trading and autonomy.
-
-Execution stays proposal-plus-manual-approval throughout. The system does not
-send orders.
+**Phase 5** is paper trading and autonomy. Execution stays
+proposal-plus-manual-approval throughout. The system does not send orders.

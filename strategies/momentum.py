@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -38,6 +38,12 @@ from contracts.temporal import BarInterval, Filtration, FiltrationSpec
 from strategies.sizing import capped_proportional
 
 STRATEGY_NAME = "weekly-momentum"
+
+#: A fixed Monday, so "which week is this" is a function of the decision time
+#: alone. Counting bars from the start of a run would make the rotation phase
+#: depend on where the run began, and two runs over overlapping windows would
+#: rotate on different weeks -- which is a silent difference, not a visible one.
+CADENCE_EPOCH = datetime(1999, 1, 4, tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +75,8 @@ class MomentumParams:
         high_drawdown_exit: Fraction below the rolling high that forces an exit.
         weight_floor_mult: Lower weight bound, as a multiple of equal weight.
         weight_cap_mult: Upper weight bound, as a multiple of equal weight.
+        rebalance_weeks: Weeks between rotations. Between them the strategy holds
+            what it holds; it does not go to cash and it does not re-rank.
     """
 
     lookback_weeks: int = 13
@@ -88,8 +96,13 @@ class MomentumParams:
     high_drawdown_exit: float = 0.12
     weight_floor_mult: float = 0.5
     weight_cap_mult: float = 2.0
+    rebalance_weeks: int = 1
 
     def __post_init__(self) -> None:
+        if self.rebalance_weeks < 1:
+            raise ContractViolation(
+                f"rebalance_weeks must be at least 1; got {self.rebalance_weeks}"
+            )
         if self.top_n < 1:
             raise ContractViolation(f"top_n must be at least 1; got {self.top_n}")
         if not 0.0 <= self.weight_floor_mult <= 1.0 <= self.weight_cap_mult:
@@ -218,12 +231,36 @@ def exit_reason(row: Mapping[str, float], params: MomentumParams) -> str | None:
     return None
 
 
+#: Ask the filtration for everything it knows. Wilder smoothing is recursive, so
+#: an indicator computed over a short trailing window differs from the same
+#: indicator computed over the full history -- by little, but these rules are
+#: threshold comparisons, and a small difference changes which weeks qualify.
+FULL_HISTORY = 1_000_000
+
+
 @dataclass(frozen=True, slots=True)
 class WeeklyMomentum:
-    """The strategy. Deterministic: same filtration and holdings, same target."""
+    """The strategy. Deterministic: same filtration and holdings, same target.
+
+    ``precomputed`` is a per-run optimisation and nothing more. Recomputing every
+    instrument's indicators at every decision time is 35,000 passes over a
+    900-bar series for one 17-year run, which makes a funnel of seventy-five
+    runs take half an hour. When a caller supplies frames covering the whole run,
+    the strategy slices them at the decision time instead.
+
+    This is safe for exactly one reason, and it is tested rather than asserted:
+    every indicator at bar *i* uses only bars up to *i*
+    (``test_every_indicator_uses_only_its_own_bar_and_earlier``), so the row at
+    time *t* of a frame built over all history is identical to the last row of a
+    frame built over history up to *t*. The strategy still reads only
+    ``frame.loc[:t]``, and
+    ``test_the_precomputed_path_agrees_with_the_filtration_path`` pins the two
+    paths against each other on the real data.
+    """
 
     params: MomentumParams = MomentumParams()
     code_version: str = "2.0"
+    precomputed: Mapping[InstrumentId, pd.DataFrame] | None = None
 
     @property
     def version(self) -> StrategyVersion:
@@ -253,14 +290,13 @@ class WeeklyMomentum:
         Returns one row per available instrument, sorted by score descending.
         """
         params = self.params
-        depth = params.warmup_weeks + params.min_history_weeks
+        depth = FULL_HISTORY
         rows: list[dict[str, Any]] = []
 
         for instrument in filtration.universe(min_bars=params.min_history_weeks):
-            bars = _bars(filtration, instrument, depth)
-            if bars.empty or len(bars) < params.min_history_weeks:
+            table = self._indicators_at(filtration, instrument, depth)
+            if table is None or len(table) < params.min_history_weeks:
                 continue
-            table = indicators(bars, params)
             row = table.iloc[-1]
             if not np.isfinite(row["close"]):
                 continue
@@ -286,11 +322,37 @@ class WeeklyMomentum:
             drop=True
         )
 
+    def rotates_at(self, moment: datetime) -> bool:
+        """Whether this decision time is a rotation week.
+
+        Derived from the calendar, not from a counter, so a replay of any window
+        rotates on exactly the weeks the original run did.
+        """
+        weeks = (moment - CADENCE_EPOCH).days // 7
+        return weeks % self.params.rebalance_weeks == 0
+
     def target(
         self, filtration: Filtration, held: Mapping[InstrumentId, float]
     ) -> TargetIntent:
-        """The book to hold from this decision time until the next."""
+        """The book to hold from this decision time until the next.
+
+        Between rotations the strategy re-states what it already holds. That is
+        not a no-op: it is the difference between a cadence and a gap. Returning
+        an empty target on a non-rotation week would mean "go to cash", and
+        skipping the decision entirely would leave the book unmarked -- which is
+        how a drawdown between rotations goes unmeasured. The previous system
+        marked only at rebalance closes, and doing it properly moved its reported
+        maximum drawdown from -23.7% to -28.8%.
+        """
         params = self.params
+        if not self.rotates_at(filtration.decision_time):
+            return TargetIntent(
+                weights=dict(held),
+                horizon_bars=params.rebalance_weeks,
+                as_of=filtration.decision_time,
+                diagnostics={"rotated": 0.0},
+            )
+
         table = self.rank(filtration, held)
 
         weights: dict[InstrumentId, float] = {}
@@ -319,12 +381,28 @@ class WeeklyMomentum:
             diagnostics["selected"] = float(len(weights))
             diagnostics["eligible"] = float(int(table["eligible"].sum()))
 
+        diagnostics["rotated"] = 1.0
         return TargetIntent(
             weights=weights,
-            horizon_bars=1,
+            horizon_bars=params.rebalance_weeks,
             as_of=filtration.decision_time,
             diagnostics=diagnostics,
         )
+
+    def _indicators_at(
+        self, filtration: Filtration, instrument: InstrumentId, depth: int
+    ) -> pd.DataFrame | None:
+        """Indicators knowable at the decision time, precomputed or not."""
+        if self.precomputed is not None:
+            frame = self.precomputed.get(instrument)
+            if frame is None or frame.empty:
+                return None
+            visible = frame.loc[frame.index <= filtration.decision_time]
+            return None if visible.empty else visible
+        bars = _bars(filtration, instrument, FULL_HISTORY)
+        if bars.empty:
+            return None
+        return indicators(bars, self.params)
 
     def state(self) -> Mapping[str, Any]:
         """The parameters. Per-decision values ride on the target's diagnostics.

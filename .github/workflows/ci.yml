@@ -21,3 +21,6 @@ jobs:
       - run: python scripts/ingest_ibkr_cache.py
       - run: python scripts/demo_causality.py
       - run: python scripts/reconcile_conventions.py
+      # The funnel is slow (seventy-five backtests); CI runs a reduced
+      # control set so the gates themselves stay exercised on every push.
+      - run: python scripts/run_funnel.py --controls 20

@@ -37,7 +37,7 @@ from validation.metrics import Performance, summarise  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 STORE = ROOT / "var" / "store"
 START = datetime(2009, 2, 24, tzinfo=timezone.utc)
-EVERY = 4
+ROTATE_WEEKS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,7 +65,11 @@ def main() -> int:
         return 1
 
     market = load_market(STORE, interval=BarInterval.WEEK, start=START)
-    schedule = list(market.schedule)[::EVERY]
+    # Every week is a decision and a mark; the strategy rotates every fourth.
+    # Subsampling the schedule instead would push each fill four weeks past its
+    # decision, which is a different (and much worse) convention than either of
+    # the two being compared here.
+    schedule = list(market.schedule)
     position_of = {moment: i for i, moment in enumerate(schedule)}
 
     def decision_bar_close(moment: datetime):
@@ -84,7 +88,7 @@ def main() -> int:
             opening=Book.opening(
                 PortfolioId(TenantId("user"), "reconcile"), 100_000.0, schedule[0]
             ),
-            strategy=WeeklyMomentum(MomentumParams()),
+            strategy=WeeklyMomentum(MomentumParams(rebalance_weeks=ROTATE_WEEKS)),
             schedule=schedule,
             filtration_at=market.filtration_at,
             marks_at=market.window.marks_at,
@@ -97,9 +101,12 @@ def main() -> int:
                 cash_buffer=variant.cash_buffer, min_trade_fraction=variant.no_trade_band
             ),
         )
-        return summarise(result.equity_curve(), periods_per_year=52 / EVERY)
+        return summarise(result.equity_curve(), periods_per_year=52)
 
-    print(f"{len(schedule)} rotations, {schedule[0].date()} to {schedule[-1].date()}")
+    print(
+        f"{len(schedule)} weekly marks, rotating every {ROTATE_WEEKS}, "
+        f"{schedule[0].date()} to {schedule[-1].date()}"
+    )
     print(f"{'':<44}{'CAGR':>8}{'Sharpe':>8}{'maxDD':>9}{'final':>13}")
     print("-" * 82)
     results = {}

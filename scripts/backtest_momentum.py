@@ -42,7 +42,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cash-buffer", type=float, default=0.01)
     parser.add_argument("--min-trade", type=float, default=0.005)
     parser.add_argument("--start", default=None, help="Earliest decision date, ISO")
-    parser.add_argument("--every", type=int, default=1, help="Decide every N bars")
+    parser.add_argument(
+        "--rebalance-weeks", type=int, default=1,
+        help="Weeks between rotations. The book is marked every week regardless.",
+    )
     args = parser.parse_args(argv)
 
     interval = BarInterval.WEEK if args.freq == "weekly" else BarInterval.DAY
@@ -51,9 +54,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     market = load_market(STORE, interval=interval, start=start)
 
-    schedule = list(market.schedule)[:: args.every]
+    # Every week is a decision; only some are rotations. Marking the book only
+    # on rotation weeks hides whatever happened between them.
+    schedule = list(market.schedule)
     strategy = WeeklyMomentum(
-        MomentumParams(top_n=args.top, lookback_weeks=args.lookback)
+        MomentumParams(
+            top_n=args.top,
+            lookback_weeks=args.lookback,
+            rebalance_weeks=args.rebalance_weeks,
+        )
     )
     portfolio = PortfolioId(TenantId("user"), "backtest")
     broker = SimulatedBroker(
@@ -61,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     result = run_backtest(
-        run=RunId(f"bt-{args.freq}-{args.every}"),
+        run=RunId(f"bt-{args.freq}-{args.rebalance_weeks}"),
         opening=Book.opening(portfolio, args.capital, schedule[0]),
         strategy=strategy,
         schedule=schedule,
@@ -76,11 +85,12 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     curve = result.equity_curve()
-    per_year = market.periods_per_year / args.every
-    stats = summarise(curve, periods_per_year=per_year)
+    stats = summarise(curve, periods_per_year=market.periods_per_year)
 
     print(f"strategy   {strategy.version.strategy} {strategy.version.params_hash}")
     print(f"decisions  {len(result.steps):,} from {schedule[0].date()} to {schedule[-1].date()}")
+    rotations = sum(1 for s in result.steps if s.decision.target.diagnostics.get("rotated"))
+    print(f"rotations  {rotations:,} of {len(result.steps):,} weekly marks")
     print(f"orders     {sum(len(s.intents) for s in result.steps):,}")
     print(f"fills      {len(result.all_fills()):,}")
     print(f"unfilled   {broker.unfilled:,} (no print at the execution bar)")

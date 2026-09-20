@@ -132,6 +132,12 @@ class StrategyVersion:
     code_version: str = "dev"
 
     def __post_init__(self) -> None:
+        # A plain string here type-checks nowhere and compares unequal to the
+        # same version rebuilt from storage, so the round trip through a ledger
+        # silently produces two identities for one strategy. Coerce at the
+        # boundary instead of trusting the annotation.
+        if not isinstance(self.strategy, StrategyId):
+            object.__setattr__(self, "strategy", StrategyId(str(self.strategy)))
         if not re.match(r"^[0-9a-f]{12}$", self.params_hash):
             raise ContractViolation(
                 f"params_hash must be a 12-character hex digest; got {self.params_hash!r}. "

@@ -52,8 +52,29 @@ class Strategy(Protocol):
         """
         ...
 
-    def target(self, filtration: Filtration) -> TargetIntent:
-        """The book the strategy intends to hold, given what is knowable."""
+    def target(
+        self, filtration: Filtration, held: Mapping[InstrumentId, float]
+    ) -> TargetIntent:
+        """The book the strategy intends to hold, given what is knowable.
+
+        Args:
+            filtration: Everything knowable at the decision time.
+            held: Current position weights, as fractions of equity. Instruments
+                absent are not held.
+
+        Why ``held`` is passed rather than re-derived: most real exit rules are
+        conditional on holding. "Sell if RSI falls back through 50 after reaching
+        70" applies to a position, not to a candidate, and the same condition on
+        a name we do not own is not a reason to avoid buying it. A strategy has
+        no way to work out what it holds from a filtration, and one that tracked
+        its own holdings internally would stop being replayable: the decision
+        would depend on the object's history rather than on its inputs.
+
+        Weights rather than quantities, deliberately. A weight is dimensionless,
+        so this tells the strategy the *shape* of the book without telling it the
+        equity — which remains the engine's business alone (see
+        ``contracts.targets``).
+        """
         ...
 
     def state(self) -> Mapping[str, Any]:

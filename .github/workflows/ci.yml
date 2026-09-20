@@ -20,3 +20,4 @@ jobs:
       # ingest never produces.
       - run: python scripts/ingest_ibkr_cache.py
       - run: python scripts/demo_causality.py
+      - run: python scripts/reconcile_conventions.py

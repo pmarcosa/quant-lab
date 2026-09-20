@@ -219,6 +219,52 @@ class BrokerOrderState:
 
 
 @dataclass(frozen=True, slots=True)
+class Fill:
+    """One execution: shares changed hands at a price, and it cost something.
+
+    A fill is an *event*, not a state. It is the only thing that may move the
+    ledger, which is what makes the book replayable: the same fills in the same
+    order always produce the same positions and the same cash.
+
+    Commission is carried separately rather than folded into the price because
+    the two behave differently. Price affects the cost basis and therefore future
+    profit; commission is spent immediately and never recovered. Folding it in
+    understates the basis and quietly flatters every subsequent return.
+    """
+
+    client_order_id: str
+    instrument: InstrumentId
+    side: Side
+    quantity: float
+    price: float
+    at: datetime
+    commission: float = 0.0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "at", utc(self.at))
+        if self.quantity <= 0:
+            raise ContractViolation(
+                f"fill quantity must be positive; direction is carried by side, "
+                f"got {self.quantity}"
+            )
+        if self.price <= 0:
+            raise ContractViolation(f"fill price must be positive; got {self.price}")
+        if self.commission < 0:
+            raise ContractViolation(f"commission cannot be negative; got {self.commission}")
+
+    @property
+    def signed_quantity(self) -> float:
+        """Shares added to the position: positive on a buy, negative on a sell."""
+        return self.quantity if self.side is Side.BUY else -self.quantity
+
+    @property
+    def cash_flow(self) -> float:
+        """Change in cash, commission included. Negative on a buy."""
+        gross = -self.signed_quantity * self.price
+        return gross - self.commission
+
+
+@dataclass(frozen=True, slots=True)
 class PositionLedgerEntry:
     """What the ledger holds after reconciling fills. The only source of truth.
 

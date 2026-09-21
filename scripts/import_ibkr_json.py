@@ -11,7 +11,7 @@ conversion and validation happen here rather than wherever it was fetched.
 
 After importing, rebuild the store:
 
-    rm -rf var && python scripts/ingest_ibkr_cache.py
+    python scripts/ingest_ibkr_cache.py --rebuild
 
 The universe is *derived* from the cache, so a new file is a new universe member
 with the listing date its own data implies. There is no separate list to edit —
@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\n{written} written; cache now holds {len(inventory)} {args.freq} instruments")
     if thin:
         print(f"too little history to be selectable yet: {', '.join(thin)}")
-    print("\nRebuild the store:  rm -rf var && python scripts/ingest_ibkr_cache.py")
+    print("\nRebuild the store:  python scripts/ingest_ibkr_cache.py --rebuild")
     return 0
 
 

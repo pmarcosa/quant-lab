@@ -1,296 +1,1161 @@
 # quant-lab — user manual
 
-How to run the system, what each part does, and what is not built yet.
+How to run every part of the system yourself, in the order you will need it:
+set it up, look after the data, widen the universe, test a strategy, read the
+reports, then trade it through IBKR, paper account first, and watch it live.
 
-Written for the person who owns it, not for a contributor. Every command below
-is meant to be typed.
+Each step says **what to type**, **what it does**, and **why it is done that
+way**. The "why" matters most, because it tells you when a step can be skipped.
+Usually it cannot.
 
----
-
-## 1. Where things are
-
-```
-contracts/    Types and Protocols. The vocabulary everything else shares.
-access/       Who may do what. One local owner today.
-data/         Bitemporal store, point-in-time universe, filtration, ingest,
-              vendor conversion.
-strategies/   The strategies. Sees contracts only.
-engine/       Accounting, the decision, the loop. One implementation.
-risk/         Limits and the protective stop.
-validation/   Performance metrics, CPCV, DSR/PBO, the funnel, the ledger.
-reports/      EMPTY. See section 7.
-execution/    Broker adapters. Simulated only. See section 6.
-runtime/      Wiring. Imports everything; imported by nothing.
-scripts/      Everything you actually run.
-docs/         This file.
-data/ibkr_cache/   Committed raw CSVs. The reproducible input.
-var/          Derived and gitignored: the store, the research ledger.
-```
-
-**The answer to "where is X" for two specific things:**
-
-| you are looking for | it is at | honest status |
-|---|---|---|
-| IBKR **data** | `data/vendor.py`, `scripts/fetch_ibkr.py`, `scripts/import_ibkr_json.py` | works |
-| IBKR **trading** | nowhere | **not built** — section 6 |
-| **performance measurement** | `validation/metrics.py` | works |
-| **performance reports** | nowhere | **not built** — section 7 |
-
----
-
-## 2. First run
+Every command is typed in a terminal at the root of the repository:
 
 ```bash
 cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/VIsual\ Studio/quant-lab
-pip install -e ".[dev]"
-python scripts/ingest_ibkr_cache.py     # builds var/store from the CSVs, ~2s
-pytest -q                               # 324 tests, ~2s
 ```
-
-`var/` is derived. Delete it and rebuild whenever you want a clean slate; the
-committed CSVs are the source of truth.
 
 ---
 
-## 3. The commands
+## Contents
 
-### Run a backtest
+1. [The system in one page](#1-the-system-in-one-page)
+2. [One-time setup](#2-one-time-setup)
+3. [Price data](#3-price-data)
+4. [Expanding the universe](#4-expanding-the-universe)
+5. [Research: backtests, the funnel, the ledger](#5-research-backtests-the-funnel-the-ledger)
+6. [Reading the reports](#6-reading-the-reports)
+7. [Before trading: IB Gateway, the config, the baseline](#7-before-trading-ib-gateway-the-config-the-baseline)
+8. [Opening the sleeve](#8-opening-the-sleeve)
+9. [The weekly cycle](#9-the-weekly-cycle)
+10. [Monitoring live performance](#10-monitoring-live-performance)
+11. [Incidents: what to do when something is wrong](#11-incidents-what-to-do-when-something-is-wrong)
+12. [From paper to live money](#12-from-paper-to-live-money)
+13. [Files, state and backups](#13-files-state-and-backups)
+14. [Things that will bite](#14-things-that-will-bite)
+15. [Changing the code safely](#15-changing-the-code-safely)
+16. [Command reference](#16-command-reference)
 
-```bash
-python scripts/backtest_momentum.py --freq weekly --rebalance-weeks 4 --start 2009-02-24
+---
+
+## 1. The system in one page
+
+**What it trades.** The weekly momentum strategy ranks the universe by 13-week
+momentum and holds the top 4, equally weighted. It rotates every 4 weeks. Each
+position gets a protective stop 12% below its entry price. These are the
+defaults in `configs/live.yaml`.
+
+**How it trades.** The system *proposes*, and you *approve* by typing a code.
+Nothing reaches the market any other way: no automatic mode exists, and no flag
+creates one. Orders are market-on-open orders (MOO), so they fill in Monday's
+opening auction. That is exactly how the backtest assumes they fill, so live
+fills and simulated fills can be compared honestly.
+
+**The sleeve.** The strategy manages a fixed amount of capital inside your IBKR
+account, the `sleeve_capital`. It only knows the positions it opened or that you
+handed to it. Anything else in the account is invisible to it and never traded.
+
+**The journal.** Every proposal, approval, order, fill, stop, snapshot,
+reconciliation, correction and state change is appended to one file:
+`state/live/<mode>-journal.jsonl`. The sleeve's positions and cash are *replayed*
+from that file every time they are needed. That makes the journal the source of
+truth, and the one file you must never lose (section 13).
+
+**The degradation ladder.** The system is always in one of three states:
+
+| state | proposals | buys | who can put it there | who can lift it |
+|---|---|---|---|---|
+| `NORMAL` | yes | yes | — | — |
+| `REDUCE_ONLY` | yes | **no**, only sells and stops | monitoring, or you (`pause`) | monitoring lifts its own; you lift yours with `clear` |
+| `HALTED` | only `--liquidate` | no | monitoring, a reconciliation mismatch, or you (`halt`) | **only you**, with `clear` and a written reason |
+
+**Where things are:**
+
+```
+contracts/    Shared vocabulary: types, protocols, live states and journal events.
+data/         Bitemporal store, point-in-time universe, ingest, IBKR file conversion.
+strategies/   The strategies. They see contracts only, so they stay swappable.
+engine/       Accounting and the decision loop. One implementation for backtest and live.
+risk/         Limits, the protective stop, the reduce-only rule.
+validation/   Metrics, CPCV, DSR/PBO, the funnel, the ledger, live monitoring statistics.
+execution/    Broker adapters: simulated.py (backtests) and ibkr.py (IB Gateway / TWS).
+reports/      Report documents (JSON) and their offline HTML pages.
+runtime/      Wiring. cli.py is the `ql` command; live.py the live session;
+              monitor.py the monitoring pass; journal.py the event journal;
+              refresh.py the weekly data refresh; reporting.py builds reports.
+scripts/      The research scripts `ql` delegates to.
+configs/      live.example.yaml (committed); live.yaml (yours, gitignored).
+data/ibkr_cache/   Raw weekly and daily CSVs, committed: the reproducible input.
+var/store/    The bitemporal store, derived from the cache. Safe to delete and rebuild.
+state/        Irreplaceable: journals, baselines, the research ledger, reports. Gitignored.
 ```
 
-| option | default | what it does |
+**The week at a glance** (details in section 9):
+
+| when | command | what it does |
 |---|---|---|
-| `--freq` | `weekly` | `weekly` or `daily` bars |
-| `--rebalance-weeks` | `1` | Weeks between rotations. The book is marked **every** week regardless — marking only on rotation weeks hides what happened between them. |
-| `--top` | `4` | Positions held |
-| `--lookback` | `13` | Ranking horizon in weeks |
-| `--stop` | `0.12` | Protective stop distance. `0` disables it. |
-| `--cost-bps` / `--slippage-bps` | `10` / `10` | Per side |
-| `--cash-buffer` | `0.01` | Held back from sizing, for commission and the gap between decision mark and fill |
-| `--min-trade` | `0.005` | No-trade band, as a fraction of equity |
-| `--capital` | `100000` | Starting cash |
-| `--start` | none | Earliest decision date, ISO |
-
-### Check the causality guarantees
-
-```bash
-python scripts/demo_causality.py
-```
-
-Asserts on real data that the universe is a function of the decision time, that
-a pinned view cannot see past it, and that publication lag is modelled. Silence
-is success.
-
-### Price the execution conventions
-
-```bash
-python scripts/reconcile_conventions.py
-```
-
-Runs both fill conventions through the same engine, so the difference is the
-convention and nothing else.
-
-### Run the falsification funnel
-
-```bash
-python scripts/run_funnel.py                 # 60 controls, several minutes
-python scripts/run_funnel.py --controls 20   # faster
-```
-
-Five gates on the real data. **Every backtest it runs is written to the research
-ledger first** (`var/research.jsonl`). It resumes: if you interrupt it, running
-it again continues from what is already recorded rather than repeating work or
-double-counting trials.
-
-Exit code `0` means the funnel passed, `2` means it did not.
-
-### Compare stop distances
-
-```bash
-python scripts/compare_stops.py
-```
+| Saturday | `ql data refresh` | adds the week that closed on Friday |
+| Saturday | `ql live sync` | brings the journal up to date with the account |
+| Saturday | `ql monitor run` | judges live results, may change the state, writes the dashboard |
+| Saturday | `ql live propose` | computes this week's orders; sends nothing |
+| Saturday to Monday before 09:28 New York | `ql live approve` | you type the code; MOO orders are sent |
+| Monday after the open | `ql live sync` | records fills and places the new stops |
+| any day | `ql live status` | state, equity, positions, stops |
 
 ---
 
-## 4. Expanding the universe
+## 2. One-time setup
 
-This is the most valuable thing you can do to the system, and the reason is in
-the funnel's own caveat: the current universe was assembled in 2026 from names
-that had already done well, so the monkey test neutralises selection bias
-*within* the universe but not the universe's own construction. A wider,
-mechanically defined universe is what separates "momentum works" from "I picked
-the winners of 2026".
-
-**There is no universe list to edit.** The universe is *derived* from whatever is
-in `data/ibkr_cache/`, with each instrument's listing date taken from its own
-first bar. Adding a file adds a universe member; there is nothing else to keep in
-sync. That is deliberate — a hand-maintained list is how a backtest ends up
-trading names that had not listed yet.
-
-### Path A — you have IB Gateway or TWS running
+### Step 2.1 — Install
 
 ```bash
-pip install -e ".[ibkr]"
-python scripts/fetch_ibkr.py --symbols NFLX,ORCL,ADBE,CRM,NOW --freq weekly
-rm -rf var && python scripts/ingest_ibkr_cache.py
+pip install -e ".[dev]"
 ```
 
-Needs the gateway logged in with API socket clients enabled. Port `4001` for IB
-Gateway, `7496` for TWS (`--port`).
+This installs the project and its dependencies (numpy, pandas, scipy, pyyaml,
+and `ib_async` for talking to IB Gateway). It also installs the **`ql`**
+command. The `-e` (editable) flag means `ql` always runs the code in this folder,
+so a `git pull` needs no reinstall.
 
-### Path B — ask Claude
+If `ql` is not found afterwards, your Python's scripts folder is not on your
+`PATH`. Use `python -m runtime.cli` instead: it is the same program, and every
+`ql …` in this manual can be typed as `python -m runtime.cli …`.
 
-Claude reaches IBKR through the connector, which does not need the gateway
-running. Say which instruments you want; Claude fetches the payloads and runs:
+### Step 2.2 — Build the store
 
 ```bash
-python scripts/import_ibkr_json.py --from-dir var/incoming --freq weekly
+ql data ingest --rebuild
 ```
 
-Either path validates before writing: mismatched array lengths, non-positive
-prices, bars whose high is below their low, and duplicate timestamps are all
-refused rather than written. A bad file that writes cleanly becomes a committed
-CSV, then a store, then a result — and by then nothing looks wrong.
+This reads the committed CSVs in `data/ibkr_cache/` and writes the bitemporal
+store in `var/store/`. It is derived data: the CSVs are the input, and the store
+is how the engine reads them without looking into the future. `--rebuild`
+deletes `var/store` first, and nothing else.
 
-**Verified end to end on 2026-09-20.** NFLX was fetched through the connector
-(1,181 weekly bars, 2004–2026), imported, and the store rebuilt: the universe
-went from 39 to 40 members and the backtest picked it up. It was then reverted,
-because one instrument moved the 17-year result from 23.4% to 25.5% CAGR — which
-is the point below.
-
-### After expanding
-
-1. **Rebuild:** `rm -rf var && python scripts/ingest_ibkr_cache.py`
-2. **Re-run the funnel.** A different universe is a different experiment; the
-   previous gate results do not carry over.
-3. **Expect the numbers to move.** One instrument changed the 17-year CAGR by two
-   points. Thirty-five will change it more.
-4. **Treat the expansion as a trial.** Choosing a universe *after* seeing which
-   universe backtests better is selection bias with extra steps. Decide the
-   membership rule first — an index, a liquidity screen, a sector spread — write
-   it down, then fetch whatever it selects, including the names you would rather
-   not own.
-
-### How far back the data goes
-
-IBKR caps a request at about 1,000 bars. Weekly reaches roughly 22 years; daily
-only about 4. That is why the weekly series is the one with 17 years of history
-and the daily one starts in 2022.
-
-### What it still will not fix
-
-The cache holds no **delisted** names, because it is assembled from instruments
-that exist today. Adding more live instruments widens the universe without
-removing survivorship bias. Fixing that is a data-vendor purchase, not a code
-change, and the funnel's caveat stands until it is made.
-
----
-
-## 5. Reading a result
-
-```
-years                17.52
-CAGR                23.4%
-volatility          21.5%
-Sharpe                1.08     <- mean excess / std, annualised. The conventional one.
-  geometric           1.09     <- (CAGR - rf) / vol. The previous system used this.
-Sortino               1.12
-max drawdown       -24.0%
-final equity     3,970,080
-```
-
-The two Sharpe figures are both computable from the same curve and are not the
-same number. The previous system reported the geometric one, which runs higher.
-Quote the first when comparing against anything published.
-
-`stops hit` counts positions a protective stop closed. `unfilled` counts orders
-that expired because their instrument did not print at the execution bar.
-
----
-
-## 6. IBKR trading: what is missing
-
-There is **no IBKR execution adapter**. `execution/` contains one file,
-`simulated.py`. `pyproject.toml` declares an optional `ibkr` extra, and until
-section 4 nothing imported it.
-
-What exists is the shape of the hole: `contracts/execution.py` defines
-`ExecutionPort` — `capabilities`, `constraints`, `submit`, `poll`, `cancel`,
-`positions` — and `SimulatedBroker` implements it in full, including the
-inconvenient parts (orders are accepted and filled later, never both at once;
-idempotency on the client order id; resting stops). An IBKR adapter is a new
-implementation of that port. It is not a change to the engine, the risk layer or
-any strategy, and the architecture test enforces that.
-
-This is phase 5 work, and it stays **proposal-plus-manual-approval**:
-`engine.run.propose` takes no broker and a test asserts the signature. Wiring
-execution to it would be a design change, not a configuration one.
-
----
-
-## 7. Performance reports: what is missing
-
-`reports/` is empty. What exists is `validation/metrics.py`, which computes the
-numbers; there is nothing that renders them.
-
-The design calls for the generator to emit a **versioned JSON data document** with
-rendering as a separate layer, showing the funnel state, DSR and PBO with N
-visible, the trial count and the discrepancy metrics — not just an equity curve.
-The separation matters: a report that computes its own numbers is a second
-implementation that can disagree with the first.
-
-For now, the scripts print to the terminal and `var/research.jsonl` holds every
-trial as one JSON object per line, which is directly queryable:
-
-```bash
-python - <<'PY'
-import json
-rows = [json.loads(l) for l in open("var/research.jsonl")]
-for r in sorted(rows, key=lambda r: -r["metrics"].get("sharpe", 0))[:5]:
-    print(f'{r["metrics"]["sharpe"]:+.3f}  {r["note"]}')
-PY
-```
-
----
-
-## 8. Things that will bite
-
-**`rm -rf var` deletes the research ledger.** It lives at `var/research.jsonl`
-and `var/` is gitignored. Copy it aside before rebuilding the store, or the trial
-count behind your DSR is gone — and unlike the store, it cannot be rebuilt.
-A safer habit:
-
-```bash
-cp var/research.jsonl /tmp/ && rm -rf var && python scripts/ingest_ibkr_cache.py
-mkdir -p var && cp /tmp/research.jsonl var/
-```
-
-**The funnel takes minutes, not seconds.** Seventy-five backtests. It resumes, so
-interrupting it is safe.
-
-**Changing a parameter changes the strategy's identity.** `StrategyVersion` folds
-a hash of the parameters into the version, so a 13-week and a 26-week lookback
-are two strategies in the ledger. That is intentional: evidence earned by one
-does not transfer to the other.
-
-**The system does not send orders**, and no flag makes it.
-
----
-
-## 9. Making a change safely
+### Step 2.3 — Run the tests
 
 ```bash
 pytest -q && ruff check .
 ```
 
-Both run in CI along with the ingest, the causality demo, the convention
-reconciliation and a reduced funnel. If you add a package, add it to `ALLOWED` in
-`tests/test_architecture.py` deliberately — a package that is not declared fails
-a test, which is the point.
+Both must pass (about 490 tests, about 20 seconds). The tests include the IBKR
+adapter and the whole live weekly cycle, run against a stand-in gateway. A red
+test means the machine you are on differs from the one the code was verified on,
+and nothing should be traded until it is green.
 
-The house rule, applied throughout: **a guard that has never failed and a guard
-that cannot fail look identical from the outside.** If you add a check, add a
-test that makes it fail. Three real defects were found that way, including two
-where my own measurement was wrong in a way that looked like a finding.
+### Step 2.4 — Check the data
+
+```bash
+ql data status
+```
+
+It shows how many instruments are cached, how many weeks the store holds, and
+how old the latest complete week is. Use it whenever you are unsure what the
+system is looking at.
+
+---
+
+## 3. Price data
+
+### What the data is
+
+Weekly bars, one per instrument per week. Each bar is stamped at the moment it
+became knowable: **Friday 21:00 UTC**, after the US close. That time is a safe
+bound all year round, because it is 16:00 or 17:00 in New York depending on
+daylight saving. A backtest decision on Friday's close can therefore never use a
+bar that was not yet complete.
+
+The store is **bitemporal**: every row carries both the week it describes and
+the moment it was recorded. When IBKR restates history, for example after a
+split, the new values are added as a revision and nothing is overwritten. A
+backtest run "as of" an earlier date still sees what was known then.
+
+### Step 3.1 — Refresh every week (needs IB Gateway, section 7)
+
+```bash
+ql data refresh
+```
+
+For every instrument in the universe, this does four things:
+
+1. Asks the gateway for the last two years of weekly bars.
+2. Merges any week split across a holiday into one bar. IBKR sometimes returns
+   two bars for one week.
+3. Drops the current week while it is still incomplete.
+4. Updates the CSV cache and appends only what is new or restated to the store,
+   stamped with the moment of the fetch.
+
+The output lists new weeks and revisions per instrument. An instrument that
+failed is shown with its error; the others still update.
+
+**Why two years and not one week.** A split restates the whole history of the
+stock. Re-fetching two years picks up a recent restatement, and the store keeps
+both versions.
+
+**Options:** `--symbols AAPL,MSFT` refreshes only those symbols. `--duration "5 Y"`
+reaches further back. `-v` lists every instrument, including unchanged ones.
+
+### Step 3.2 — Rebuild when in doubt
+
+```bash
+ql data ingest --rebuild
+```
+
+Rebuilding from the cache is always safe, and it is required after importing
+new instruments (section 4). The difference from a refresh: a rebuild stamps
+every bar as known at its own Friday close, with a single version per week. The
+record of *when* a refresh actually saw a bar, and of restatements it picked
+up, is lost. Research is unaffected: it assumes bars are known at the close
+anyway. The live system keeps its own history in the journal.
+
+---
+## 4. Expanding the universe
+
+Widening the universe is the most valuable research you can do, for the reason
+the funnel prints in its own caveat. The current universe was assembled in 2026
+from names that had already done well. The monkey test neutralises selection
+bias *within* the universe, but not the bias in how the universe itself was
+chosen. A wider universe, defined by a mechanical rule, is what separates
+"momentum works" from "I picked the winners of 2026".
+
+**There is no universe list to edit.** The universe is *derived* from whatever is
+in `data/ibkr_cache/`. Each instrument's listing date is taken from its own
+first bar. Adding a file adds a member, and there is nothing else to keep in
+sync. This is deliberate: a hand-maintained list is how a backtest ends up
+trading names that had not yet listed.
+
+### Step 4.1 — Decide the rule before fetching anything
+
+Write the membership rule down first. It might be an index's members, a
+liquidity screen, or a sector spread. Then fetch *everything* the rule selects,
+including the names you would rather not own. Choosing the universe *after*
+seeing which one backtests better is selection bias with extra steps.
+
+### Step 4.2a — Fetch through IB Gateway (if it is running, section 7)
+
+```bash
+ql data fetch --symbols NFLX,ORCL,ADBE,CRM,NOW --freq weekly
+```
+
+This asks the gateway for the full weekly history of each symbol, converts it,
+validates it, and writes one CSV per symbol to `data/ibkr_cache/weekly/`. The
+host, port and client id come from `configs/live.yaml`; `--port` overrides
+them. IBKR caps one request at roughly 1,000 bars, which is about 20 years of
+weekly bars.
+
+### Step 4.2b — Or import saved payloads (no gateway needed)
+
+Claude can fetch price history through the IBKR connector without the gateway.
+Ask for the instruments, and the payloads are saved as JSON. Then import them:
+
+```bash
+ql data import --from-dir var/incoming --freq weekly
+ql data import NFLX=nflx.json ORCL=orcl.json --freq weekly
+```
+
+Both paths validate before they write anything. Mismatched array lengths,
+non-positive prices, bars whose high is below their low, and duplicate
+timestamps are refused. A bad file that writes cleanly would become a committed
+CSV, then a store, then a result, and by that point nothing would look wrong.
+
+### Step 4.3 — Rebuild and check
+
+```bash
+ql data ingest --rebuild
+ql data status -v
+```
+
+The verbose status lists every instrument with its number of bars and its date
+range. Look for any file holding far less history than the others. That is the
+most common failure, and it is silent.
+
+### Step 4.4 — Treat the new universe as a new experiment
+
+1. **Re-run the funnel** (section 5.3). A different universe is a different
+   experiment, and earlier gate results do not carry over.
+2. **Expect the numbers to move.** Adding one instrument (NFLX, in a test on
+   2026-09-20) moved the 17-year CAGR by two points.
+3. **If you are trading live, rebuild the monitoring baseline** (step 7.4). The
+   live strategy trades whatever is in the store, so from the next proposal it
+   trades the new universe. Monitoring must compare it against a backtest of
+   the same universe.
+4. **Commit the new CSVs** (`git add data/ibkr_cache && git commit`), so the
+   result can be reproduced from the repository alone.
+
+### What expanding will not fix
+
+The cache holds no **delisted** names, because it is built from instruments that
+exist today. More live instruments widen the universe but do not remove
+survivorship bias. Fixing that means buying data from a vendor, not changing the
+code.
+
+---
+
+## 5. Research: backtests, the funnel, the ledger
+
+### Step 5.1 — Run a backtest
+
+```bash
+ql backtest
+ql backtest --report
+ql backtest --top 5 --lookback 26 --stop 0 --start 2009-01-01 --report
+```
+
+This runs the strategy over the whole store with exactly the engine the live
+system uses. It prints CAGR, volatility, Sharpe, maximum drawdown, final equity
+and stops fired. With `--report` it also writes a report you can open in any
+browser (section 6.1).
+
+| option | default | what it does |
+|---|---|---|
+| `--top` | from config, else 4 | positions held |
+| `--lookback` | from config, else 13 | momentum horizon, in weeks |
+| `--rebalance-weeks` | from config, else 4 | weeks between rotations. The book is still marked every week. |
+| `--stop` | from config, else 0.12 | protective stop distance; `0` disables it |
+| `--cost-bps` / `--slippage-bps` | 10 / 10 | commission and slippage per side, in basis points |
+| `--start` | the first week in the store | earliest week, as an ISO date |
+| `--benchmark` | SPY | the comparison line in the report |
+| `--report` | off | writes `state/reports/backtest-<time>.html` and `.json` |
+
+**Why the defaults come from the config.** A backtest you are going to act on
+should be of the strategy you are actually going to trade.
+
+**Every backtest is recorded.** Each run is written to the research ledger
+(`state/research.jsonl`, study `manual`) before its result is shown. Running
+the identical backtest twice is recorded once.
+
+Why record at all? The Deflated Sharpe Ratio discounts a result by the number of
+things tried to find it. Twenty quick backtests while you "just look around"
+are twenty trials. A ledger that does not see them overstates every later
+result.
+
+**Note on the start date.** The cache reaches back to 1999 for some names. Early
+years therefore have a thin universe: 6 names in 1999 against 39 today. A
+backtest from the very start answers a different question from one starting
+in 2009. Use `--start` to pick the window deliberately, and use the same window
+when comparing variants.
+
+### Step 5.2 — Check the causality guarantees (optional, after data changes)
+
+```bash
+python scripts/demo_causality.py
+python scripts/reconcile_conventions.py
+```
+
+The first script checks, on the real data, three things: the universe is a
+function of the decision time, a pinned view cannot see past it, and publication
+lag is modelled. Silence means success. The second runs both fill conventions
+through the same engine and prices the difference between them.
+
+### Step 5.3 — Run the falsification funnel
+
+```bash
+ql funnel                    # 60 random-selection controls; several minutes
+ql funnel --controls 20      # faster
+```
+
+The funnel puts the strategy through five gates on the real data, then prints
+the verdict whatever it is. Exit code `0` means it passed and `2` means it did
+not. Every backtest it runs is written to the ledger first. It also resumes: if
+you interrupt it, running it again continues from what is already recorded,
+without repeating work or counting a trial twice.
+
+### Step 5.4 — Compare stop distances
+
+```bash
+python scripts/compare_stops.py
+```
+
+This runs the same strategy with several stop distances and records each run as
+a trial. It shows what the stop actually buys: less drawdown, paid for in
+positions cut just before they recovered.
+
+### Step 5.5 — Query the ledger directly
+
+The ledger holds one JSON object per line and is easy to query:
+
+```bash
+python - <<'PY'
+import json
+rows = [json.loads(l) for l in open("state/research.jsonl")]
+print(len(rows), "trials")
+for r in sorted(rows, key=lambda r: -r["metrics"].get("sharpe", 0))[:5]:
+    print(f'{r["metrics"]["sharpe"]:+.3f}  {r["study"]:<8} {r["window"]}  {r["note"]}')
+PY
+```
+
+The Sharpe stored here is *weekly* (not annualised). It is the input the DSR
+needs.
+
+---
+
+## 6. Reading the reports
+
+Every report is written twice, as data (`.json`) and as a page (`.html`), side
+by side in `state/reports/`. The page is drawn *only* from the data, so the two
+can never disagree, and the JSON can be archived, diffed or loaded into anything.
+
+The page is a single file with no internet dependency. Open it by
+double-clicking it. It follows your system's light or dark mode, and the ◐
+button switches between them.
+
+Charts work the same way everywhere:
+
+- **Hover** over a chart, or focus it with Tab and use ← →, to see every
+  series' value at that week.
+- Every chart has a **Table view** underneath with the exact numbers. A value
+  in the tooltip is always also in the table.
+- Colours are fixed: blue is the strategy or sleeve, orange the benchmark. Each
+  line is also named at its right-hand end, so colour is never the only way to
+  tell the lines apart.
+- The four status colours (green, amber, orange, red) are used only for the
+  state of the system. They always appear with a symbol (✓ ! ▲ ✕) and a word.
+
+List recent reports, or re-draw a page from its data:
+
+```bash
+ql report list
+ql report render state/reports/live-paper-20261003-101500.json
+```
+
+### 6.1 The backtest report
+
+| element | what it tells you | how to read it |
+|---|---|---|
+| **CAGR**, with the benchmark underneath | compound annual growth | Compare over the same window. The benchmark line starts on the day its own data starts, at the strategy's equity on that day. |
+| **Max drawdown** | the deepest fall from a peak | One path's worst case, not a bound. Monitoring uses the bootstrap to judge how deep a *normal* fall can be. |
+| **Sharpe** | mean weekly excess return over its standard deviation, annualised | The conventional definition. The geometric variant, (CAGR − rf)/vol, is in the notes. It runs higher and is not comparable with published figures. |
+| **Sortino** | as Sharpe, but against downside deviation only | |
+| **Rotations, stops fired, commission** | how much the strategy traded | Stops fired is the price of protection. See step 5.4. |
+| **Equity chart** | strategy against benchmark, same starting capital | Linear scale: for the size of falls, read the drawdown chart instead. |
+| **Drawdown chart** | distance below the running peak | The shaded area is the strategy. Long, flat stretches below zero are the periods you would have had to sit through. |
+| **Calendar-year returns** | year by year, with the difference against the benchmark | The first and last years are partial. |
+| **Last rotations** | what the strategy chose to hold, and when | A sanity check: a strategy that holds the same names for years is not rotating. |
+| **Settings** | exactly what was run | |
+
+### 6.2 The live monitoring dashboard
+
+Written by `ql monitor run` (section 10) to `state/reports/live-<mode>-<time>.html`.
+Read it top to bottom. It is ordered by what needs your attention first.
+
+1. **The status bar.** The state (NORMAL, REDUCE-ONLY or HALTED), whether it
+   changed on this run, and every reason. Health problems, such as stale data,
+   no recent sync or a mismatch, are listed too. They turn a NORMAL bar amber.
+2. **The tiles.** Each tile is one check, marked with its own status where it
+   has a threshold. Section 10.2 explains each check.
+3. **Sleeve equity vs benchmark.** The sleeve's weekly equity from the
+   snapshots. Deposits or corrections recorded with `ql live adjust --cash-delta`
+   are removed from the returns, so they do not count as performance.
+4. **Cumulative live return against the backtest's range.** The live cumulative
+   return, with two dashed lines. They mark the 10th and 1st percentiles of the
+   cumulative return that bootstrapped backtest paths reach over the *same
+   number of weeks*. Sitting below P10 is unusual; below P1 is rare.
+5. **Live drawdown.** How far below its peak the sleeve is.
+6. **Implementation shortfall per rotation.** What each rotation cost against
+   the decision price, with the backtest's modelled cost as a dashed line.
+7. **Positions and protective stops.** Every position, its mark, its stop and the
+   stop's distance below the mark. The monitor runs without the gateway, so
+   these stops come from the journal; `ql live sync` checks them against the
+   broker. An empty stop cell means a position is unprotected: run
+   `ql live stops`.
+8. **Rotations: cost and edge.** Per rotation: the shortfall, and the *alpha
+   share*, meaning the shortfall as a fraction of the return a rotation is
+   expected to earn.
+9. **Thresholds in force.** The exact lines this run was judged against.
+10. **Notes.** Especially "trend not judged before 26 weeks" and the warning
+    that early statistics are wide.
+
+---
+## 7. Before trading: IB Gateway, the config, the baseline
+
+### Step 7.1 — Install and configure IB Gateway
+
+The system talks to IBKR through **IB Gateway** (or TWS) running on your Mac.
+IB Gateway is the better choice: it is lighter, and it is built for API use.
+
+1. Download IB Gateway (the "stable" version) from interactivebrokers.com and
+   install it.
+2. Log in to your **paper trading** account first. On the login screen, choose
+   "Paper Trading". Your paper account number starts with `DU`.
+3. In the gateway: *Configure → Settings → API → Settings*:
+   - tick **Enable ActiveX and Socket Clients**;
+   - leave the **Socket port** at **4002** (paper); the live default is 4001;
+   - untick **Read-Only API**, otherwise orders are refused;
+   - under **Trusted IPs**, keep `127.0.0.1`.
+4. Market data: the API's historical bars need the same market-data permissions
+   as the platform. For the paper account, in Client Portal enable sharing your
+   live account's market data with the paper account (*Settings → Paper Trading
+   Account*).
+
+**Why the ports matter.** The system refuses a paper configuration pointed at a
+live port (4001, 7496) and a live configuration pointed at a paper port (4002,
+7497). A config pointed at the wrong gateway is how a test order becomes a real
+one.
+
+### Step 7.2 — Write your config
+
+```bash
+cp configs/live.example.yaml configs/live.yaml
+```
+
+Edit `configs/live.yaml`:
+
+| setting | what to put | why |
+|---|---|---|
+| `mode` | `paper` | Always start here (section 12). |
+| `account` | your `DU…` account | Checked against the accounts the gateway manages, and against the mode: `DU` is paper, `U` is live. |
+| `sleeve_capital` | the capital the strategy manages | It sizes against this, not the whole account. |
+| `gateway.port` | 4002 | Must match the gateway (step 7.1). |
+| `gateway.client_id` | any number not used by another API program | Two programs with the same id disconnect each other. |
+| `strategy.*` | the strategy you researched | Changing any of these changes the strategy's identity and requires a new baseline. |
+| `risk.stop_distance` | 0.12 | The protective stop. `0` disables it (not recommended). |
+| `risk.max_order_fraction` | 0.6 | No single order may exceed this share of the sleeve. It is a guard against unit errors, not a sizing rule. |
+| `monitoring.*` | the defaults | Section 10.3 explains each one and when to change it. |
+| `proposal_ttl_hours` | 60 | A Saturday proposal must still be approvable on Monday morning. |
+| `unmanaged` | tickers the strategy must never touch | For things you hold in the same account for your own reasons. |
+
+`configs/live.yaml` is gitignored because it names your account.
+
+### Step 7.3 — Check the connection
+
+With the gateway running and logged in:
+
+```bash
+ql live status
+```
+
+Before the sleeve is opened it prints `connected DU… (paper)` with the account's
+net liquidation value, and `sleeve not open yet`. That means the gateway, the
+port and the account all check out. If it fails, the message says why: the
+gateway is not running, the port is wrong, or the account is not one this
+gateway manages.
+
+### Step 7.4 — Build the monitoring baseline
+
+```bash
+ql monitor baseline
+```
+
+**What it does.** It backtests the configured strategy (same universe, settings,
+stop and costs) over the store and saves three things to
+`state/live/<mode>-baseline.json`:
+
+- the weekly returns;
+- the execution cost the backtest paid;
+- the return an average rotation earned.
+
+**Why.** Monitoring asks one question: *is what is happening live consistent
+with what the backtest said would happen?* The baseline is "what the backtest
+said".
+
+- The baseline is **tied to the settings**. If you change `top_n`, `lookback`,
+  `rebalance_weeks`, the stop or `max_gross`, monitoring refuses to run until you
+  rebuild it. This stops live results from being compared against a different
+  strategy.
+- **Rebuild it** after changing the strategy settings, and after expanding the
+  universe.
+- **Don't rebuild it** week after week just to fold in new data. A reference
+  that moves every week can quietly absorb a problem.
+
+---
+
+## 8. Opening the sleeve
+
+### Step 8.1 — Open it, once
+
+```bash
+ql live init
+```
+
+This records the sleeve's opening balance: `sleeve_capital` in cash and no
+positions. It then runs a first sync: it snapshots the account and reconciles
+the (empty) sleeve against it.
+
+A sleeve opens once per mode. The paper and live sleeves have separate journals
+(`paper-journal.jsonl`, `live-journal.jsonl`), so paper history never leaks
+into live.
+
+### Step 8.2 — Or hand over positions you already hold
+
+```bash
+ql live init --adopt AAPL,MSFT
+```
+
+Adopted positions enter the sleeve at the quantity and average cost IBKR
+reports. The sleeve's cash is whatever of `sleeve_capital` they do not already
+use. From then on the strategy manages them like any other position: it may sell
+them at the next rotation, and it protects them with stops anchored at the
+opening price.
+
+Adoption is refused when:
+
+- the account does not hold the name;
+- the name is listed as `unmanaged`;
+- the name is not in the price data;
+- the adopted positions are worth more than `sleeve_capital`.
+
+**Why adopt rather than sell and rebuy.** It avoids a round trip of costs and
+taxes for names the strategy would hold anyway.
+
+---
+
+## 9. The weekly cycle
+
+The weekly bar closes on **Friday at the US close**. Everything below happens
+between then and the **Monday open**. Rotations happen every
+`rebalance_weeks` (4 by default). The other weeks are "hold weeks": the
+cycle still runs, but the proposal is usually empty.
+
+Keep IB Gateway running and logged in for the steps that need it (marked 🔌).
+
+### Step 9.1 — Refresh the data 🔌 (Saturday)
+
+```bash
+ql data refresh
+```
+
+This adds the week that closed on Friday (section 3.1). **Why first:** the
+proposal is made on the latest complete week. `propose` refuses if that week is
+more than 10 days old, so a forgotten refresh cannot turn into a stale decision.
+
+### Step 9.2 — Sync 🔌
+
+```bash
+ql live sync
+```
+
+Sync brings the journal up to date with the account, in this order:
+
+1. **Fills.** Every execution of an order this system sent (they are
+   recognised by their `ql-` order reference), including stops that fired, is
+   recorded once. Duplicates are ignored by execution id.
+2. **Order statuses.** Orders that filled, were cancelled or were rejected are
+   recorded.
+3. **Stops.** Every sleeve position gets a good-till-cancelled protective stop.
+   Positions that no longer need one have theirs cancelled.
+4. **Snapshot.** The sleeve is marked at the latest closes. This is the weekly
+   equity point that monitoring uses.
+5. **Reconciliation.** The sleeve is compared with the account:
+   - **OK**: they agree.
+   - **WARN**: the account holds *more* than the sleeve. That is expected in a
+     shared account, for example your own other positions. A missing stop and
+     low account cash are also warnings.
+   - **MISMATCH**: the account holds *less* than the sleeve believes, or an order
+     the system sent has vanished. **The system halts**, because it would
+     otherwise be sizing and protecting positions that do not exist. See 11.1.
+
+Proposals require a reconciliation less than 24 hours old, and without a
+mismatch. That is why sync comes before propose.
+
+### Step 9.3 — Monitor (no gateway needed)
+
+```bash
+ql monitor run
+```
+
+This runs every check (section 10). It applies the resulting state change, if
+any, and writes the dashboard. Open the page it prints. **Why before
+proposing:** if monitoring moves the system to reduce-only or halted, the
+proposal must already respect that.
+
+### Step 9.4 — Propose 🔌
+
+```bash
+ql live propose
+```
+
+The strategy decides on the latest complete week, exactly as it did in the
+backtest. **Nothing is sent.** The proposal is printed and recorded:
+
+- the proposal id, what kind it is (ROTATION, HOLD WEEK or LIQUIDATION), and
+  when it expires;
+- the current and target weights of every name;
+- each order: side, instrument, quantity, type (market, `opg` = opening
+  auction), estimated price and value, and share of equity;
+- any risk findings, for example orders removed because the system is
+  reduce-only.
+
+Things `propose` refuses, and why:
+
+| refusal | why |
+|---|---|
+| no reconciliation, or one older than a day, or a mismatch | Sizing from a sleeve that may not match the account. |
+| orders from the last approval still working | Two sets of orders for the same shares. |
+| data older than 10 days | A decision on stale prices. |
+| the system is halted | Only `--liquidate` is allowed (11.2). |
+
+Names that a stop closed since the last rotation are not bought back until the
+next rotation. The backtest does the same.
+
+### Step 9.5 — Approve, or reject 🔌 (before Monday 09:28 New York time)
+
+```bash
+ql live approve
+```
+
+This shows the pending proposal's orders and asks you to type its confirmation
+code:
+
+- in **paper** mode, the proposal id, e.g. `P2655AA`;
+- in **live** mode, `LIVE` followed by the id, e.g. `LIVE P2655AA`. It is longer
+  on purpose, so a live approval can never be a reflex.
+
+Anything else sends nothing. Before sending, `approve` checks four things:
+
+- the proposal is the latest undecided one;
+- it has not expired;
+- the sleeve has not changed since the proposal was computed (a fill, a stop or
+  an adjustment in between makes its quantities wrong);
+- the system has not been halted since.
+
+It then does the following:
+
+- cancels any resting stop on a name it is about to sell. Otherwise the stop
+  and the sell together would sell the shares twice;
+- sends sells first, then buys, as market-on-open orders, each tagged with a
+  unique reference so a retry can never send an order twice.
+
+**Timing.** Market-on-open orders must reach IBKR before the opening auction
+closes to new orders, at **09:28 New York time**. That is normally 15:28 in
+Spain; for a couple of weeks in March and in October/November the offset is one
+hour less. The proposal stays approvable for 60 hours, so Saturday to Monday
+morning is comfortable.
+
+**To decline** a proposal:
+
+```bash
+ql live reject P2655AA --reason "Earnings on Tuesday for two of the names; skipping this rotation"
+```
+
+A rejection is legitimate, but it is recorded as an **override**. Monitoring
+measures overrides: how often you skip, and whether you skip buys and sells
+equally (section 10.2).
+
+### Step 9.6 — Sync after the open 🔌 (Monday, after 09:30 New York)
+
+```bash
+ql live sync
+```
+
+This records the opening-auction fills and places the new stops, anchored at
+each position's actual fill price. **Until this runs, new positions have no
+stop.** Run it as soon after the open as you can.
+
+### Step 9.7 — Check
+
+```bash
+ql live status
+```
+
+This shows the state, sleeve equity and cash, the time since the last sync,
+the last reconciliation, and every position with its mark and its stop. Every
+position should show a stop.
+
+### During the week
+
+Nothing is required. Stops rest at IBKR and work without the system running.
+If one fires, the next `ql live sync` records it as a fill. The system does
+not rebuy that name until the next rotation.
+
+---
+## 10. Monitoring live performance
+
+### 10.1 What monitoring is for
+
+A four-week rotation marked weekly gives about 52 observations a year. On 52
+points, a mean or a t-statistic cannot tell a real loss of edge from a bad run.
+Acting on one produces both kinds of error: switching off a healthy strategy
+after bad luck, and keeping one whose edge has gone.
+
+So monitoring never compares live results with one backtest number. It places
+every live statistic inside a **distribution built from the backtest**, for a
+window as long as the live record. The question it answers is always the same:
+*how unusual is this for this strategy?*
+
+Run it weekly (step 9.3), or at any time:
+
+```bash
+ql monitor run              # judge, apply the state, write the dashboard
+ql monitor run --dry-run    # judge and write the dashboard; change nothing
+ql monitor run --no-report  # judge and apply; no page
+```
+
+It needs neither the gateway nor market hours. It reads the journal and the
+store.
+
+### 10.2 The checks
+
+**1. Drawdown against the bootstrap.**
+
+- *What.* A stationary bootstrap (Politis–Romano) resamples the baseline's
+  weekly returns in blocks of random length. It keeps the volatility
+  clustering and persistence that an independent resample would destroy, and
+  builds 5,000 synthetic paths as long as the live record (at most 52 weeks).
+  The live drawdown's percentile among those paths' drawdowns is the tile
+  *Live drawdown: deeper than N% of backtest paths*.
+- *Why the matched length.* A 10-week live drawdown compared with one-year
+  drawdowns would look mild when it is not.
+- *Lines.* Reduce-only above the 80th percentile, halt above the 99th.
+- *Same paths, second test.* The live cumulative return is compared with the
+  paths' 10th and 1st percentiles (the dashed lines on the dashboard). Below
+  P10 is reduce-only; below P1 is halt.
+
+**2. Break probability (online changepoint detection).**
+
+- *What.* Bayesian online changepoint detection (Adams–MacKay) runs over the
+  backtest and then the live weeks. It reports the posterior probability that
+  the return process *changed after going live*.
+- *Lines.* Reduce-only at 20%, halt above 50%.
+- *Known limit, measured.* It is sensitive to a change in *volatility* and
+  weak at detecting a pure fall in the *mean* over a few months. That case is
+  exactly what check 1 catches, which is why both exist.
+
+**3. Trend.**
+
+- *What.* The median weekly return of the live record, with a bootstrap
+  confidence interval.
+- *When it counts.* Only after 26 live weeks, and only when the **whole
+  interval** is below zero. Before that, the tile says "not judged yet".
+- *Line.* A significantly negative trend halts.
+
+**4. Implementation shortfall.**
+
+- *What.* For every rotation: what the fills cost against the price at
+  decision time, in basis points of the traded value. It
+  is compared with what the backtest paid.
+- *Why.* It separates "the signal stopped working" from "the fills got worse".
+  They call for different responses.
+- *Supporting numbers.*
+  - Execution drag: the fill against the bar's opening price. This is the part
+    the backtest cannot model.
+  - Markouts: the price move 1 and 4 weeks after the fill. Persistently
+    negative markouts mean you are buying tops.
+- *Lines.* Reduce-only at 1.5× the modelled cost. Halt when the cost exceeds
+  half of the return a rotation is expected to earn, two rotations in a row:
+  execution would then be eating the edge.
+
+**5. Process: how you and the system work together.** These are not
+thresholds, but they are shown on every dashboard:
+
+| metric | meaning | watch for |
+|---|---|---|
+| approved / proposed, rejected, expired | how often proposals are acted on | Expiries are skipped weeks by default. |
+| buy and sell compliance | share of proposed buys and sells that were executed | |
+| **asymmetry** | buy compliance minus sell compliance | Positive means you execute buys and skip sells. It is the most expensive override habit: it keeps losers the system wanted out of. Amber at +10%, red at +25%. |
+| override cost | what the rejected orders would have made over the following week, in dollars | Positive means the overrides cost money. |
+| median latency | hours from proposal to approval | |
+| stop coverage | share of positions with a working stop | Anything under 100% is an unprotected position. |
+
+**6. Health.** Data age (over 10 days is stale), time since the last sync (over
+a week), and whether the last reconciliation was a mismatch. Health problems do
+not change the state, but they turn the status bar amber: every other check is
+only as good as the data it reads.
+
+### 10.3 The thresholds, and when to change them
+
+The defaults are in `configs/live.yaml` under `monitoring:`. They come from the
+project's expert, with one deliberate change: **the drawdown halt is at the 99th
+percentile, not the 95th.**
+
+Why: on healthy synthetic data, where nothing was wrong, the checks were run
+thousands of times and their false alarms counted.
+
+| drawdown halt at | false halts per weekly assessment (healthy system) | real collapse halted within 13 weeks / 26 weeks |
+|---|---|---|
+| 95th percentile | 5–13% | — |
+| 99th percentile | 0–5% | 60% / 87% |
+
+The reduce-only line at the 80th percentile trips on 27–37% of assessments of
+a healthy system. That is intended: reduce-only is cheap, because existing
+positions keep running with their stops. It lifts itself when the evidence
+clears. A halt is expensive, so its line is set where healthy systems rarely
+reach it. With a stated drawdown tolerance of 30–40%, the 99th percentile is
+the expert's own "high tolerance" option.
+
+**Change a threshold only in the config, only with a reason, and not in
+response to the current reading.** Moving a line because it has just been
+crossed is switching the alarm off.
+
+### 10.4 What to do in each state
+
+- **NORMAL.** Nothing. Keep the weekly cycle.
+- **REDUCE_ONLY (set by monitoring).**
+  - Proposals continue, but buys are removed: sells, stops and exits still
+    happen, new risk does not.
+  - Read the reasons on the dashboard. Usually it is a drawdown past P80, which
+    is common.
+  - No action is needed: monitoring lifts it when the evidence clears. If you
+    want to override, `ql live clear --to normal --reason "..."`.
+- **REDUCE_ONLY (set by you, `ql live pause`).** Monitoring never lifts it. You
+  paused for a reason monitoring cannot see, such as a holiday or earnings.
+  Lift it yourself with `ql live clear`.
+- **HALTED.** No rotations. Follow 11.2.
+
+---
+
+## 11. Incidents: what to do when something is wrong
+
+### 11.1 Reconciliation mismatch
+
+*Symptom:* `ql live sync` prints `MISMATCH` and the system is **HALTED**.
+
+*Meaning:* the account holds **less** of something than the sleeve believes, or
+an order the system sent has disappeared. Typical causes:
+
+- you sold shares manually in TWS or the app;
+- a corporate action (a merger, a spin-off, a symbol change);
+- IBKR cancelled an order the system still thinks is working.
+
+*Steps:*
+
+1. `ql live sync` again. A fill that arrived late may resolve it.
+2. `ql live journal --tail 40` to see what the system last did, and compare it
+   with *Trades* and *Portfolio* in TWS or Client Portal.
+3. Correct the sleeve to the truth. Quantities are **absolute**, and a reason
+   is required:
+   ```bash
+   ql live adjust --instrument AAPL --quantity 0 --cash-delta 18250.40 \
+       --reason "Sold 100 AAPL manually on 3 Oct at 182.50; proceeds stay in the sleeve"
+   ```
+   `--cash-delta` adds (+) or removes (−) cash from the sleeve. Monitoring
+   removes it from that week's return, so a correction does not count as
+   performance.
+4. `ql live reconcile`. It must now print `OK` or `WARN`.
+5. `ql live clear --reason "Manual AAPL sale recorded; reconciliation OK"`.
+
+**Why the system halts instead of fixing itself.** Guessing which side is right
+is exactly the decision that needs a person.
+
+### 11.2 The system is halted
+
+*Meaning:* either monitoring found the strategy outside its bootstrapped range
+(the dashboard lists the reason), or reconciliation failed (11.1), or you halted
+it (`ql live halt --reason ...`).
+
+While halted, nothing rotates. Existing positions keep their stops at IBKR, so
+the downside of each position stays bounded.
+
+*Steps:*
+
+1. Read the dashboard: `ql monitor run --dry-run`, then open the page.
+2. Decide among three options:
+   - **Resume.** The cause is understood and does not invalidate the strategy
+     (a data error, a one-off event):
+     `ql live clear --reason "..."`. Clearing re-checks reconciliation first,
+     and refuses if there is still a mismatch.
+   - **Resume cautiously.** `ql live clear --to reduce_only --reason "..."`.
+     Existing positions run and nothing new is bought.
+   - **Exit.** `ql live propose --liquidate`, then `ql live approve` as usual.
+     It proposes selling every sleeve position at the next open. Even an exit
+     needs your typed approval.
+
+**Why a person must lift a halt.** A halt means the evidence says the system is
+no longer the one that was validated. Deciding it is fine again is a judgement,
+and the written reason is the record of that judgement.
+
+### 11.3 Data is stale
+
+*Symptom:* `propose` refuses with "the latest complete week is N days old", or
+the dashboard shows a data-age warning.
+
+*Steps:* `ql data refresh` (gateway needed), then continue the cycle. If the
+refresh fails for some symbols, see the error column. A symbol that fails
+repeatedly may have been delisted or renamed.
+
+### 11.4 An order was not filled, or was rejected
+
+*Symptom:* after Monday's sync, an order shows cancelled or rejected; or
+`propose` says orders are still working.
+
+*Steps:*
+
+1. `ql live sync` records the final status. Rejections carry IBKR's message
+   (for example no trading permission, or insufficient funds).
+2. Once no orders are working, `ql live propose` computes a fresh proposal from
+   the current sleeve. It contains whatever is still missing.
+3. MOO orders placed after the auction cutoff are rejected by IBKR. The next
+   approval window is the next morning's open.
+
+### 11.5 A stop fired
+
+This is normal, and nothing is required. The next `ql live sync` records the
+fill. The name is not bought back until the next rotation.
+
+### 11.6 You traded in the account yourself
+
+- **You bought something the sleeve does not hold.** Reconciliation warns that
+  it is "held at the broker but not by the sleeve". To silence it, list the
+  ticker under `unmanaged:` in the config. The strategy will never touch it.
+- **You changed a sleeve position.** Treat it as 11.1.
+
+### 11.7 Deposits and withdrawals
+
+The sleeve does not see the account's cash movements. To give the strategy more
+or less capital:
+
+```bash
+ql live adjust --cash-delta 10000 --reason "Added 10k to the strategy on 5 Oct"
+```
+
+Also update `sleeve_capital` in the config for the record.
+
+### 11.8 The gateway disconnects, or you forget a week
+
+Nothing breaks: stops rest at IBKR, and nothing is sent without you. When you
+are back:
+
+1. `ql data refresh`
+2. `ql live sync`
+3. `ql monitor run`
+4. `ql live propose`
+
+A proposal that expired stays in the journal as expired, which monitoring
+counts.
+
+### 11.9 A command refuses
+
+Every refusal starts with `error:` and says what to do next. Refusals are the
+system working. Nothing is half-done when a command refuses: the check runs
+before anything is recorded or sent.
+
+---
+
+## 12. From paper to live money
+
+**Minimum before switching:**
+
+1. At least one full rotation cycle, four weeks, on paper, including one
+   rotation with sells and buys. Every step of section 9 must have been done by
+   you.
+2. Every paper sync reconciled `OK` or `WARN`, never `MISMATCH`.
+3. Stops were placed after each rotation, and `ql live status` showed a stop on
+   every position.
+4. `ql monitor run` produced a dashboard you could read without this manual
+   open.
+
+**The switch:**
+
+1. In IB Gateway, log in to the **live** account. The API settings are the same
+   (step 7.1), but the port is **4001**.
+2. In `configs/live.yaml` set `mode: live`, `account: U…` (your live account)
+   and `gateway.port: 4001`. Set `sleeve_capital` to the amount you intend to
+   commit. Start smaller than the final amount.
+3. `ql live status`. It must say `connected U… (live)`.
+4. `ql monitor baseline`. Baselines are per mode, so this builds the live one.
+5. `ql live init`, or `ql live init --adopt …`.
+6. From now on, `approve` asks you to type `LIVE <id>`.
+
+The paper journal stays in `state/live/paper-journal.jsonl`. To keep paper
+running alongside live, keep a second config (for example
+`configs/paper.yaml`) and pass it explicitly:
+`ql --config configs/paper.yaml live status`.
+
+---
+
+## 13. Files, state and backups
+
+| path | what | if lost |
+|---|---|---|
+| `data/ibkr_cache/` | raw CSVs, committed | Recoverable from git. |
+| `var/store/` | derived store | Rebuild: `ql data ingest --rebuild`. |
+| `state/live/<mode>-journal.jsonl` | **every live event; the sleeve is replayed from it** | **Not recoverable.** The sleeve's history, costs and overrides are gone. |
+| `state/live/<mode>-baseline.json` | the monitoring reference | Rebuild with `ql monitor baseline`. |
+| `state/research.jsonl` | every research trial | **Not recoverable.** The trial count behind the DSR is gone. |
+| `state/reports/` | report pages and their data | Re-render from the JSON; re-run to regenerate. |
+| `configs/live.yaml` | your config | Re-create from the example. |
+
+**Back up `state/`.** It is gitignored on purpose, because it names your account
+and positions. The repository lives in iCloud Drive, which syncs it, but sync is
+not a backup. Copy `state/` somewhere else after each weekly cycle.
+
+**The journal refuses to be edited.** Each line carries a sequence number. A
+truncated, reordered or hand-edited journal fails its integrity check, and the
+system stops rather than trading on a history it cannot trust. Corrections go
+through `ql live adjust`, which *appends* a correction with a reason. Never edit
+the file.
+
+**iCloud "Optimise Mac Storage".** If it is enabled, macOS may offload files it
+thinks are unused. Right-click the `quant-lab` folder and choose **Keep
+Downloaded**.
+
+---
+
+## 14. Things that will bite
+
+- **Changing a strategy parameter changes the strategy's identity.** The
+  version includes a hash of the parameters, so the ledger treats a 13-week and
+  a 26-week lookback as two strategies. The monitoring baseline refuses
+  settings it was not built for. Evidence earned by one does not transfer to
+  the other.
+- **The funnel takes minutes.** About 75 backtests. It resumes, so interrupting
+  it is safe.
+- **Market-on-open has a cutoff.** 09:28 New York time. An approval after that
+  is rejected by IBKR and has to wait for the next open (11.4).
+- **Two API programs with the same client id** disconnect each other. Keep
+  `gateway.client_id` unique.
+- **IB Gateway restarts daily** at the IBKR server reset, and needs a fresh
+  login at least once a week. Check it is logged in before the weekly cycle.
+- **The system does not send orders on its own**, and no flag makes it.
+
+---
+
+## 15. Changing the code safely
+
+```bash
+pytest -q && ruff check .
+```
+
+Both run in CI on every push, along with:
+
+- the ingest;
+- the causality demo;
+- the convention reconciliation;
+- `ql data status` and a `ql backtest --report`;
+- a reduced funnel.
+
+The layering is enforced by `tests/test_architecture.py`. For example,
+`reports/` may import only `contracts` and `validation`, and `strategies/` only
+`contracts`. A new package must be added there deliberately.
+
+The live code is tested against a stand-in gateway (`tests/fake_gateway.py`)
+that uses the real `ib_async` types, and the whole weekly cycle is driven
+through the `ql` command in `tests/test_cli.py`.
+
+The house rule: **a guard that has never failed and a guard that cannot fail
+look identical from the outside.** If you add a check, add a test that makes it
+fail.
+
+---
+
+## 16. Command reference
+
+🔌 = needs IB Gateway running and logged in.
+
+| command | what it does |
+|---|---|
+| `ql data status [-v]` | cache and store contents, data age |
+| `ql data refresh [--symbols A,B] [--duration "2 Y"]` 🔌 | append the latest weekly bars |
+| `ql data fetch --symbols A,B --freq weekly` 🔌 | add instruments to the universe |
+| `ql data import A=a.json … \| --from-dir DIR` | add instruments from saved payloads |
+| `ql data ingest --rebuild` | rebuild the store from the cache |
+| `ql backtest [options] [--report]` | backtest; recorded in the ledger |
+| `ql funnel [--controls N]` | the five research gates |
+| `ql live init [--adopt A,B]` 🔌 | open the sleeve (once per mode) |
+| `ql live sync` 🔌 | fills, statuses, stops, snapshot, reconciliation |
+| `ql live status [--offline]` | state, equity, positions, stops |
+| `ql live propose [--liquidate]` 🔌 | compute orders; sends nothing |
+| `ql live approve [ID] [--confirm CODE]` 🔌 | send the pending proposal after the typed code |
+| `ql live reject ID --reason "…"` | decline; recorded as an override |
+| `ql live stops` 🔌 | place any missing protective stops |
+| `ql live reconcile` 🔌 | compare sleeve and account, and record it |
+| `ql live adjust [--instrument T --quantity Q] [--average-cost C] [--cash-delta X] --reason "…"` | correct the sleeve |
+| `ql live pause --reason "…"` | reduce-only until you clear it |
+| `ql live halt --reason "…"` | no rotations until you clear it |
+| `ql live clear [--to normal\|reduce_only] --reason "…"` 🔌 | lift a pause or halt (reconciles first) |
+| `ql live journal [--tail N] [--kind K] [--full]` | read the event journal |
+| `ql monitor baseline` | build the monitoring reference |
+| `ql monitor run [--dry-run] [--no-report] [--benchmark SPY]` | every check, the state, the dashboard |
+| `ql report list` | recent report pages |
+| `ql report render FILE.json [--out FILE.html]` | re-render a saved report |
+
+Global options: `--config PATH` (default `configs/live.yaml`) and `--store PATH`
+(default `var/store`). Every command has `--help`.

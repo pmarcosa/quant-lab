@@ -63,7 +63,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--controls", type=int, default=60)
     parser.add_argument("--rebalance-weeks", type=int, default=4)
-    parser.add_argument("--ledger", default=str(ROOT / "var" / "research.jsonl"))
+    # The ledger lives in state/, not var/: var/ is derived and safe to delete,
+    # and the trial count behind the DSR cannot be rebuilt once it is gone.
+    parser.add_argument("--ledger", default=str(ROOT / "state" / "research.jsonl"))
     args = parser.parse_args(argv)
 
     if not (STORE / "universe_weekly.csv").exists():

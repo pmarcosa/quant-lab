@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -26,9 +26,6 @@ from data.universe import PointInTimeUniverse
 #: last bar, never to answer a question about a decision.
 _FAR_FUTURE = datetime(2100, 1, 1, tzinfo=timezone.utc)
 
-#: Bars are stamped available a quarter of an hour after the session close by the
-#: ingest, so a decision taken on a close happens at the close plus this.
-DECISION_OFFSET = timedelta(minutes=15)
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +84,10 @@ class MarketWindow:
             known = store.as_of(instrument, horizon, fields=["open", "low", "close"])
             if known.empty:
                 continue
+            # When each bar first became knowable. The decision for a week is
+            # scheduled after the last of these, so a bar fetched on a Saturday
+            # is decided on after the fetch, not at a time it did not yet exist.
+            first = store.first_known(instrument, horizon).reindex(known.index)
             iso = known.index.isocalendar()
             weeks = pd.MultiIndex.from_arrays([iso.year, iso.week])
             # Two bars in one week happens where a session was split. The later
@@ -97,8 +98,8 @@ class MarketWindow:
             opens[str(instrument)] = pd.Series(frame["open"].astype(float).values, index=index)
             lows[str(instrument)] = pd.Series(frame["low"].astype(float).values, index=index)
             closes[str(instrument)] = pd.Series(frame["close"].astype(float).values, index=index)
-            for week, stamp in zip(index, frame.index, strict=True):
-                stamps.setdefault(week, []).append(stamp)
+            for week, event in zip(index, frame.index, strict=True):
+                stamps.setdefault(week, []).append(first.loc[event])
 
         if not closes:
             raise ContractViolation("no instruments had any bars at this horizon")
@@ -114,9 +115,12 @@ class MarketWindow:
         # One entry per frame row, always. ``schedule`` is a subset of these;
         # the two are kept separate because indexing the frames by a position in
         # a filtered schedule reads a different week and does it silently.
+        #
+        # The moment is when the last instrument's bar for the week first became
+        # knowable -- which already includes the publication lag, because the
+        # store's available time does.
         index = tuple(
-            max(stamps[tuple(week)]).to_pydatetime() + DECISION_OFFSET
-            for week in close_frame.index
+            max(stamps[tuple(week)]).to_pydatetime() for week in close_frame.index
         )
         schedule = tuple(m for m in index if start is None or m >= utc(start))
 
@@ -231,16 +235,20 @@ def load_market(
     universe = PointInTimeUniverse.from_csv(root / f"universe_{frequency}.csv")
 
     if horizon is None:
+        # Everything the store knows, and no more. Taken from the stored
+        # available times rather than the wall clock, so the same store always
+        # loads the same way -- and a bar fetched on a Saturday, whose available
+        # time is Saturday, is inside the horizon rather than just past it.
         latest = max(
             (
-                store.as_of(instrument, _FAR_FUTURE).index.max()
+                store.as_of(instrument, _FAR_FUTURE)["available_time"].max()
                 for instrument in store.instruments()
             ),
             default=None,
         )
-        if latest is None:
+        if latest is None or pd.isna(latest):
             raise ContractViolation(f"dataset {dataset} is empty")
-        horizon = latest.to_pydatetime() + timedelta(days=1)
+        horizon = latest.to_pydatetime()
 
     return Market(
         store=store,

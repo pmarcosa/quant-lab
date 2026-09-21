@@ -165,6 +165,31 @@ class BitemporalStore:
             latest = latest[["available_time", *fields]]
         return latest
 
+    def first_known(self, instrument: InstrumentId, horizon: datetime) -> pd.Series:
+        """For each event, the moment it was *first* knowable, up to ``horizon``.
+
+        Distinct from :meth:`as_of`, which returns the latest revision. When a
+        split restates a year of history, every restated row arrives with a new
+        ``available_time``; asking when a week became knowable must still answer
+        with the original publication, not the restatement, or every past
+        decision would appear to have been taken today.
+
+        Returns:
+            Series of first ``available_time`` indexed by ``event_time``, oldest
+            first. Empty when nothing was knowable.
+        """
+        moment = utc(horizon)
+        target = self._file(instrument)
+        if not target.exists():
+            return pd.Series(dtype="datetime64[ns, UTC]")
+        frame = pd.read_csv(target, usecols=list(TIME_COLUMNS))
+        for column in TIME_COLUMNS:
+            frame[column] = pd.to_datetime(frame[column], utc=True, format="ISO8601")
+        known = frame[(frame["event_time"] <= moment) & (frame["available_time"] <= moment)]
+        if known.empty:
+            return pd.Series(dtype="datetime64[ns, UTC]")
+        return known.groupby("event_time")["available_time"].min().sort_index()
+
     def first_event_at(
         self, instrument: InstrumentId, decision_time: datetime
     ) -> datetime | None:

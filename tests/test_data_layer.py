@@ -53,7 +53,9 @@ def test_a_query_cannot_see_past_its_decision_time(loaded_store: BitemporalStore
 def test_a_bar_is_not_knowable_until_it_is_published(store: BitemporalStore) -> None:
     """The publication lag is real: at the close itself the print is not final."""
     store.append(OLD, to_observations(weekly_bars("2026-09-04", 3)))
-    close = datetime(2026, 9, 18, 20, 0, tzinfo=timezone.utc)
+    # 21:00 UTC: the close taken at its later seasonal value, so no bar is ever
+    # stamped before its session ended.
+    close = datetime(2026, 9, 18, 21, 0, tzinfo=timezone.utc)
     assert len(store.as_of(OLD, close)) == 2
     assert len(store.as_of(OLD, close + timedelta(minutes=20))) == 3
 
@@ -199,3 +201,99 @@ def test_the_filtration_exposes_no_date_range_parameter() -> None:
     for name in ("history", "frame", "is_available"):
         parameters = set(inspect.signature(getattr(StoreFiltration, name)).parameters)
         assert not parameters & {"start", "end", "until", "as_of", "date_range"}
+
+
+# -- weekly labelling and completeness ---------------------------------------
+
+
+def test_a_weekly_bar_is_stamped_at_the_end_of_its_week() -> None:
+    """IBKR labels a weekly bar with its first session; it closes on Friday."""
+    from data.ingest import bar_close
+
+    monday_label = datetime(2026, 9, 14)
+    tuesday_label = datetime(2026, 9, 8)  # a week that began on a holiday Monday
+    assert bar_close(monday_label, week_ending=True) == datetime(
+        2026, 9, 18, 21, 0, tzinfo=timezone.utc
+    )
+    assert bar_close(tuesday_label, week_ending=True).date().isoformat() == "2026-09-11"
+    assert bar_close(monday_label).date().isoformat() == "2026-09-14", "daily keeps its day"
+
+
+def test_only_bars_that_have_closed_are_kept() -> None:
+    """A finished week fetched on Saturday is kept; the week in progress is not."""
+    from data.ingest import complete_bars
+
+    index = pd.to_datetime(["2026-09-07", "2026-09-14", "2026-09-21"])
+    bars = pd.DataFrame({"close": [1.0, 2.0, 3.0]}, index=index)
+    saturday = datetime(2026, 9, 19, 10, 0, tzinfo=timezone.utc)
+    kept = complete_bars(bars, saturday, week_ending=True)
+    assert list(kept["close"]) == [1.0, 2.0]
+    friday_before_close = datetime(2026, 9, 18, 20, 30, tzinfo=timezone.utc)
+    assert list(complete_bars(bars, friday_before_close, week_ending=True)["close"]) == [1.0]
+
+
+def test_rows_fetched_late_are_stamped_with_the_fetch() -> None:
+    """A live refresh records when the system actually learned the bar."""
+    from data.ingest import to_observations
+
+    bars = pd.DataFrame({"close": [1.0]}, index=pd.to_datetime(["2026-09-14"]))
+    fetched = datetime(2026, 9, 19, 9, 30, tzinfo=timezone.utc)
+    rows = to_observations(bars, week_ending=True, available_at=fetched)
+    assert rows["available_time"].iloc[0] == pd.Timestamp(fetched)
+    assert rows["event_time"].iloc[0] == pd.Timestamp("2026-09-18 21:00", tz="UTC")
+
+
+def test_first_known_ignores_later_restatements(store: BitemporalStore) -> None:
+    """A split restates history; when a week became knowable does not change."""
+    original = to_observations(weekly_bars("2026-01-02", 10))
+    store.append(OLD, original)
+    restated = original.copy()
+    restated["close"] = restated["close"] / 2
+    restated["available_time"] = pd.Timestamp("2026-09-19", tz="UTC")
+    store.revise(OLD, restated)
+    first = store.first_known(OLD, datetime(2026, 12, 31, tzinfo=timezone.utc))
+    assert (first.values == original["available_time"].values).all()
+    latest = store.as_of(OLD, datetime(2026, 12, 31, tzinfo=timezone.utc))
+    assert latest["close"].iloc[0] == original["close"].iloc[0] / 2, "prices are the latest"
+
+
+def test_a_split_week_becomes_one_weekly_bar() -> None:
+    """Two bars in one ISO week are one week, not a phantom extra one."""
+    from data.ingest import merge_split_weeks
+
+    index = pd.to_datetime(["2026-06-29", "2026-07-01", "2026-07-06"])
+    bars = pd.DataFrame(
+        {
+            "open": [10.0, 11.0, 12.0], "high": [11.0, 13.0, 12.5],
+            "low": [9.5, 10.5, 11.5], "close": [10.8, 12.2, 12.1],
+            "volume": [100, 50, 80],
+        },
+        index=index,
+    )
+    merged = merge_split_weeks(bars)
+    assert len(merged) == 2
+    week = merged.iloc[0]
+    assert (week["open"], week["high"], week["low"], week["close"], week["volume"]) == (
+        10.0, 13.0, 9.5, 12.2, 150
+    )
+    assert merged.index[0] == pd.Timestamp("2026-06-29"), "the vendor's first label is kept"
+
+
+def test_relabelling_within_a_week_does_not_change_what_is_stored(tmp_path) -> None:
+    """The vendor's choice of label is irrelevant once bars are stamped at week-end.
+
+    The same four weeks, labelled once on Mondays and once on assorted weekdays,
+    must produce identical observations. This is the half of the 2026-09-21
+    change that is supposed to be result-neutral, pinned on its own.
+    """
+    from data.ingest import to_observations
+
+    values = {"open": [1.0, 2.0, 3.0, 4.0], "close": [1.5, 2.5, 3.5, 4.5]}
+    mondays = pd.DataFrame(values, index=pd.to_datetime(
+        ["2026-08-03", "2026-08-10", "2026-08-17", "2026-08-24"]))
+    assorted = pd.DataFrame(values, index=pd.to_datetime(
+        ["2026-08-04", "2026-08-12", "2026-08-17", "2026-08-28"]))
+    pd.testing.assert_frame_equal(
+        to_observations(mondays, week_ending=True),
+        to_observations(assorted, week_ending=True),
+    )

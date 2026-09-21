@@ -48,7 +48,7 @@ def main() -> int:
     strategy = WeeklyMomentum(params, precomputed=precompute_indicators(market, params))
     costs = CostModel(commission_bps=10.0, slippage_bps=10.0)
     policy = SizingPolicy(cash_buffer=0.01, min_trade_fraction=0.005)
-    ledger = ResearchLedger(ROOT / "var" / "research.jsonl")
+    ledger = ResearchLedger(ROOT / "state" / "research.jsonl")
 
     print(f"{len(schedule)} weekly marks, {schedule[0].date()} to {schedule[-1].date()}")
     print(f"{'stop':<10}{'CAGR':>8}{'vol':>8}{'Sharpe':>8}{'Sortino':>9}"

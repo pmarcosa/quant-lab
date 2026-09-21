@@ -34,7 +34,18 @@ def main(argv: list[str] | None = None) -> int:
         default="2026-06-01",
         help="A last bar at or after this date means the instrument is presumed live.",
     )
+    parser.add_argument(
+        "--rebuild", action="store_true",
+        help="Delete the derived store and rebuild it. Touches var/store only; "
+             "the research ledger and the live journal live in state/ and are kept.",
+    )
     args = parser.parse_args(argv)
+
+    if args.rebuild and STORE.exists():
+        import shutil
+
+        shutil.rmtree(STORE)
+        print(f"removed {STORE.relative_to(ROOT)}")
 
     cutoff = datetime.fromisoformat(args.still_trading_after).replace(tzinfo=timezone.utc)
     frequencies = ("weekly", "daily") if args.freq == "both" else (args.freq,)
@@ -44,13 +55,13 @@ def main(argv: list[str] | None = None) -> int:
         dataset = f"bars_{interval.value.lower()}"
         store = BitemporalStore(STORE, dataset)
         if store.path.exists():
-            print(f"{dataset}: already present, skipping (delete var/store to rebuild)")
+            print(f"{dataset}: already present, skipping (use --rebuild to rebuild)")
             continue
 
-        # The final weekly bar is the week in progress: its high, low and close are
-        # not final, and a partial bar is a live-versus-backtest discrepancy.
+        # Weekly bars are stamped at their week's close; any bar whose session
+        # has not closed yet is left out rather than stored half-finished.
         written = ingest_directory(
-            CACHE / frequency, store, drop_last_bar=(frequency == "weekly")
+            CACHE / frequency, store, week_ending=(frequency == "weekly")
         )
         print(f"{dataset}: {len(written)} instruments, {sum(written.values()):,} observations")
 

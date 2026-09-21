@@ -1,0 +1,52 @@
+# quant-lab live configuration.
+#
+# Copy this file to configs/live.yaml and fill it in. configs/live.yaml is
+# gitignored because it names your brokerage account.
+#
+# Start with mode: paper. Move to live only after a full weekly cycle has run
+# cleanly on paper (see docs/MANUAL.md, section 12).
+
+mode: paper                 # paper | live
+account: DU0000000          # paper accounts start with DU, live with U
+
+# The capital the strategy manages. It sizes against this, not against the
+# whole account: anything else you hold at IBKR is invisible to it.
+sleeve_capital: 25000
+
+gateway:
+  host: 127.0.0.1
+  port: 4002                # IB Gateway: 4002 paper / 4001 live. TWS: 7497 / 7496
+  client_id: 17
+
+strategy:
+  rebalance_weeks: 4
+  top_n: 4
+  lookback_weeks: 13
+
+risk:
+  stop_distance: 0.12       # protective stop, from the rotation price. 0 disables it
+  max_gross: 1.0
+  max_order_fraction: 0.6   # no single order above this share of sleeve equity
+
+monitoring:
+  # Thresholds for the degradation ladder: normal -> reduce-only -> halted.
+  # The defaults are the project expert's. See docs/MANUAL.md, section 10.
+  reduce_percentile: 0.80          # live drawdown vs bootstrapped backtest windows
+  halt_percentile: 0.99            # expert: 0.95, or 0.99 for high tolerance (see manual)
+  reduce_break_probability: 0.20   # changepoint probability during live trading
+  halt_break_probability: 0.50
+  reduce_shortfall_multiple: 1.5   # execution cost vs what the backtest modelled
+  halt_shortfall_alpha_share: 0.5  # cost eating half the expected return...
+  halt_shortfall_cycles: 2         # ...for this many rotations in a row
+  trend_min_weeks: 26
+  bootstrap_paths: 5000
+  bootstrap_block_weeks: 6
+  changepoint_hazard_weeks: 250
+  max_data_age_days: 10
+
+# How long a proposal stays approvable. Orders go to the opening auction, so a
+# proposal made on Saturday must survive until Monday morning.
+proposal_ttl_hours: 60
+
+# Tickers held in the account that the strategy must never trade.
+unmanaged: []

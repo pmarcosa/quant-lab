@@ -14,8 +14,12 @@ dependencies = [
     "scipy>=1.10",
 ]
 
+[project.scripts]
+ql = "runtime.cli:main"
+
 [project.optional-dependencies]
-dev = ["pytest>=7.4", "ruff>=0.5"]
+# ib_async is in dev so CI exercises the IBKR adapter against the stand-in gateway.
+dev = ["pytest>=7.4", "ruff>=0.5", "ib_async>=1.0"]
 ibkr = ["ib_async>=1.0"]
 
 [tool.hatch.build.targets.wheel]

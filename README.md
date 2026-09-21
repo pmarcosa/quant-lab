@@ -10,10 +10,14 @@ a universe assembled with hindsight, a live path that quietly takes a shortcut t
 backtest never exercised. So the framework makes the seam between them a single
 object (a `Filtration`) instead of a convention people remember to follow.
 
-Status: **phases 0–4 complete** — contracts and data, the engine, the
-falsification funnel and research ledger, and a risk layer that may only reduce
-exposure. Execution stays proposal-only throughout: the system does not send
-orders.
+Status: **phases 0–5 complete** — contracts and data, the engine, the
+falsification funnel and research ledger, a risk layer that may only reduce
+exposure, and live trading through IBKR with monitoring and reports. Execution
+is proposal-plus-typed-approval: the system computes orders, and only a person
+typing the proposal's code sends them.
+
+**To use it, read [docs/MANUAL.md](docs/MANUAL.md).** Everything runs through
+one command, `ql` (`pip install -e ".[dev]"`, then `ql --help`).
 
 ## What is guaranteed today
 
@@ -123,11 +127,12 @@ access/      Who may do what (a null-object local owner, for now).
 data/        Bitemporal store, point-in-time universe, filtration, ingest.
 strategies/  Strategies. Sees contracts only — never the engine, never a peer.
 engine/      Accounting, the decision, the loop. One implementation.
-risk/        Limits and kill switches. Empty: phase 4.
-validation/  Performance measurement; the funnel and ledger come in phase 3.
-reports/     Presentation. Reads results, never computes them. Empty.
-execution/   Broker adapters behind one port. Simulated one today.
-runtime/     The composition root. Imports everything; imported by nothing.
+risk/        Limits, the protective stop, reduce-only.
+validation/  Metrics, CPCV, DSR/PBO, the funnel, the ledger, live monitoring statistics.
+reports/     Report documents (versioned JSON) and offline HTML. Never computes.
+execution/   Broker adapters behind one port: simulated, and IBKR (ib_async).
+runtime/     The composition root: the `ql` CLI, the live session and journal,
+             monitoring, data refresh. Imports everything; imported by nothing.
 ```
 
 The dependency rules are in `tests/test_architecture.py:ALLOWED`, and they are
@@ -242,7 +247,37 @@ noise looks like. The default is 12% because that is what the live system runs;
 whether to keep it is a judgement about sleeping at night, not a number this
 table settles.
 
+## Live trading and monitoring
+
+`runtime/live.py` runs a **sleeve**: a fixed amount of capital inside an IBKR
+account, whose positions are replayed from an append-only, integrity-checked
+journal (`runtime/journal.py`). Each week, `ql live propose` computes orders
+with the same engine the backtest uses. `ql live approve` sends them as
+market-on-open orders, the fill the backtest assumes, only after the person
+types the proposal's code. Before sending, it checks that the sleeve has not
+changed since the proposal was made.
+
+After every sync, the sleeve is reconciled against the account. If the broker
+holds less than the sleeve believes, the system halts.
+
+`validation/monitoring.py` judges live results against distributions built from
+the backtest, never against a single number. It uses four checks:
+
+- the live drawdown's percentile among stationary-bootstrap paths of the same
+  length;
+- online changepoint detection;
+- a robust trend with a bootstrap interval;
+- implementation shortfall against the decision price and the modelled cost.
+
+The checks drive a degradation ladder: NORMAL → REDUCE_ONLY → HALTED.
+Monitoring can impose a halt, but only a person lifts one. The thresholds and
+their measured false-alarm rates are in the manual, section 10.
+
+`reports/` renders a backtest report and a live dashboard as self-contained HTML
+from a versioned JSON document.
+
 ## What is not here yet
 
-**Phase 5** is paper trading and autonomy. Execution stays
-proposal-plus-manual-approval throughout. The system does not send orders.
+- **Delisted instruments.** The universe carries survivorship bias until
+  point-in-time data is bought.
+- **Automatic execution.** Not planned: approval stays manual by design.

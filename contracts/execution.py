@@ -49,8 +49,18 @@ class OrderType(str, Enum):
 
 
 class TimeInForce(str, Enum):
+    """How long an order stays working.
+
+    ``OPG`` is "at the opening": a market order that participates in the opening
+    auction and nothing else. It exists because it is the live counterpart of the
+    backtest's fill convention -- a decision taken on Friday's close is filled at
+    Monday's open in both -- so the live system and the simulation are measured
+    against the same price rather than two different ones.
+    """
+
     DAY = "day"
     GTC = "gtc"
+    OPG = "opg"
 
 
 class OrderStatus(str, Enum):

@@ -21,6 +21,10 @@ jobs:
       - run: python scripts/ingest_ibkr_cache.py
       - run: python scripts/demo_causality.py
       - run: python scripts/reconcile_conventions.py
+      # The command a person uses, on the real store: status, and a backtest
+      # with its report, recorded to a throwaway ledger.
+      - run: ql data status
+      - run: ql backtest --report --ledger /tmp/ci-ledger.jsonl
       # The funnel is slow (seventy-five backtests); CI runs a reduced
       # control set so the gates themselves stay exercised on every push.
       - run: python scripts/run_funnel.py --controls 20

@@ -91,6 +91,44 @@ class GrossExposureLimit:
 
 
 @dataclass(frozen=True, slots=True)
+class ReduceOnly:
+    """No new buying: exits and trims pass, purchases do not.
+
+    What the live system runs under when monitoring has seen something it cannot
+    yet explain — a drawdown in the tail of the backtest's distribution, a rising
+    probability that the return process has changed, execution costing more than
+    it should. It stops the book from growing into a problem while a person
+    looks. It cannot make anything worse, which is the only property a rule that
+    fires on uncertain evidence may have.
+    """
+
+    reason: str = "reduce-only"
+
+    @property
+    def name(self) -> str:
+        return "reduce only"
+
+    def apply(
+        self,
+        intents: Sequence[OrderIntent],
+        positions: Mapping[InstrumentId, PositionRisk],
+        equity: float,
+    ) -> tuple[tuple[OrderIntent, ...], tuple[RiskFinding, ...]]:
+        kept = tuple(i for i in intents if i.side is Side.SELL)
+        dropped = [i for i in intents if i.side is Side.BUY]
+        findings = tuple(
+            RiskFinding(
+                rule=self.name,
+                severity=Severity.LIMIT,
+                instrument=i.instrument,
+                message=f"buy of {i.quantity:.0f} withheld: {self.reason}",
+            )
+            for i in dropped
+        )
+        return kept, findings
+
+
+@dataclass(frozen=True, slots=True)
 class CorrelatedClusterWarning:
     """Warn when correlated names together pass a share of the book.
 

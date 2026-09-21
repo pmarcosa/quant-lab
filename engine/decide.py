@@ -63,11 +63,16 @@ class SizingPolicy:
         allow_short: Whether a negative target weight may open a short. Off by
             default: a strategy that emits one by accident should fail, not
             silently borrow stock.
+        time_in_force: For the rotation's market orders. ``OPG`` -- the opening
+            auction -- is the default because it is the live counterpart of the
+            backtest's fill: a decision on Friday's close fills at Monday's open
+            in both, so live and simulated results are measured at one price.
     """
 
     cash_buffer: float = 0.01
     min_trade_fraction: float = 0.005
     allow_short: bool = False
+    time_in_force: TimeInForce = TimeInForce.OPG
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.cash_buffer < 1.0:
@@ -256,7 +261,7 @@ def decide(
                 quantity=quantity,
                 order_type=OrderType.MARKET,
                 decision_time=moment,
-                time_in_force=TimeInForce.DAY,
+                time_in_force=policy.time_in_force,
                 reason=_reason(held, desired),
             )
         )

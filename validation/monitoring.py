@@ -16,11 +16,11 @@ Four instruments, from the project's expert, each answering a different question
    distribution says how unusual it is *for this strategy*, not for strategies in
    general. The same paths give a prediction band for cumulative return.
 2. **Online changepoint detection.** Bayesian online changepoint detection (Adams
-   and MacKay) runs over the backtest and then the live weeks, and reports the
+   and MacKay) runs over the backtest and then the live bars, and reports the
    posterior probability that the return process changed during live trading.
-3. **Robust trend.** The median weekly return, with a bootstrap interval.
-   Judged only after enough weeks, and only when the whole interval is below
-   zero: a point estimate on a few dozen weeks is noise.
+3. **Robust trend.** The median return per bar, with a bootstrap interval.
+   Judged only after enough bars, and only when the whole interval is below
+   zero: a point estimate on a few dozen bars is noise.
 4. **Implementation shortfall.** What execution cost against the decision price,
    compared with what the backtest assumed. It separates "the signal stopped
    working" from "the fills got worse", which call for different responses.
@@ -50,7 +50,7 @@ def stationary_bootstrap(
 ) -> np.ndarray:
     """Synthetic return paths that keep the series' short-range dependence.
 
-    Each path starts at a random week and continues through consecutive weeks,
+    Each path starts at a random bar and continues through consecutive bars,
     jumping to a new random start with probability ``1/block`` at each step, and
     wrapping at the end. Blocks of random length keep the volatility clustering
     and momentum persistence an independent resample would destroy, which is what
@@ -92,23 +92,25 @@ class DrawdownCheck:
     live_return: float
     band_low_10: float
     band_low_1: float
-    weeks: int
+    periods: int
 
 
 def drawdown_check(
     backtest_returns: Sequence[float], live_returns: Sequence[float],
-    paths: int = 5000, block: float = 6.0,
+    paths: int = 5000, block: float = 6.0, horizon: int = 52,
 ) -> DrawdownCheck | None:
     """The live drawdown and cumulative return, placed in the bootstrap's distribution.
 
-    The horizon is the live record's own length, capped at a year. Comparing a
-    ten-week live drawdown with the distribution of one-year drawdowns — as a
-    fixed 52-week window would — understates how unusual an early loss is.
+    The horizon is the live record's own length, capped at ``horizon`` bars (a
+    year: 52 weekly bars, 252 daily ones). Comparing a ten-week live drawdown
+    with the distribution of one-year drawdowns -- as a fixed one-year window
+    would -- understates how unusual an early loss is. ``block`` is the mean
+    bootstrap block length in bars.
     """
     live = np.asarray(live_returns, dtype=float)
     if live.size == 0:
         return None
-    window = live[-52:]
+    window = live[-max(int(horizon), 1):]
     simulated = stationary_bootstrap(backtest_returns, window.size, paths, block)
     drawdowns = max_drawdown(simulated)
     observed = float(max_drawdown(window)[0])
@@ -119,7 +121,7 @@ def drawdown_check(
         live_return=float(np.prod(1.0 + window) - 1.0),
         band_low_10=float(np.quantile(cumulative, 0.10)),
         band_low_1=float(np.quantile(cumulative, 0.01)),
-        weeks=int(window.size),
+        periods=int(window.size),
     )
 
 
@@ -127,13 +129,13 @@ def drawdown_check(
 
 
 def changepoint_probability(
-    reference: Sequence[float], live: Sequence[float], hazard_weeks: float = 250.0
+    reference: Sequence[float], live: Sequence[float], hazard_bars: float = 250.0
 ) -> float:
     """Posterior probability that the return process changed during live trading.
 
     Bayesian online changepoint detection with a Normal-Gamma model and a
-    constant hazard. The run length is the number of weeks since the last
-    change; after the backtest and then the live weeks have been processed, the
+    constant hazard. The run length is the number of bars since the last
+    change; after the backtest and then the live bars have been processed, the
     answer is the posterior mass on run lengths shorter than the live record.
 
     The prior for a *new* regime is deliberately vague — centred on zero with a
@@ -158,8 +160,8 @@ def changepoint_probability(
     data = np.concatenate([history, recent])
     scale = float(np.std(history, ddof=1)) if history.size > 1 else float(np.std(data))
     scale = scale if scale > 0 else 1e-3
-    log_h = math.log(1.0 / hazard_weeks)
-    log_1mh = math.log(1.0 - 1.0 / hazard_weeks)
+    log_h = math.log(1.0 / hazard_bars)
+    log_1mh = math.log(1.0 - 1.0 / hazard_bars)
 
     # Vague prior: mean 0, weak confidence, variance of the right order.
     mu0, kappa0, alpha0 = 0.0, 1.0, 1.0
@@ -204,10 +206,10 @@ def changepoint_probability(
 
 @dataclass(frozen=True, slots=True)
 class TrendCheck:
-    weekly_slope: float
+    slope: float  # median log return per bar
     low: float
     high: float
-    weeks: int
+    periods: int
     judged: bool
 
     @property
@@ -216,11 +218,11 @@ class TrendCheck:
 
 
 def trend_check(
-    live_returns: Sequence[float], min_weeks: int = 26, paths: int = 2000, block: float = 4.0
+    live_returns: Sequence[float], min_bars: int = 26, paths: int = 2000, block: float = 4.0
 ) -> TrendCheck | None:
     """The live equity trend, with an interval that means what it says.
 
-    The slope of log equity against time *is* the mean weekly log return, so it
+    The slope of log equity against time *is* the mean log return per bar, so it
     is estimated from the returns — robustly, as their median — and its interval
     comes from a stationary bootstrap of those returns.
 
@@ -243,8 +245,8 @@ def trend_check(
     else:
         low, high = float(live.min()), float(live.max())
     return TrendCheck(
-        weekly_slope=slope, low=low, high=high,
-        weeks=int(live.size), judged=live.size >= min_weeks,
+        slope=slope, low=low, high=high,
+        periods=int(live.size), judged=live.size >= min_bars,
     )
 
 
@@ -371,27 +373,31 @@ def shortfall_check(
 class ProcessMetrics:
     """How the person and the system are working together.
 
-    Asymmetry is the one to watch: buy compliance minus sell compliance. A
-    sustained positive number means buys are executed and sells are not — the
-    system proposes, and a person quietly overrules it on the way out, which is
-    the most expensive habit a discretionary override can have.
+    Asymmetry is the one to watch: entry compliance minus exit compliance. A
+    sustained positive number means new positions are taken and exits are not
+    -- the system proposes, and a person quietly overrules it on the way out,
+    which is the most expensive habit a discretionary override can have.
+
+    Entries and exits, not buys and sells: in a book that can be short,
+    covering a short is a buy and an exit, and opening one is a sale and an
+    entry. For a long-only book the two readings coincide.
     """
 
     proposals: int
     approved: int
     rejected: int
     expired: int
-    buy_compliance: float | None
-    sell_compliance: float | None
+    entry_compliance: float | None
+    exit_compliance: float | None
     median_latency_hours: float | None
     override_cost: float | None
     stop_coverage: float | None
 
     @property
     def asymmetry(self) -> float | None:
-        if self.buy_compliance is None or self.sell_compliance is None:
+        if self.entry_compliance is None or self.exit_compliance is None:
             return None
-        return self.buy_compliance - self.sell_compliance
+        return self.entry_compliance - self.exit_compliance
 
 
 # -- the verdict -------------------------------------------------------------
@@ -418,8 +424,9 @@ class Assessment:
     break_probability: float | None
     trend: TrendCheck | None
     shortfall: ShortfallCheck | None
-    weeks: int
+    periods: int
     notes: tuple[str, ...] = field(default_factory=tuple)
+    unit: str = "week"
 
 
 #: The expert's defaults. Frozen, so one shared instance is safe.
@@ -436,10 +443,20 @@ def assess(
     thresholds: Thresholds = DEFAULT_THRESHOLDS,
     paths: int = 5000,
     block: float = 6.0,
-    hazard_weeks: float = 250.0,
-    trend_min_weeks: int = 26,
+    hazard_bars: float = 250.0,
+    trend_min_bars: int = 26,
+    horizon: int = 52,
+    unit: str = "week",
 ) -> Assessment:
-    """Run every check and map the results onto the degradation ladder."""
+    """Run every check and map the results onto the degradation ladder.
+
+    Every length here is in bars of the strategy's own interval: ``block``,
+    ``hazard_bars``, ``trend_min_bars`` and ``horizon`` (the longest live
+    window compared). The caller converts calendar settings into bars
+    (``runtime.monitor``), so the same configuration means the same thing
+    whether the strategy trades weekly, daily or intraday. ``unit`` only
+    words the messages.
+    """
     t = thresholds
     state = DegradationState.NORMAL
     reasons: list[str] = []
@@ -450,16 +467,16 @@ def assess(
         state = state.worst(level)
         reasons.append(f"{level.value}: {reason}")
 
-    drawdown = drawdown_check(backtest_returns, live_returns, paths, block)
+    drawdown = drawdown_check(backtest_returns, live_returns, paths, block, horizon)
     if drawdown is not None:
         if drawdown.percentile > t.halt_percentile:
             at_least(DegradationState.HALTED,
                      f"drawdown {drawdown.live_drawdown:.1%} is deeper than "
-                     f"{drawdown.percentile:.0%} of {drawdown.weeks}-week backtest paths")
+                     f"{drawdown.percentile:.0%} of {drawdown.periods}-{unit} backtest paths")
         elif drawdown.percentile > t.reduce_percentile:
             at_least(DegradationState.REDUCE_ONLY,
                      f"drawdown {drawdown.live_drawdown:.1%} is deeper than "
-                     f"{drawdown.percentile:.0%} of {drawdown.weeks}-week backtest paths")
+                     f"{drawdown.percentile:.0%} of {drawdown.periods}-{unit} backtest paths")
         if drawdown.live_return < drawdown.band_low_1:
             at_least(DegradationState.HALTED,
                      f"return {drawdown.live_return:+.1%} is below the 1% prediction band "
@@ -470,7 +487,7 @@ def assess(
                      f"({drawdown.band_low_10:+.1%})")
 
     live = list(live_returns)
-    probability = changepoint_probability(backtest_returns, live, hazard_weeks) if live else None
+    probability = changepoint_probability(backtest_returns, live, hazard_bars) if live else None
     if probability is not None:
         if probability > t.halt_break_probability:
             at_least(DegradationState.HALTED,
@@ -479,13 +496,15 @@ def assess(
             at_least(DegradationState.REDUCE_ONLY,
                      f"changepoint probability {probability:.0%} since going live")
 
-    trend = trend_check(live, trend_min_weeks)
+    trend = trend_check(live, trend_min_bars)
     if trend is not None:
         if trend.significantly_negative:
             at_least(DegradationState.HALTED,
-                     f"equity trend is significantly negative over {trend.weeks} weeks")
+                     f"equity trend is significantly negative over {trend.periods} {unit}s")
         elif not trend.judged:
-            notes.append(f"trend not judged before {trend_min_weeks} weeks ({trend.weeks} so far)")
+            notes.append(
+                f"trend not judged before {trend_min_bars} {unit}s ({trend.periods} so far)"
+            )
 
     shortfall = shortfall_check(records, modeled_bps, expected_rotation_return, sleeve_equity)
     if shortfall is not None:
@@ -498,13 +517,13 @@ def assess(
                      f"execution cost {shortfall.mean_bps:.0f} bps is {shortfall.ratio:.1f}x "
                      f"the {shortfall.modeled_bps:.0f} bps the backtest assumed")
 
-    if len(live) < 13:
+    if len(live) < max(horizon // 4, 1):
         notes.append(
-            f"{len(live)} live weeks: every statistic here is wide. The ladder uses "
+            f"{len(live)} live {unit}s: every statistic here is wide. The ladder uses "
             f"distributions for exactly this reason, but read it as an early warning."
         )
     return Assessment(
         recommended=state, reasons=tuple(reasons), drawdown=drawdown,
         break_probability=probability, trend=trend, shortfall=shortfall,
-        weeks=len(live), notes=tuple(notes),
+        periods=len(live), notes=tuple(notes), unit=unit,
     )

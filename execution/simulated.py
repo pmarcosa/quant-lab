@@ -203,6 +203,7 @@ class SimulatedBroker:
         moment: datetime,
         prices: Mapping[InstrumentId, float],
         lows: Mapping[InstrumentId, float] | None = None,
+        highs: Mapping[InstrumentId, float] | None = None,
     ) -> tuple[Fill, ...]:
         """Move the market forward and fill everything working.
 
@@ -211,6 +212,9 @@ class SimulatedBroker:
             prices: Reference prices — in a bar backtest, the open of the bar
                 *after* the decision, because that is the first price a decision
                 made on the close could actually have traded at.
+            lows: The bar's lows, which trigger sell stops.
+            highs: The bar's highs, which trigger buy stops (a short's
+                protection). Without them a buy stop fires only on a gap.
 
         Returns:
             The fills produced, in the order the orders were submitted.
@@ -257,7 +261,7 @@ class SimulatedBroker:
             rules = self.constraints(intent.instrument)
 
             if intent.order_type is OrderType.STOP:
-                touched = self._stop_touched(intent, reference, lows)
+                touched = self._stop_touched(intent, reference, lows, highs)
                 if touched is None:
                     continue  # rests until it is hit or cancelled
                 reference = touched
@@ -290,29 +294,34 @@ class SimulatedBroker:
         intent: OrderIntent,
         open_price: float,
         lows: Mapping[InstrumentId, float] | None,
+        highs: Mapping[InstrumentId, float] | None = None,
     ) -> float | None:
         """The price a resting stop would fill at this bar, or None if untouched.
 
-        Gap handling is the part that matters. If the bar opens *below* a sell
-        stop, the stop did not fill at its level — the market was already past it
-        when trading started, and the honest fill is the open. Filling a gapped
-        stop at its trigger price credits the backtest with an exit that nobody
-        could have got, and it does so precisely in the crashes the stop exists
-        for, which is where the error is largest.
+        Gap handling is the part that matters. If the bar opens *past* the stop
+        -- below a sell stop, above a buy stop -- the stop did not fill at its
+        level: the market was already beyond it when trading started, and the
+        honest fill is the open. Filling a gapped stop at its trigger price
+        credits the backtest with an exit that nobody could have got, and it
+        does so precisely in the crashes (and, for shorts, the squeezes) the
+        stop exists for, which is where the error is largest.
         """
         level = intent.stop_price
         if level is None:  # pragma: no cover - OrderIntent refuses this
             return None
-        low = None if lows is None else lows.get(intent.instrument)
 
         if intent.side is Side.SELL:
+            low = None if lows is None else lows.get(intent.instrument)
             if open_price <= level:
                 return open_price
             if low is not None and low <= level:
                 return level
             return None
+        high = None if highs is None else highs.get(intent.instrument)
         if open_price >= level:
             return open_price
+        if high is not None and high >= level:
+            return level
         return None
 
     def _record(self, portfolio: PortfolioId, fill: Fill) -> None:

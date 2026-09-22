@@ -131,7 +131,7 @@ def test_a_lowercase_or_odd_symbol_is_refused(tmp_path):
 
 def test_an_unknown_frequency_is_refused(tmp_path):
     with pytest.raises(ContractViolation, match="frequency"):
-        write_cache_csv("NFLX", bars_from_connector(payload()), tmp_path, "hourly")
+        write_cache_csv("NFLX", bars_from_connector(payload()), tmp_path, "yearly")
 
 
 def test_a_written_file_round_trips_through_the_ingest(tmp_path):

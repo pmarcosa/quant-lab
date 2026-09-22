@@ -1,36 +1,63 @@
-# quant-lab live configuration.
+# quant-lab: one strategy's live configuration.
 #
-# Copy this file to configs/live.yaml and fill it in. configs/live.yaml is
-# gitignored because it names your brokerage account.
+# Copy this file to configs/strategies/<strategy_id>.yaml (one file per
+# strategy) and fill it in. configs/strategies/ is gitignored because the files
+# name your brokerage accounts.
 #
-# Start with mode: paper. Move to live only after a full weekly cycle has run
-# cleanly on paper (see docs/MANUAL.md, section 12).
+# Each strategy trades in its OWN IBKR account (open a linked account in Client
+# Portal for each one). Two strategies configured on the same account are
+# refused. A paper twin of a live strategy is a second file with the same
+# strategy_id and mode: paper. See docs/MANUAL.md, steps 7.2 and 7.5.
+#
+# Start with mode: paper. Move to live only after a full cycle has run cleanly
+# on paper (docs/MANUAL.md, section 12). Shorts and other bar sizes: step 7.6.
+
+# The strategy's id: lowercase letters, digits and dashes, up to 16 characters.
+# It is written on every order this strategy sends (IBKR "Order Ref" column:
+# ql-<strategy_id>.<hash>), names its journal and state folder, and never changes
+# once the sleeve is open.
+strategy_id: momentum
 
 mode: paper                 # paper | live
 account: DU0000000          # paper accounts start with DU, live with U
 
-# The capital the strategy manages. It sizes against this, not against the
-# whole account: anything else you hold at IBKR is invisible to it.
+# The capital the strategy manages.
 sleeve_capital: 25000
+
+# dedicated: the account belongs to this strategy; anything else in it (a
+#            position the strategy does not hold, extra shares) halts the system.
+# shared:    other holdings are expected and only reported as warnings.
+account_scope: dedicated
 
 gateway:
   host: 127.0.0.1
   port: 4002                # IB Gateway: 4002 paper / 4001 live. TWS: 7497 / 7496
-  client_id: 17
+  client_id: 17             # unique per program connected to the same gateway
 
 strategy:
-  rebalance_weeks: 4
-  top_n: 4
-  lookback_weeks: 13
+  name: weekly-momentum     # a key of runtime/strategies.py; its bar size comes from it
+  params:
+    rebalance_weeks: 4
+    top_n: 4
+    lookback_weeks: 13
+
+execution:
+  time_in_force: auto       # auto: opening auction for daily/weekly bars, day orders intraday
 
 risk:
-  stop_distance: 0.12       # protective stop, from the rotation price. 0 disables it
-  max_gross: 1.0
-  max_order_fraction: 0.6   # no single order above this share of sleeve equity
+  stop_distance: 0.12       # protective stop from the rotation price; 0 disables it
+  max_gross: 1.0            # longs plus shorts, as a fraction of equity
+  max_net: 1.0              # longs minus shorts: upper bound
+  min_net: -1.0             # ...and lower bound (binds only when shorts are allowed)
+  allow_short: false        # short sales need this AND a margin account
+  max_borrow_fee: null      # refuse shorts whose annual borrow fee is above this (e.g. 0.05)
+  max_order_fraction: 0.6   # no single order may open more than this share of equity
 
 monitoring:
   # Thresholds for the degradation ladder: normal -> reduce-only -> halted.
   # The defaults are the project expert's. See docs/MANUAL.md, section 10.
+  # Durations are in CALENDAR WEEKS whatever the strategy's bar size; they are
+  # converted into bars (6 weeks = 6 weekly bars, or about 29 daily bars).
   reduce_percentile: 0.80          # live drawdown vs bootstrapped backtest windows
   halt_percentile: 0.99            # expert: 0.95, or 0.99 for high tolerance (see manual)
   reduce_break_probability: 0.20   # changepoint probability during live trading
@@ -39,13 +66,15 @@ monitoring:
   halt_shortfall_alpha_share: 0.5  # cost eating half the expected return...
   halt_shortfall_cycles: 2         # ...for this many rotations in a row
   trend_min_weeks: 26
+  horizon_weeks: 52                # longest live window compared with the backtest
   bootstrap_paths: 5000
   bootstrap_block_weeks: 6
   changepoint_hazard_weeks: 250
-  max_data_age_days: 10
+  max_data_age_hours: null         # null: by bar size (weekly 240 h, daily 100 h)
 
 # How long a proposal stays approvable. Orders go to the opening auction, so a
-# proposal made on Saturday must survive until Monday morning.
+# proposal made on Saturday must survive until Monday morning. Approval is also
+# refused as soon as a newer bar has closed.
 proposal_ttl_hours: 60
 
 # Tickers held in the account that the strategy must never trade.

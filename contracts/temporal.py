@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
@@ -59,12 +59,34 @@ def utc(moment: datetime) -> datetime:
 
 
 class BarInterval(str, Enum):
-    """Sampling frequencies the system understands."""
+    """Sampling frequencies the system understands.
+
+    Everything that depends on the bar size asks this enum rather than assuming
+    one: annualisation, how many bars make a week, how long a bar lasts, what
+    the vendor calls it. A module that hard-codes "52" or "weekly" is a module
+    that silently breaks the day a daily or intraday strategy arrives.
+    """
 
     MINUTE = "1Min"
     HOUR = "1Hour"
     DAY = "1Day"
     WEEK = "1Week"
+
+    @classmethod
+    def parse(cls, name: str) -> BarInterval:
+        """Accept the enum value or a plain word: ``week``, ``weekly``, ``1Day``..."""
+        key = str(name).strip().lower()
+        aliases = {
+            "1min": cls.MINUTE, "minute": cls.MINUTE, "min": cls.MINUTE,
+            "1hour": cls.HOUR, "hour": cls.HOUR, "hourly": cls.HOUR,
+            "1day": cls.DAY, "day": cls.DAY, "daily": cls.DAY,
+            "1week": cls.WEEK, "week": cls.WEEK, "weekly": cls.WEEK,
+        }
+        if key not in aliases:
+            raise ContractViolation(
+                f"unknown bar interval {name!r}; use minute, hour, day or week"
+            )
+        return aliases[key]
 
     @property
     def pandas_freq(self) -> str:
@@ -80,6 +102,39 @@ class BarInterval(str, Enum):
         never disagree.
         """
         return {"1Min": 252 * 390, "1Hour": 252 * 7, "1Day": 252, "1Week": 52}[self.value]
+
+    @property
+    def bars_per_week(self) -> float:
+        """Bars in one trading week. Converts calendar settings into bar counts.
+
+        Monitoring parameters that describe the market's memory -- a bootstrap
+        block, the expected time between regime changes, a minimum sample -- are
+        fixed in calendar time and translated into bars through this, so the
+        same setting means the same thing at every frequency.
+        """
+        return self.periods_per_year / 52.0
+
+    @property
+    def duration(self):
+        """How long one bar lasts, in wall-clock time (a trading day for DAY)."""
+        return {
+            "1Min": timedelta(minutes=1), "1Hour": timedelta(hours=1),
+            "1Day": timedelta(days=1), "1Week": timedelta(weeks=1),
+        }[self.value]
+
+    @property
+    def is_intraday(self) -> bool:
+        return self in (BarInterval.MINUTE, BarInterval.HOUR)
+
+    @property
+    def frequency(self) -> str:
+        """The word used for cache folders and universe files."""
+        return {"1Min": "minute", "1Hour": "hourly", "1Day": "daily", "1Week": "weekly"}[self.value]
+
+    @property
+    def noun(self) -> str:
+        """One bar, in words: for reports and messages."""
+        return {"1Min": "minute", "1Hour": "hour", "1Day": "day", "1Week": "week"}[self.value]
 
 
 @dataclass(frozen=True, slots=True)

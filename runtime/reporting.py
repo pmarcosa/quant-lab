@@ -164,6 +164,7 @@ def live_report(
             so the page shows the lines the checks were judged against.
     """
     a = report.assessment
+    unit = a.unit
     reasons = list(a.reasons)
     problems = list(report.health.problems)
     level = _STATE_LEVEL[report.state_after]
@@ -193,16 +194,17 @@ def live_report(
     metrics = [
         Metric("Sleeve equity", status.get("sleeve_equity"), "money",
                f"cash {status.get('cash', 0):,.0f}"),
-        Metric("Live weeks", a.weeks, "int", f"since {report.weeks[0]}" if report.weeks else ""),
+        Metric(f"Live {unit}s", a.periods, "int",
+               f"since {report.periods[0]}" if report.periods else ""),
         Metric("Live return", dd.live_return if dd else None, "pct_signed",
-               f"over the last {dd.weeks} weeks" if dd else "no live weeks yet"),
+               f"over the last {dd.periods} {unit}s" if dd else f"no live {unit}s yet"),
         Metric("Live drawdown", -dd.live_drawdown if dd else None, "pct",
                f"deeper than {dd.percentile:.0%} of backtest paths" if dd else "",
                by(dd.percentile if dd else None, reduce_p, halt_p)),
         Metric("Break probability", a.break_probability, "pct",
                f"reduce ≥ {reduce_b:.0%}, halt ≥ {halt_b:.0%}",
                by(a.break_probability, reduce_b, halt_b)),
-        Metric("Trend (weekly, median)", tr.weekly_slope if tr else None, "pct_signed",
+        Metric(f"Trend (per {unit}, median)", tr.slope if tr else None, "pct_signed",
                (f"CI {tr.low:+.2%} … {tr.high:+.2%}" + ("" if tr.judged else " · not judged yet"))
                if tr else "", "critical" if tr and tr.significantly_negative else "neutral"),
         Metric("Shortfall per rotation", sf.mean_bps if sf else None, "bps",
@@ -215,7 +217,7 @@ def live_report(
         Metric("Approved / proposed", f"{pm.approved} / {pm.proposals}", "text",
                f"{pm.rejected} rejected · {pm.expired} expired"),
         Metric("Compliance asymmetry", pm.asymmetry, "pct_signed",
-               "buys executed minus sells executed",
+               "entries executed minus exits executed",
                by(pm.asymmetry, 0.10, 0.25) if pm.asymmetry is not None else "neutral"),
         Metric("Stop coverage", pm.stop_coverage, "pct", "positions with a working stop",
                "good" if pm.stop_coverage == 1.0 else "serious" if pm.stop_coverage is not None
@@ -234,7 +236,7 @@ def live_report(
         series = [Series("Sleeve", tuple(report.equity))]
         if report.benchmark and len(report.benchmark) == len(report.equity) - 1:
             series.append(Series(benchmark, tuple(v * base for v in cumulative(report.benchmark))))
-        charts.append(Chart("live-equity", "Sleeve equity vs benchmark", tuple(report.weeks),
+        charts.append(Chart("live-equity", "Sleeve equity vs benchmark", tuple(report.periods),
                             tuple(series), format="money"))
     if report.returns:
         cum = tuple(v - 1.0 for v in cumulative(report.returns))
@@ -243,11 +245,11 @@ def live_report(
             bands = (("backtest P10", dd.band_low_10), ("backtest P1", dd.band_low_1))
         charts.append(Chart(
             "live-return", "Cumulative live return against the backtest's range",
-            tuple(report.weeks), (Series("Live", cum),), format="pct", baseline=0.0, bands=bands,
+            tuple(report.periods), (Series("Live", cum),), format="pct", baseline=0.0, bands=bands,
             note="Dashed lines: the 10th and 1st percentile of cumulative return that "
-                 "bootstrapped backtest paths reach over the same number of weeks.",
+                 f"bootstrapped backtest paths reach over the same number of {unit}s.",
         ))
-        charts.append(Chart("live-drawdown", "Live drawdown", tuple(report.weeks),
+        charts.append(Chart("live-drawdown", "Live drawdown", tuple(report.periods),
                             (Series("Sleeve", drawdown(report.equity)),),
                             format="pct", baseline=0.0, area=True))
     if sf and sf.per_rotation_bps:
@@ -294,10 +296,11 @@ def live_report(
         ("text", "pct", "pct"),
     )
     return Report(
-        kind="live", title=f"Live monitor — {report.mode}",
+        kind="live", title=f"Live monitor — {report.strategy_id or 'strategy'} ({report.mode})",
         subtitle=f"account {status.get('account', '?')} · baseline "
-                 f"{report.baseline.strategy_version} ({report.baseline.first_week} to "
-                 f"{report.baseline.last_week})",
+                 f"{report.baseline.strategy_version} ({report.baseline.first_bar} to "
+                 f"{report.baseline.last_bar}) · "
+                 f"{ {'week': 'weekly', 'day': 'daily', 'hour': 'hourly'}.get(unit, unit)} bars",
         generated_at=report.generated_at.isoformat(timespec="seconds"),
         status=Status(level, label, tuple(reasons)),
         metrics=tuple(metrics), charts=tuple(charts),
@@ -306,7 +309,8 @@ def live_report(
             "Monitoring can impose and lift REDUCE-ONLY. It can impose HALTED but never lift "
             "it: `ql live clear` with a written reason is the only way out.",
         ),
-        context={"mode": report.mode, "state": report.state_after.value,
+        context={"strategy_id": report.strategy_id, "interval": report.interval,
+                 "mode": report.mode, "state": report.state_after.value,
                  "pending_proposal": status.get("pending_proposal")},
     ).validate()
 

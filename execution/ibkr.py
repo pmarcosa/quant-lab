@@ -25,6 +25,12 @@ filled". The live cycle reconciles; it does not guess.
 **Fills carry the broker's execution id**, so journaling the same execution
 twice — after a reconnect, say — is detectable and skipped.
 
+**Every order carries its strategy.** The ``orderRef`` is ``ql-<strategy>.…``
+(``contracts.execution.client_order_id``), and an adapter built for one
+strategy only claims fills, and only manages stops, under its own prefix. With
+one IB Gateway login showing several linked accounts, orders are also scoped to
+the configured account.
+
 ``ib_async`` is imported lazily. Nothing else in the system needs it, and a
 backtest must never acquire a dependency on whether a gateway is running.
 """
@@ -120,6 +126,28 @@ class WorkingOrder:
     status: OrderStatus
 
 
+@dataclass(frozen=True, slots=True)
+class ShortInfo:
+    """What the broker says about borrowing an instrument to sell short.
+
+    ``shares`` is IBKR's shortable-shares figure; ``fee_rate`` the annual
+    borrow fee as a fraction, when known. The TWS API reports availability but
+    not the fee (IBKR publishes fees separately), so ``fee_rate`` is usually
+    ``None`` and the fee check only applies where a fee is reported.
+    """
+
+    shares: float | None
+    fee_rate: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MarginVerdict:
+    ok: bool
+    message: str
+    initial_margin_after: float | None = None
+    equity_with_loan: float | None = None
+
+
 def _ib_types():
     try:
         import ib_async
@@ -143,11 +171,13 @@ class IBKRBroker:
         account: str,
         mode: TradingMode,
         settle_seconds: float = 2.0,
+        order_prefix: str = "ql-",
     ) -> None:
         self._ib = ib
         self.account = account.strip().upper()
         self.mode = mode
         self._settle = settle_seconds
+        self.order_prefix = order_prefix
         self._constraints: dict[InstrumentId, InstrumentConstraints] = {}
         self._verify_account()
 
@@ -162,6 +192,7 @@ class IBKRBroker:
         account: str,
         mode: TradingMode,
         timeout: float = 20.0,
+        order_prefix: str = "ql-",
     ) -> IBKRBroker:  # pragma: no cover - needs a live gateway
         """Connect to a running gateway and verify the account before returning."""
         ib_async = _ib_types()
@@ -174,7 +205,7 @@ class IBKRBroker:
                 f"running and logged in, with API socket clients enabled?"
             ) from error
         try:
-            return cls(ib, account, mode)
+            return cls(ib, account, mode, order_prefix=order_prefix)
         except ContractViolation:
             ib.disconnect()
             raise
@@ -309,16 +340,16 @@ class IBKRBroker:
     def fills(self) -> Sequence[BrokerFill]:
         """Every execution the gateway reports that carries one of our order ids.
 
-        Executions without an ``orderRef`` were not placed by this system —
-        typically trades made by hand in TWS — and are deliberately excluded:
-        the sleeve must not absorb trades it did not make. Reconciliation will
-        still notice the position they create.
+        Executions without this strategy's ``orderRef`` prefix were not placed
+        by it — trades made by hand in TWS, or another strategy's — and are
+        deliberately excluded: the sleeve must not absorb trades it did not
+        make. Reconciliation will still notice the position they create.
         """
         found: list[BrokerFill] = []
         for item in self._ib.fills():
             execution = item.execution
             reference = getattr(execution, "orderRef", "") or ""
-            if not reference.startswith("ql-"):
+            if not reference.startswith(self.order_prefix):
                 continue
             if getattr(execution, "acctNumber", self.account).upper() != self.account:
                 continue
@@ -370,6 +401,64 @@ class IBKRBroker:
                 )
             )
         return found
+
+    def short_availability(
+        self, instruments: Sequence[InstrumentId]
+    ) -> dict[InstrumentId, ShortInfo]:
+        """Shortable shares per instrument (IBKR generic tick 236).
+
+        Needs a market-data subscription for the instrument. Where IBKR sends
+        nothing, the answer is ``ShortInfo(None)`` -- unknown -- and the risk
+        layer treats unknown as not borrowable.
+        """
+        found: dict[InstrumentId, ShortInfo] = {}
+        tickers = {}
+        for instrument in instruments:
+            tickers[instrument] = self._ib.reqMktData(
+                self._stock(instrument), genericTickList="236", snapshot=False
+            )
+        self._ib.sleep(self._settle)
+        for instrument, ticker in tickers.items():
+            shares = getattr(ticker, "shortableShares", None)
+            usable = shares is not None and shares == shares and shares >= 0
+            found[instrument] = ShortInfo(float(shares) if usable else None)
+            self._ib.cancelMktData(ticker.contract)
+        return found
+
+    def margin_check(self, intents: Sequence[OrderIntent]) -> MarginVerdict:
+        """Whether the account can margin these orders, by IBKR's own what-if.
+
+        Each order is priced with a what-if request, which returns the initial
+        margin it would add without placing it. The changes are summed onto the
+        current requirement and compared with equity with loan value. Summing
+        is conservative: it ignores offsets between the orders themselves.
+        """
+        ib_async = _ib_types()
+        before = equity = None
+        change = 0.0
+        for intent in intents:
+            order = ib_async.Order(
+                action="BUY" if intent.side is Side.BUY else "SELL",
+                totalQuantity=float(intent.quantity), orderType="MKT",
+                account=self.account, whatIf=True,
+            )
+            state = self._ib.whatIfOrder(self._stock(intent.instrument), order)
+            if state is None or not getattr(state, "initMarginChange", None):
+                return MarginVerdict(False, f"IBKR gave no margin estimate for {intent.instrument}")
+            change += _number(state.initMarginChange)
+            if before is None:
+                before = _number(state.initMarginBefore)
+                equity = _number(state.equityWithLoanBefore)
+        if before is None or equity is None:
+            return MarginVerdict(True, "no orders to check")
+        after = before + change
+        if after > equity:
+            return MarginVerdict(
+                False,
+                f"initial margin would be {after:,.0f} against equity with loan of {equity:,.0f}",
+                after, equity,
+            )
+        return MarginVerdict(True, f"initial margin {after:,.0f} of {equity:,.0f}", after, equity)
 
     def historical_bars(self, instrument: InstrumentId, bar_size: str, duration: str):
         """Price history through the same connection, as an ib_async bar list."""
@@ -431,3 +520,9 @@ class IBKRBroker:
             average_fill_price=float(report.avgFillPrice) if filled else None,
             message=message,
         )
+
+
+def _number(value) -> float:
+    """IBKR reports margin figures as strings, with a huge sentinel for 'unset'."""
+    number = float(value)
+    return 0.0 if number > 1e300 else number

@@ -13,9 +13,13 @@ data existed, never before. And when a split restates a year of prices, the
 restated rows arrive as revisions with today's date: a query pinned before today
 still sees what was known then.
 
-Only complete weeks are written. A bar for the week in progress has a high, low
-and close that are not final, and deciding on one is a discrepancy between live
-and backtest that nothing downstream can detect.
+Only complete bars are written. A bar still forming has a high, low and close
+that are not final, and deciding on one is a discrepancy between live and
+backtest that nothing downstream can detect.
+
+The bar size is the strategy's: weekly, daily or intraday. Weekly and daily
+bars are labelled by date; intraday ones keep their UTC start time, because
+their close is one bar length later (``data.ingest.bar_close``).
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 from contracts.identifiers import InstrumentId
+from contracts.temporal import BarInterval
 from data.bitemporal import BitemporalStore
 from data.ingest import complete_bars, merge_split_weeks, to_observations
 from data.vendor import CACHE_COLUMNS, cache_inventory, write_cache_csv
@@ -36,43 +41,79 @@ from data.vendor import CACHE_COLUMNS, cache_inventory, write_cache_csv
 PRICE_COLUMNS = ("open", "high", "low", "close")
 
 
+#: IBKR's bar-size strings and how far back a routine refresh re-fetches.
+#: Weekly and daily go back far enough to pick up a restatement from a recent
+#: split; intraday history is expensive to request and rarely restated.
+IBKR_BAR_SIZES = {
+    BarInterval.WEEK: ("1 week", "2 Y"),
+    BarInterval.DAY: ("1 day", "1 Y"),
+    BarInterval.HOUR: ("1 hour", "10 D"),
+    BarInterval.MINUTE: ("1 min", "2 D"),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class RefreshResult:
     instrument: str
-    new_weeks: int
-    revised_weeks: int
-    last_week: str
+    new_bars: int
+    revised_bars: int
+    last_bar: str
     error: str = ""
 
+    # The weekly names, for callers written before intervals were general.
+    @property
+    def new_weeks(self) -> int:
+        return self.new_bars
 
-def bars_from_broker(bars) -> pd.DataFrame:
-    """Turn an ib_async bar list into an OHLCV frame indexed by bar label."""
-    rows = [
-        {
-            "timestamp": pd.Timestamp(b.date).tz_localize(None)
-            if getattr(pd.Timestamp(b.date), "tzinfo", None)
-            else pd.Timestamp(b.date),
+    @property
+    def revised_weeks(self) -> int:
+        return self.revised_bars
+
+    @property
+    def last_week(self) -> str:
+        return self.last_bar
+
+
+def bars_from_broker(bars, interval: BarInterval = BarInterval.WEEK) -> pd.DataFrame:
+    """Turn an ib_async bar list into an OHLCV frame indexed by bar label.
+
+    Daily and weekly labels are dates. Intraday labels keep their time, in UTC.
+    """
+    rows = []
+    for b in bars:
+        stamp = pd.Timestamp(b.date)
+        if interval.is_intraday:
+            stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+        elif stamp.tzinfo is not None:
+            stamp = stamp.tz_localize(None)
+        rows.append({
+            "timestamp": stamp,
             "open": float(b.open), "high": float(b.high), "low": float(b.low),
             "close": float(b.close), "volume": float(b.volume or 0),
-        }
-        for b in bars
-    ]
+        })
     if not rows:
         return pd.DataFrame(columns=list(CACHE_COLUMNS))
     frame = pd.DataFrame(rows).set_index("timestamp").sort_index()
-    frame.index = frame.index.normalize()
+    if not interval.is_intraday:
+        frame.index = frame.index.normalize()
     return frame
 
 
-def merge_into_cache(existing: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
-    """Existing history, with the fresh bars winning wherever weeks overlap."""
+def _keys(index: pd.Index, interval: BarInterval) -> list:
+    if interval is BarInterval.WEEK:
+        iso = pd.DatetimeIndex(index).isocalendar()
+        return list(zip(iso.year, iso.week, strict=True))
+    return list(pd.DatetimeIndex(index))
+
+
+def merge_into_cache(
+    existing: pd.DataFrame, fresh: pd.DataFrame, interval: BarInterval = BarInterval.WEEK
+) -> pd.DataFrame:
+    """Existing history, with the fresh bars winning wherever periods overlap."""
     if existing.empty:
         return fresh
-    iso_old = existing.index.isocalendar()
-    iso_new = fresh.index.isocalendar()
-    old_keys = list(zip(iso_old.year, iso_old.week, strict=True))
-    new_keys = set(zip(iso_new.year, iso_new.week, strict=True))
-    kept = existing[[key not in new_keys for key in old_keys]]
+    new_keys = set(_keys(fresh.index, interval))
+    kept = existing[[key not in new_keys for key in _keys(existing.index, interval)]]
     return pd.concat([kept, fresh]).sort_index()
 
 
@@ -102,6 +143,65 @@ def changed_rows(
     return rows.loc[keep], sum(new_mask), sum(revised_mask)
 
 
+def refresh(
+    broker,
+    cache_root: Path,
+    store: BitemporalStore,
+    now: datetime,
+    interval: BarInterval = BarInterval.WEEK,
+    symbols: Sequence[str] | None = None,
+    duration: str | None = None,
+) -> tuple[RefreshResult, ...]:
+    """Fetch recent bars for every cached instrument and record them.
+
+    Args:
+        broker: Anything with ``historical_bars(instrument, bar_size, duration)``.
+        cache_root: The ``data/ibkr_cache`` directory.
+        store: The bitemporal store for ``interval``.
+        now: The moment of the fetch; becomes the available time of new rows.
+        interval: The bar size -- the strategy's.
+        symbols: Restrict to these; all cached instruments when omitted.
+        duration: How far back to re-fetch, in IBKR's syntax. Defaults by
+            interval (``IBKR_BAR_SIZES``).
+    """
+    bar_size, default_duration = IBKR_BAR_SIZES[interval]
+    frequency = interval.frequency
+    inventory = cache_inventory(cache_root, frequency)
+    wanted = [s.upper() for s in symbols] if symbols else list(inventory["symbol"])
+    results: list[RefreshResult] = []
+    for symbol in wanted:
+        instrument = InstrumentId(symbol)
+        try:
+            fresh = bars_from_broker(
+                broker.historical_bars(instrument, bar_size, duration or default_duration),
+                interval,
+            )
+        except Exception as error:  # a failure for one symbol must not stop the rest
+            results.append(RefreshResult(symbol, 0, 0, "", error=str(error)))
+            continue
+        if interval is BarInterval.WEEK:
+            fresh = merge_split_weeks(fresh)
+        fresh = complete_bars(fresh, now, interval=interval)
+        if fresh.empty:
+            results.append(RefreshResult(symbol, 0, 0, "", error="no complete bars returned"))
+            continue
+
+        path = cache_root / frequency / f"{symbol}.csv"
+        existing = pd.DataFrame(columns=list(CACHE_COLUMNS))
+        if path.exists():
+            existing = pd.read_csv(path, parse_dates=["timestamp"]).set_index("timestamp")
+        write_cache_csv(symbol, merge_into_cache(existing, fresh, interval), cache_root, frequency)
+
+        rows = to_observations(fresh, available_at=now, interval=interval)
+        delta, new, revised = changed_rows(store, instrument, rows, now)
+        if not delta.empty:
+            store.append(instrument, delta)
+        last = fresh.index[-1]
+        label = last.isoformat() if interval.is_intraday else last.date().isoformat()
+        results.append(RefreshResult(symbol, new, revised, label))
+    return tuple(results)
+
+
 def refresh_weekly(
     broker,
     cache_root: Path,
@@ -110,43 +210,5 @@ def refresh_weekly(
     symbols: Sequence[str] | None = None,
     duration: str = "2 Y",
 ) -> tuple[RefreshResult, ...]:
-    """Fetch recent weekly bars for every cached instrument and record them.
-
-    Args:
-        broker: Anything with ``historical_bars(instrument, bar_size, duration)``.
-        cache_root: The ``data/ibkr_cache`` directory.
-        store: The weekly bitemporal store.
-        now: The moment of the fetch; becomes the available time of new rows.
-        symbols: Restrict to these; all cached instruments when omitted.
-        duration: How far back to re-fetch. Two years is enough to pick up a
-            restatement from a recent split without re-fetching all history.
-    """
-    inventory = cache_inventory(cache_root, "weekly")
-    wanted = [s.upper() for s in symbols] if symbols else list(inventory["symbol"])
-    results: list[RefreshResult] = []
-    for symbol in wanted:
-        instrument = InstrumentId(symbol)
-        try:
-            fresh = bars_from_broker(broker.historical_bars(instrument, "1 week", duration))
-        except Exception as error:  # a failure for one symbol must not stop the rest
-            results.append(RefreshResult(symbol, 0, 0, "", error=str(error)))
-            continue
-        fresh = complete_bars(merge_split_weeks(fresh), now, week_ending=True)
-        if fresh.empty:
-            results.append(RefreshResult(symbol, 0, 0, "", error="no complete bars returned"))
-            continue
-
-        path = cache_root / "weekly" / f"{symbol}.csv"
-        existing = pd.DataFrame(columns=list(CACHE_COLUMNS))
-        if path.exists():
-            existing = pd.read_csv(path, parse_dates=["timestamp"]).set_index("timestamp")
-        write_cache_csv(symbol, merge_into_cache(existing, fresh), cache_root, "weekly")
-
-        rows = to_observations(fresh, week_ending=True, available_at=now)
-        delta, new, revised = changed_rows(store, instrument, rows, now)
-        if not delta.empty:
-            store.append(instrument, delta)
-        results.append(
-            RefreshResult(symbol, new, revised, fresh.index[-1].date().isoformat())
-        )
-    return tuple(results)
+    """:func:`refresh` for weekly bars. Kept for callers written before intervals."""
+    return refresh(broker, cache_root, store, now, BarInterval.WEEK, symbols, duration)

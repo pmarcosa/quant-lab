@@ -42,14 +42,24 @@ from contracts.execution import (
     Side,
     TimeInForce,
     client_order_id,
+    order_prefix,
+    split_legs,
 )
 from contracts.identifiers import InstrumentId, PortfolioId, RunId, TenantId
 from contracts.live import DegradationState, EventKind, TradingMode
+from contracts.strategy import Strategy
 from contracts.temporal import BarInterval
 from engine.accounting import Book
 from engine.decide import SizingPolicy
 from engine.run import _position_risk, propose
-from risk.rules import GrossExposureLimit, ProtectiveStop, ReduceOnly, RiskSupervisor
+from risk.rules import (
+    GrossExposureLimit,
+    NetExposureLimit,
+    ProtectiveStop,
+    ReduceOnly,
+    RiskSupervisor,
+    ShortSales,
+)
 from runtime.config import LiveConfig
 from runtime.journal import (
     Journal,
@@ -59,8 +69,8 @@ from runtime.journal import (
     intent_to_dict,
     sleeve_book,
 )
+from runtime.strategies import build_strategy
 from runtime.wiring import Market, load_market
-from strategies.momentum import MomentumParams, WeeklyMomentum
 
 TENANT = TenantId("user")
 
@@ -161,6 +171,9 @@ class LiveSession:
     store_root: Path
     clock: Callable[[], datetime] = now_utc
     market_loader: Callable[[Path], Market] | None = None
+    #: Builds the strategy. Defaults to the registry in ``runtime.strategies``;
+    #: tests inject strategies that are not deployable.
+    strategy_factory: Callable[[LiveConfig], Strategy] | None = None
     journal: Journal = field(init=False)
 
     def __post_init__(self) -> None:
@@ -172,39 +185,98 @@ class LiveSession:
                 f"the broker is connected in {self.broker.mode.value} mode but the "
                 f"config says {self.config.mode.value}"
             )
+        if self.broker is not None and getattr(self.broker, "account", self.config.account) != (
+            self.config.account
+        ):
+            raise ContractViolation(
+                f"the broker is connected to {self.broker.account} but strategy "
+                f"{self.config.strategy_id!r} is configured for {self.config.account}"
+            )
+        self._check_identity()
+
+    def _check_identity(self) -> None:
+        """Refuse a journal written by another strategy or for another account.
+
+        The journal's folder is named after the strategy, so this only fires when
+        files have been moved or a config edited under a running sleeve. Either
+        way, trading one strategy's book with another's settings is exactly the
+        silent error this guards against.
+        """
+        opened = self.journal.last(EventKind.OPENED)
+        if opened is None:
+            return
+        recorded = opened.payload.get("strategy_id")
+        if recorded is not None and recorded != self.config.strategy_id:
+            raise StateIntegrityError(
+                f"the journal at {self.config.journal_path} belongs to strategy "
+                f"{recorded!r}, not {self.config.strategy_id!r}"
+            )
+        account = opened.payload.get("account")
+        if account is not None and account != self.config.account:
+            raise StateIntegrityError(
+                f"the {self.config.strategy_id!r} sleeve was opened in account {account}, "
+                f"but the config now says {self.config.account}. A sleeve does not move "
+                f"between accounts; open a new strategy id for the new account."
+            )
 
     # -- identity and wiring -------------------------------------------------
 
     @property
     def portfolio(self) -> PortfolioId:
-        return PortfolioId(TENANT, f"{self.config.mode.value}-sleeve")
+        """The book, named by the strategy id -- which every order then carries."""
+        return PortfolioId(TENANT, self.config.strategy_id)
 
     @property
     def run(self) -> RunId:
-        return RunId(f"{self.config.mode.value}-live")
+        return RunId(f"{self.config.strategy_id}-{self.config.mode.value}")
 
-    def strategy(self) -> WeeklyMomentum:
+    @property
+    def order_prefix(self) -> str:
+        """``ql-<strategy_id>.``: how this strategy's orders are recognised."""
+        return order_prefix(self.portfolio)
+
+    def strategy(self) -> Strategy:
+        if self.strategy_factory is not None:
+            return self.strategy_factory(self.config)
         s = self.config.strategy
-        return WeeklyMomentum(
-            MomentumParams(
-                rebalance_weeks=s.rebalance_weeks,
-                top_n=s.top_n,
-                lookback_weeks=s.lookback_weeks,
-            )
-        )
+        return build_strategy(s.name, s.params)
+
+    @property
+    def interval(self) -> BarInterval:
+        """The strategy's bar size. Everything periodic follows it."""
+        return self.strategy().filtration_spec.interval
 
     def market(self) -> Market:
         if self.market_loader is not None:
             return self.market_loader(self.store_root)
-        return load_market(self.store_root, interval=BarInterval.WEEK)
+        return load_market(self.store_root, interval=self.interval)
 
     def stop_rule(self) -> ProtectiveStop | None:
         d = self.config.risk.stop_distance
         return ProtectiveStop(distance=d) if d > 0 else None
 
-    def supervisor(self, state: DegradationState) -> RiskSupervisor:
-        rules: list = [GrossExposureLimit(maximum=self.config.risk.max_gross)]
-        if not state.permits_buys:
+    def supervisor(
+        self,
+        state: DegradationState,
+        availability: Mapping[InstrumentId, float | None] | None = None,
+        borrow_fees: Mapping[InstrumentId, float | None] | None = None,
+    ) -> RiskSupervisor:
+        """The risk rules for this state, in order.
+
+        Short sales are checked against what the broker says can be borrowed
+        when ``availability`` is given; without it (no short orders in the
+        decision) only the on/off switch applies.
+        """
+        r = self.config.risk
+        rules: list = [
+            ShortSales(
+                allowed=r.allow_short, availability=availability,
+                borrow_fees=borrow_fees or {}, max_borrow_fee=r.max_borrow_fee,
+            ),
+            GrossExposureLimit(maximum=r.max_gross),
+            NetExposureLimit(minimum=r.min_net, maximum=r.max_net),
+        ]
+        if not state.permits_entries:
             rules.append(ReduceOnly(reason=f"the system is {state.value.replace('_', '-')}"))
         return RiskSupervisor(rules=tuple(rules), stop=self.stop_rule())
 
@@ -354,6 +426,11 @@ class LiveSession:
             {
                 "cash": cash, "positions": positions,
                 "sleeve_capital": self.config.sleeve_capital,
+                "strategy_id": self.config.strategy_id,
+                "strategy": {"name": self.config.strategy.name,
+                             "params": dict(self.config.strategy.params)},
+                "strategy_version": str(self.strategy().version),
+                "interval": self.interval.value,
                 "account": self.config.account, "mode": self.config.mode.value,
                 "account_net_liquidation": account.net_liquidation,
                 "data_as_of": latest.isoformat(),
@@ -461,12 +538,24 @@ class LiveSession:
     # -- reconciliation ------------------------------------------------------
 
     def reconcile(self, record: bool = True) -> Reconciliation:
-        """The journal's sleeve against what the broker holds.
+        """The journal's sleeve against what the broker holds, on signed positions.
 
-        The sleeve is a sub-account, so the broker may hold *more* than the
-        sleeve — other positions, extra shares — and that is a warning, not an
-        error. The broker holding *less* than the sleeve believes is a mismatch:
-        the system would be sizing and stopping positions that are not there.
+        A **mismatch** halts the system. It is any difference that means the
+        sleeve believes in exposure the account does not have, or has it on the
+        wrong side:
+
+        - the sign differs (the sleeve is short, the account long, or the
+          reverse): a cover sent for a short that is really a long *adds*
+          exposure instead of removing it -- the expert's first kill condition;
+        - the account holds less, in the sleeve's direction, than the sleeve
+          believes: the system would size and stop shares that are not there;
+        - in a ``dedicated`` account, anything else as well: shares beyond the
+          sleeve's, or a position the sleeve does not hold at all (unless listed
+          as unmanaged). The account is the strategy's; an orphan position means
+          a fill nobody recorded or a trade made by hand.
+
+        In a ``shared`` account those last differences are warnings: other
+        holdings are expected.
         """
         book = self.book()
         findings: list[Finding] = []
@@ -474,27 +563,36 @@ class LiveSession:
             str(p.instrument): p.quantity for p in self.broker.positions(self.portfolio)
         }
         sleeve = {str(i): p.quantity for i, p in book.positions.items()}
+        dedicated = self.config.account_scope == "dedicated"
+        extra_level = "mismatch" if dedicated else "warn"
 
         for ticker, quantity in sorted(sleeve.items()):
             held = broker_positions.get(ticker, 0.0)
-            if held + 1e-9 < quantity:
+            if held != 0 and (held > 0) != (quantity > 0):
+                findings.append(Finding(
+                    "mismatch",
+                    f"the sleeve is {'long' if quantity > 0 else 'short'} {abs(quantity):g} but "
+                    f"the account is {'long' if held > 0 else 'short'} {abs(held):g}",
+                    ticker,
+                ))
+            elif abs(held) + 1e-9 < abs(quantity):
                 findings.append(Finding(
                     "mismatch",
                     f"the sleeve holds {quantity:g} but the broker holds {held:g}",
                     ticker,
                 ))
-            elif held > quantity + 1e-9:
+            elif abs(held) > abs(quantity) + 1e-9:
                 findings.append(Finding(
-                    "warn",
-                    f"the broker holds {held:g}, {held - quantity:g} more than the sleeve; "
-                    f"the extra shares are outside the strategy",
+                    extra_level,
+                    f"the broker holds {held:g}, {abs(held) - abs(quantity):g} more than the "
+                    f"sleeve; the extra shares are outside the strategy",
                     ticker,
                 ))
         for ticker, quantity in sorted(broker_positions.items()):
             if ticker in sleeve or ticker in self.config.unmanaged or not quantity:
                 continue
             findings.append(Finding(
-                "warn",
+                extra_level,
                 f"held at the broker ({quantity:g}) but not by the sleeve and not listed as "
                 f"unmanaged",
                 ticker,
@@ -515,15 +613,33 @@ class LiveSession:
                         "mismatch", f"order {oid} was sent but the broker has no record of it"
                     ))
 
-        # Every sleeve position should have a resting stop.
+        # Every sleeve position should have a resting stop on its closing side.
         if self.stop_rule() is not None:
             protected = {
-                str(w.instrument) for w in self.broker.working_orders()
-                if w.client_order_id.endswith("-stop") and w.side is Side.SELL
+                (str(w.instrument), w.side) for w in self.broker.working_orders()
+                if w.client_order_id.startswith(self.order_prefix)
+                and w.client_order_id.endswith("-stop")
             }
-            for ticker in sorted(sleeve):
-                if ticker not in protected:
+            for ticker, quantity in sorted(sleeve.items()):
+                if (ticker, Side.closing(quantity)) not in protected:
                     findings.append(Finding("warn", "no protective stop resting at the broker", ticker))
+
+        # A short whose shares can no longer be borrowed can be bought in by the
+        # broker whatever the strategy decides. The system cannot prevent a
+        # recall; it can say so while there is still time to act.
+        shorts = [InstrumentId(t) for t, q in sleeve.items() if q < 0]
+        report = getattr(self.broker, "short_availability", None)
+        if shorts and report is not None:
+            found = report(shorts)
+            for instrument in shorts:
+                info = found.get(instrument)
+                if info is None or not info.shares:
+                    findings.append(Finding(
+                        "warn",
+                        "short position with no borrow availability reported: recall or "
+                        "buy-in risk",
+                        str(instrument),
+                    ))
 
         account = self.broker.account_snapshot()
         if account.cash + 1e-6 < book.cash:
@@ -550,8 +666,17 @@ class LiveSession:
             raise ContractViolation("an adjustment needs a real reason (at least ten characters)")
         payload: dict[str, Any] = {"reason": reason.strip(), "cash_delta": float(cash_delta)}
         if instrument is not None:
-            if quantity is None or quantity < 0:
-                raise ContractViolation("an adjustment to a position needs a quantity of 0 or more")
+            if quantity is None:
+                raise ContractViolation(
+                    "an adjustment to a position needs the correct signed quantity "
+                    "(negative for a short, 0 to remove it)"
+                )
+            if quantity < 0 and not self.config.risk.allow_short:
+                raise ContractViolation(
+                    f"{instrument}: a negative quantity records a short, and this strategy "
+                    f"does not allow shorts. If the account really is short, that is an "
+                    f"incident; if not, the sign is wrong."
+                )
             payload["instrument"] = instrument.upper()
             payload["quantity"] = float(quantity)
             if average_cost is not None:
@@ -562,7 +687,7 @@ class LiveSession:
     # -- proposing -----------------------------------------------------------
 
     def propose(self, liquidate: bool = False) -> Proposal:
-        """Decide on the latest complete week and record the proposal. Sends nothing."""
+        """Decide on the latest complete bar and record the proposal. Sends nothing."""
         if not self.journal.is_open:
             raise StateIntegrityError("the sleeve is not open; run `ql live init` first")
         state = self.state()
@@ -590,11 +715,14 @@ class LiveSession:
             )
 
         market = self.market()
+        interval = market.interval
         moment = market.schedule[-1]
         age = now - moment
-        if age > timedelta(days=self.config.monitoring.max_data_age_days):
+        limit = self.config.monitoring.data_age_hours(interval)
+        if age > timedelta(hours=limit):
             raise ContractViolation(
-                f"the latest complete week is {age.days} days old; run `ql data refresh`"
+                f"the latest complete {interval.noun} closed {age.total_seconds() / 3600:.0f} "
+                f"hours ago (limit {limit:.0f}); run `ql data refresh`"
             )
 
         book = self.book()
@@ -620,7 +748,10 @@ class LiveSession:
                 run=self.run, book=book, strategy=strategy, moment=moment,
                 filtration_at=market.filtration_at, marks_at=lambda _: marks,
                 constraints_for=self.broker.constraints, tradable=tradable,
-                policy=SizingPolicy(time_in_force=TimeInForce.OPG),
+                policy=SizingPolicy(
+                    time_in_force=self.config.execution.resolve(interval),
+                    allow_short=self.config.risk.allow_short,
+                ),
             )
             decision_intents = decision.intents
             target = {str(i): w for i, w in decision.target.weights.items()}
@@ -630,21 +761,27 @@ class LiveSession:
         if missing:
             raise ContractViolation(f"no price data for held {missing}; refresh the data")
         equity = book.equity({i: marks[i] for i in book.positions})
-        review = self.supervisor(state).review(
-            decision_intents, _position_risk(book, marks, {}), equity
+        availability, fees = self._borrow_data(book, decision_intents)
+        review = self.supervisor(state, availability, fees).review(
+            decision_intents, _position_risk(book, marks, {}), equity, marks
         )
         orders = []
         for intent in review.approved:
             price = marks.get(intent.instrument, 0.0)
             value = intent.quantity * price
             share = value / equity if equity > 0 else 0.0
-            if intent.side is Side.BUY and share > self.config.risk.max_order_fraction:
+            # The sanity bound applies to new exposure, on either side: a large
+            # exit is the book getting smaller, a large entry is a unit error.
+            _, opening = split_legs(book.quantity(intent.instrument), intent.side, intent.quantity)
+            opening_share = opening * price / equity if equity > 0 else 0.0
+            if opening_share > self.config.risk.max_order_fraction:
                 raise ContractViolation(
-                    f"{intent.instrument}: an order worth {share:.0%} of the sleeve exceeds "
-                    f"max_order_fraction ({self.config.risk.max_order_fraction:.0%}). This is a "
-                    f"sanity bound; something upstream is wrong."
+                    f"{intent.instrument}: an order opening {opening_share:.0%} of the sleeve "
+                    f"exceeds max_order_fraction ({self.config.risk.max_order_fraction:.0%}). "
+                    f"This is a sanity bound; something upstream is wrong."
                 )
             orders.append(ProposedOrder(intent, price, value, share))
+        self._check_margin(book, [o.intent for o in orders])
 
         current = book.weights({i: marks[i] for i in book.positions}) if book.positions else {}
         fingerprint = book_fingerprint(book)
@@ -691,19 +828,67 @@ class LiveSession:
         })
         return proposal
 
+    def _borrow_data(self, book: Book, intents: Sequence[OrderIntent]):
+        """What the broker says can be borrowed, for orders that open a short.
+
+        ``(None, None)`` when nothing in the decision is a short sale, so the
+        common case never asks. A broker that cannot report availability gives
+        an empty answer, which the short-sale rule treats as "not borrowable".
+        """
+        shorting = [
+            i.instrument for i in intents
+            if i.side is Side.SELL and split_legs(book.quantity(i.instrument), i.side, i.quantity)[1] > 0
+        ]
+        if not shorting:
+            return None, None
+        report = getattr(self.broker, "short_availability", None)
+        if report is None:
+            return {i: None for i in shorting}, {}
+        found = report(shorting)
+        return (
+            {i: found.get(i).shares if found.get(i) else None for i in shorting},
+            {i: found.get(i).fee_rate if found.get(i) else None for i in shorting},
+        )
+
+    def _check_margin(self, book: Book, intents: Sequence[OrderIntent]) -> None:
+        """Refuse a proposal whose short sales the account cannot margin.
+
+        Asked of the broker (IBKR's what-if order), not computed here: margin
+        rules differ by account type, instrument and house policy, and a local
+        approximation that is wrong in the permissive direction is worse than
+        none. Only short-opening orders are checked; long-only proposals are
+        funded by the sleeve's own cash, which sizing already respects.
+        """
+        shorts = [
+            i for i in intents
+            if i.side is Side.SELL and split_legs(book.quantity(i.instrument), i.side, i.quantity)[1] > 0
+        ]
+        if not shorts:
+            return
+        check = getattr(self.broker, "margin_check", None)
+        if check is None:
+            raise ContractViolation(
+                "this broker cannot report margin, so short sales cannot be checked; refused"
+            )
+        verdict = check(shorts)
+        if not verdict.ok:
+            raise ContractViolation(f"margin check failed: {verdict.message}")
+
     def _liquidation_intents(self, book: Book, moment: datetime) -> tuple[OrderIntent, ...]:
-        """Sell everything the sleeve holds at the next open."""
+        """Close everything the sleeve holds at the next open: sell longs, cover shorts."""
+        tif = self.config.execution.resolve(self.interval)
         intents = []
         for instrument, position in sorted(book.positions.items(), key=lambda kv: str(kv[0])):
             quantity = abs(position.quantity)
+            side = Side.closing(position.quantity)
             intents.append(OrderIntent(
                 client_order_id=client_order_id(
-                    self.run, self.portfolio, instrument, moment, Side.SELL, quantity
+                    self.run, self.portfolio, instrument, moment, side, quantity
                 ),
                 run=self.run, portfolio=self.portfolio, instrument=instrument,
-                strategy_version=self.strategy().version, side=Side.SELL,
+                strategy_version=self.strategy().version, side=side,
                 quantity=quantity, order_type=OrderType.MARKET, decision_time=moment,
-                time_in_force=TimeInForce.OPG, reason="liquidation",
+                time_in_force=tif, reason="liquidation",
             ))
         return tuple(intents)
 
@@ -757,9 +942,9 @@ class LiveSession:
         """Send an approved proposal's orders. The only path to the market.
 
         Refuses unless: the typed text is exactly the confirmation phrase; the
-        proposal is the latest and still undecided; it has not expired; the
-        sleeve is exactly the one it was computed against; and the system has
-        not been halted since.
+        proposal is the latest and still undecided; it has not expired; no newer
+        bar has arrived since it was decided; the sleeve is exactly the one it
+        was computed against; and the system has not been halted since.
         """
         expected = self.confirmation_phrase(proposal_id)
         if typed.strip() != expected:
@@ -775,6 +960,17 @@ class LiveSession:
         now = self.clock()
         if now >= datetime.fromisoformat(event.payload["expires_at"]):
             raise ContractViolation(f"{proposal_id} has expired; propose again")
+        # A proposal is a decision on one bar. Once a newer bar exists it is a
+        # decision on stale data, however young the proposal is -- the check
+        # that makes a fixed time-to-live safe for strategies of any frequency.
+        decided = datetime.fromisoformat(event.payload["decision_time"])
+        latest = self.market().schedule[-1]
+        if latest > decided:
+            raise ContractViolation(
+                f"{proposal_id} was decided on the {self.interval.noun} closing "
+                f"{decided.isoformat(timespec='minutes')}, and a newer one has closed since "
+                f"({latest.isoformat(timespec='minutes')}); propose again"
+            )
         book = self.book()
         if book_fingerprint(book) != event.payload["fingerprint"]:
             raise ContractViolation(
@@ -787,8 +983,14 @@ class LiveSession:
             raise ContractViolation("the system was halted after this proposal was made")
 
         intents = [intent_from_dict(row) for row in event.payload["intents"]]
-        if not state.permits_buys:
-            intents = [i for i in intents if i.side is Side.SELL]
+        if not state.permits_entries:
+            # Degraded after the proposal was made: keep only what closes
+            # exposure, on either side of zero.
+            intents = [
+                kept for kept in (
+                    _closing_part(i, book.quantity(i.instrument)) for i in intents
+                ) if kept is not None
+            ]
 
         self.journal.append(EventKind.APPROVAL, now, {
             "proposal_id": proposal_id,
@@ -796,20 +998,26 @@ class LiveSession:
             "confirmation": "typed",
         })
 
-        # Cancel-replace: a resting stop and this approval's sell are two orders
-        # for the same shares. Both reaching the market would take the book short.
-        selling = {str(i.instrument) for i in intents if i.side is Side.SELL}
+        # Cancel-replace: a resting stop and an approved order on the same side
+        # are two orders to close the same shares. Both reaching the market
+        # would push the position through zero -- a long into a short, or the
+        # reverse -- without anyone deciding to.
+        trading = {(str(i.instrument), i.side) for i in intents}
         for working in self.broker.working_orders():
-            if working.client_order_id.endswith("-stop") and str(working.instrument) in selling:
+            if (
+                working.client_order_id.startswith(self.order_prefix)
+                and working.client_order_id.endswith("-stop")
+                and (str(working.instrument), working.side) in trading
+            ):
                 self.broker.cancel(working.client_order_id)
                 self.journal.append(EventKind.STOP_CANCELLED, now, {
                     "client_order_id": working.client_order_id,
                     "instrument": str(working.instrument),
-                    "reason": "replaced by an approved sell",
+                    "reason": f"replaced by an approved {working.side.value}",
                 })
 
         sent = []
-        for intent in intents:  # sells first; the engine already ordered them
+        for intent in intents:  # exits first; the engine already ordered them
             state_reported = self.broker.submit(intent)
             self.journal.append(EventKind.SUBMISSION, self.clock(), {
                 **intent_to_dict(intent),
@@ -843,12 +1051,16 @@ class LiveSession:
         A stop is re-anchored only when a rotation has finished: at the average
         fill price for names the rotation traded, and at the decision close for
         names it held unchanged. Between rotations the anchor stays put and only
-        the quantity follows the position.
+        the quantity follows the position. A long gets a sell stop below its
+        anchor, a short a buy stop above it.
         """
         rule = self.stop_rule()
         now = self.clock()
         book = self.book()
-        ours = [w for w in self.broker.working_orders() if w.client_order_id.endswith("-stop")]
+        ours = [
+            w for w in self.broker.working_orders()
+            if w.client_order_id.startswith(self.order_prefix) and w.client_order_id.endswith("-stop")
+        ]
         if rule is None:
             for w in ours:
                 self.broker.cancel(w.client_order_id)
@@ -884,7 +1096,9 @@ class LiveSession:
                 anchor = anchors[ticker]["anchor"]
             else:
                 anchor = float(opening_marks.get(ticker) or position.average_cost)
-            level = self.broker.constraints(instrument).round_price(rule.level(anchor))
+            level = self.broker.constraints(instrument).round_price(
+                rule.level(anchor, position.quantity)
+            )
             decision = (
                 datetime.fromisoformat(rotation.payload["decision_time"]) if rotation
                 else opening.at
@@ -896,7 +1110,8 @@ class LiveSession:
             want = desired.get(str(w.instrument))
             if (
                 want is None
-                or abs(w.quantity - want[0]) > 1e-9
+                or abs(w.quantity - abs(want[0])) > 1e-9
+                or w.side is not Side.closing(want[0])
                 or w.stop_price is None
                 or abs(w.stop_price - want[1]) > 1e-6
             ):
@@ -908,21 +1123,24 @@ class LiveSession:
                 cancelled += 1
             else:
                 desired.pop(str(w.instrument))
-        for ticker, (quantity, level, rotation_key, decision, anchor) in sorted(desired.items()):
+        version = self.strategy().version
+        for ticker, (position, level, rotation_key, decision, anchor) in sorted(desired.items()):
             instrument = InstrumentId(ticker)
+            side = Side.closing(position)
+            quantity = abs(position)
             intent = OrderIntent(
                 client_order_id=client_order_id(
-                    self.run, self.portfolio, instrument, decision, Side.SELL, quantity
+                    self.run, self.portfolio, instrument, decision, side, quantity
                 ) + "-stop",
                 run=self.run, portfolio=self.portfolio, instrument=instrument,
-                strategy_version=self.strategy().version, side=Side.SELL,
+                strategy_version=version, side=side,
                 quantity=quantity, order_type=OrderType.STOP, decision_time=decision,
                 stop_price=level, time_in_force=TimeInForce.GTC, reason="protective stop",
             )
             state = self.broker.submit(intent)
             self.journal.append(EventKind.STOP_PLACED, now, {
                 "client_order_id": intent.client_order_id, "instrument": ticker,
-                "quantity": quantity, "anchor": anchor, "level": level,
+                "side": side.value, "quantity": quantity, "anchor": anchor, "level": level,
                 "rotation": rotation_key, "status": state.status.value,
             })
             placed += 1
@@ -938,7 +1156,12 @@ class LiveSession:
         return anchors
 
     def _rotation_fill_prices(self, rotation) -> dict[str, float]:
-        """Average buy fill price per instrument for the rotation's orders."""
+        """Average entry fill price per instrument for the rotation's orders.
+
+        Entry means the side the position now points: buys for a long, sales
+        for a short. That is the price the new exposure was taken at, and so
+        the one a stop is measured from.
+        """
         if rotation is None:
             return {}
         approval = next(
@@ -949,10 +1172,14 @@ class LiveSession:
         if approval is None:
             return {}
         order_ids = set(approval.payload.get("orders", ()))
+        book = self.book()
+        entry_side = {
+            str(i): ("buy" if p.quantity > 0 else "sell") for i, p in book.positions.items()
+        }
         totals: dict[str, tuple[float, float]] = {}
         for event in self.journal.events(EventKind.FILL):
             p = event.payload
-            if p["client_order_id"] in order_ids and p["side"] == "buy":
+            if p["client_order_id"] in order_ids and p["side"] == entry_side.get(p["instrument"]):
                 q, v = totals.get(p["instrument"], (0.0, 0.0))
                 totals[p["instrument"]] = (q + p["quantity"], v + p["quantity"] * p["price"])
         return {t: v / q for t, (q, v) in totals.items() if q > 0}
@@ -1023,3 +1250,11 @@ class LiveSession:
             elif event.kind is EventKind.FILL and p.get("client_order_id", "").endswith("-stop"):
                 live.pop(p.get("instrument", ""), None)
         return {name: level for name, (_, level) in live.items()}
+
+
+def _closing_part(intent: OrderIntent, held: float) -> OrderIntent | None:
+    """The part of an order that reduces exposure, or ``None`` if it only adds."""
+    closing, opening = split_legs(held, intent.side, intent.quantity)
+    if closing <= 0:
+        return None
+    return intent if opening == 0 else replace(intent, quantity=float(closing))

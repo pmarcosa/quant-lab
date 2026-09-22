@@ -73,3 +73,61 @@ def append_week(root: Path, frames: dict[str, pd.DataFrame], known_at: datetime,
         frames[symbol] = pd.concat([frame, row])
         store.append(InstrumentId(symbol), to_observations(row, week_ending=True, available_at=known_at))
     return frames
+
+
+# -- a daily market, for strategies that are not weekly ---------------------------
+
+LAST_DAY = datetime(2026, 9, 18)  # a Friday: the latest complete session
+
+
+def daily_frame(growth: float, days: int, last_day: datetime, start: float = 50.0):
+    labels = pd.bdate_range(end=last_day, periods=days)
+    rng = np.random.default_rng((abs(hash(growth)) + 7) % 2**32)
+    closes = start * np.cumprod(1 + growth / 5 + rng.normal(0, 0.001, days))
+    opens = np.concatenate([[closes[0]], closes[:-1]]) * 1.0005
+    return pd.DataFrame(
+        {
+            "open": opens, "high": np.maximum(opens, closes) * 1.005,
+            "low": np.minimum(opens, closes) * 0.995, "close": closes,
+            "volume": np.full(days, 1e6),
+        },
+        index=labels,
+    )
+
+
+def build_daily_market(root: Path, days: int = 260) -> dict[str, pd.DataFrame]:
+    """Write a daily store and its universe under ``root``."""
+    from contracts.temporal import BarInterval
+
+    store = BitemporalStore(root, "bars_1day")
+    frames = {}
+    for symbol, growth in GROWTH.items():
+        frame = daily_frame(growth, days, LAST_DAY)
+        frames[symbol] = frame
+        store.append(InstrumentId(symbol), to_observations(frame, interval=BarInterval.DAY))
+    universe = universe_from_store(store, still_trading_after=datetime(2026, 1, 1, tzinfo=timezone.utc))
+    universe.to_csv(root / "universe_daily.csv", derived=True)
+    return frames
+
+
+def append_day(root: Path, frames: dict[str, pd.DataFrame], known_at: datetime, drift=None):
+    """Add the next session to every instrument, recorded as known at ``known_at``."""
+    from contracts.temporal import BarInterval
+
+    store = BitemporalStore(root, "bars_1day")
+    for symbol, frame in frames.items():
+        last = frame.iloc[-1]
+        growth = (drift or {}).get(symbol, GROWTH[symbol] / 5)
+        close = float(last["close"]) * (1 + growth)
+        label = frame.index[-1] + pd.offsets.BDay(1)
+        row = pd.DataFrame(
+            {"open": [float(last["close"]) * 1.0005], "high": [max(close, last["close"]) * 1.005],
+             "low": [min(close, last["close"]) * 0.995], "close": [close], "volume": [1e6]},
+            index=[label],
+        )
+        frames[symbol] = pd.concat([frame, row])
+        store.append(
+            InstrumentId(symbol),
+            to_observations(row, available_at=known_at, interval=BarInterval.DAY),
+        )
+    return frames

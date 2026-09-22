@@ -57,6 +57,7 @@ class RiskSupervision(Protocol):
         intents: Sequence[OrderIntent],
         positions: Mapping[InstrumentId, PositionRisk],
         equity: float,
+        marks: Mapping[InstrumentId, float] | None = None,
     ) -> RiskReview:
         ...
 
@@ -136,6 +137,7 @@ def run_backtest(
     lows_at: PricesAt | None = None,
     supervisor: RiskSupervision | None = None,
     policy: SizingPolicy = DEFAULT_SIZING,
+    highs_at: PricesAt | None = None,
 ) -> RunResult:
     """Run ``strategy`` over ``schedule``, one decision per entry.
 
@@ -150,8 +152,10 @@ def run_backtest(
             the moment after the decision.
         broker: An ``ExecutionPort``. The simulator and a real adapter are
             interchangeable here, which is the point.
-        lows_at: The bar's lows, so resting stops can be triggered on a price the
-            market touched rather than only on one it closed at.
+        lows_at: The bar's lows, so resting sell stops (a long's protection) are
+            triggered on a price the market touched, not only one it closed at.
+        highs_at: The bar's highs, for buy stops -- a short's protection. A
+            short without them would only ever be stopped at a close or a gap.
         supervisor: Optional risk layer. It sees each decision before the orders
             are sent and may only reduce exposure; the contract enforces that.
         policy: Sizing rules.
@@ -181,9 +185,9 @@ def run_backtest(
     # before the next one: a stop followed by an immediate re-entry is a round
     # trip that pays costs and protects nothing.
     stopped_since_rotation: set[InstrumentId] = set()
-    # Stop order id to instrument. The engine tracks this itself rather than
-    # asking the broker, so the execution port stays as narrow as it is.
-    resting_stops: dict[str, InstrumentId] = {}
+    # Stop order id to (instrument, side). The engine tracks this itself rather
+    # than asking the broker, so the execution port stays as narrow as it is.
+    resting_stops: dict[str, tuple[InstrumentId, Side]] = {}
     opening_equity = opening.equity(
         {i: marks_at(opening.as_of)[i] for i in opening.positions}
     )
@@ -216,17 +220,17 @@ def run_backtest(
         rotated = bool(decision.target.diagnostics.get("rotated", 1.0))
         if supervisor is not None:
             exposure = _position_risk(book.at(moment), marks, anchors)
-            review = supervisor.review(intents, exposure, decision.equity)
+            review = supervisor.review(intents, exposure, decision.equity, marks)
             intents = review.approved
             findings = tuple(f.line() for f in review.findings)
 
-        # Cancel-replace, in that order. A resting stop and a rotation's own sell
-        # are two orders to sell the same shares: if both reach the market the
-        # position goes short, which is how a long-only system acquires a short
-        # book without anyone deciding to.
-        selling = {i.instrument for i in intents if i.side is Side.SELL}
-        for oid, instrument in list(resting_stops.items()):
-            if instrument in selling:
+        # Cancel-replace, in that order. A resting stop and a rotation order on
+        # the same side are two orders to close the same shares: if both reach
+        # the market the position overshoots through zero -- a long becomes a
+        # short, or a short a long -- without anyone deciding to.
+        trading = {(i.instrument, i.side) for i in intents}
+        for oid, (instrument, side) in list(resting_stops.items()):
+            if (instrument, side) in trading:
                 broker.cancel(oid)
                 resting_stops.pop(oid, None)
 
@@ -235,7 +239,8 @@ def run_backtest(
             broker.submit(intent)
         if has_next:
             lows = None if lows_at is None else lows_at(execution_time)
-            fills = broker.advance(execution_time, execution_at(execution_time), lows)
+            highs = None if highs_at is None else highs_at(execution_time)
+            fills = broker.advance(execution_time, execution_at(execution_time), lows, highs)
             book = book.at(execution_time).apply_all(fills)
 
         stopped = tuple(
@@ -274,7 +279,7 @@ def run_backtest(
                 broker.constraints,
             ):
                 broker.submit(intent)
-                resting_stops[intent.client_order_id] = intent.instrument
+                resting_stops[intent.client_order_id] = (intent.instrument, intent.side)
 
         marked_at = execution_time if has_next else moment
         prices = execution_at(marked_at) if has_next else marks

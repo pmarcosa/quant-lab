@@ -27,8 +27,9 @@ SATURDAY = datetime(2026, 9, 19, 10, 0, tzinfo=timezone.utc)
 
 def config(tmp_path, **risk):
     return LiveConfig(
+        strategy_id="momentum",
         mode=TradingMode.PAPER, account="DU1234567", sleeve_capital=100_000.0,
-        strategy=StrategySettings(rebalance_weeks=1, top_n=2, lookback_weeks=13),
+        strategy=StrategySettings(params={"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13}),
         risk=RiskSettings(**{"stop_distance": 0.12, "max_order_fraction": 0.6, **risk}),
         state_dir=tmp_path / "state",
     )
@@ -106,6 +107,7 @@ def test_nothing_is_sent_without_the_typed_code(world):
 
 def test_live_mode_needs_a_longer_confirmation(tmp_path):
     cfg = LiveConfig(
+        strategy_id="momentum",
         mode=TradingMode.LIVE, account="U7654321", sleeve_capital=1.0,
         state_dir=tmp_path,
     )
@@ -245,20 +247,51 @@ def test_a_name_a_stop_closed_is_not_bought_back_before_the_next_rotation(world)
     assert stopped not in bought
 
 
-def test_a_trade_made_by_hand_is_not_absorbed_but_is_reported(world):
+def _hand_trade(gateway, symbol="DDD", reference=""):
     import ib_async
 
-    session, gateway, *_ = world
-    session.init()
     manual = gateway.placeOrder(
-        ib_async.Stock("DDD", "SMART", "USD"),
-        ib_async.Order(action="BUY", totalQuantity=7, orderType="MKT", orderRef=""),
+        ib_async.Stock(symbol, "SMART", "USD"),
+        ib_async.Order(action="BUY", totalQuantity=7, orderType="MKT", orderRef=reference),
     )
     gateway.execute(manual, 50.0)
+
+
+def test_a_trade_made_by_hand_in_a_dedicated_account_halts(world):
+    """The account is the strategy's. A position nobody recorded is an incident."""
+    session, gateway, *_ = world
+    session.init()
+    _hand_trade(gateway)
     report = session.sync()
     assert report.new_fills == 0
     assert "DDD" not in {str(i) for i in session.book().positions}
+    assert any(f.instrument == "DDD" and f.level == "mismatch" for f in report.reconciliation.findings)
+    assert session.state() is DegradationState.HALTED
+
+
+def test_a_trade_made_by_hand_in_a_shared_account_is_reported(tmp_path):
+    from dataclasses import replace
+
+    build_market(tmp_path / "store")
+    gateway = FakeGateway(cash=150_000.0)
+    broker = IBKRBroker(gateway, "DU1234567", TradingMode.PAPER, settle_seconds=0)
+    session = LiveSession(replace(config(tmp_path), account_scope="shared"), broker,
+                          tmp_path / "store", clock=Clock(SATURDAY))
+    session.init()
+    _hand_trade(gateway)
+    report = session.sync()
+    assert report.new_fills == 0
     assert any(f.instrument == "DDD" and f.level == "warn" for f in report.reconciliation.findings)
+    assert session.state() is DegradationState.NORMAL
+
+
+def test_another_strategys_fills_are_never_claimed(world):
+    """Two strategies' order ids start differently; a fill is claimed by prefix."""
+    session, gateway, *_ = world
+    session.init()
+    _hand_trade(gateway, reference="ql-other.0123456789abcdef0123")
+    report = session.sync()
+    assert report.new_fills == 0
 
 
 def test_the_sleeve_cannot_open_twice(world):

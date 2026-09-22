@@ -31,7 +31,7 @@ python scripts/reconcile_conventions.py   # prices the execution conventions
 python scripts/run_funnel.py              # five gates, on the real data
 python scripts/compare_stops.py           # what a protective stop actually buys
 python scripts/backtest_momentum.py --freq weekly --rebalance-weeks 4 --start 2009-02-24
-pytest -q                                 # 303 tests
+pytest -q                                 # 583 tests
 ```
 
 `demo_causality.py` proves three things against 17 years of real IBKR bars:
@@ -207,15 +207,25 @@ permanently.
 
 ## Risk
 
-`risk/` may **only reduce exposure**, and the contract enforces it. It may drop
-or shrink a buy, and it may add a sell that closes a position. It may never add a
-buy, and it may never shrink or drop a sell — a sell here is an exit, and
-watering one down leaves exposure on, which is an increase wearing a limit's
-clothes. `RiskReview.__post_init__` refuses all three, so a new rule cannot break
-the invariant by being written carelessly.
+`risk/` may **only reduce exposure**, and the contract enforces it on signed
+positions, so it holds for longs and shorts alike: for every instrument, the
+position risk approves must lie **between zero and the position the strategy
+proposed**, inclusive. Risk may shrink an entry, stop a reversal at flat, or add
+an order that closes a position. It may never enlarge an entry, and never shrink
+an exit — watering an exit down leaves exposure on, which is an increase wearing
+a limit's clothes. `RiskReview.__post_init__` refuses every violation, so a new
+rule cannot break the invariant by being written carelessly.
+
+The rules: gross exposure (longs plus shorts) and net exposure (longs minus
+shorts) limits, which credit what an order closes before counting what it opens
+and fail closed when a new name has no price; short sales, off unless a strategy
+allows them and, live, cut to what the broker says can be borrowed; and
+reduce-only, which lets positions shrink toward zero on either side and nothing
+else.
 
 The protective stop rests **at the broker**, not in the process: if the machine
-running this is off, the positions are still protected. It is a fixed 12% — the
+running this is off, the positions are still protected. A long gets a sell stop
+below its entry, a short a buy stop above it. It is a fixed 12% — the
 same distance for a calm instrument and a volatile one, because volatility enters
 through position *size* — and it is anchored to the **rotation price, never the
 average cost**. Measured on the live book, a stop set from AAPL's average cost
@@ -224,8 +234,9 @@ the market and would have sold immediately. Average cost is information about th
 holder's past, not the instrument's future.
 
 A position a stop closes **stays closed** until the next rotation. And a resting
-stop is cancelled before a rotation's own sell reaches the market, because two
-orders to sell the same shares take a long-only book short.
+stop is cancelled before a rotation's own order on the same side reaches the
+market, because two orders closing the same shares push the position through
+zero.
 
 ### What the stop is worth
 
@@ -257,8 +268,25 @@ market-on-open orders, the fill the backtest assumes, only after the person
 types the proposal's code. Before sending, it checks that the sleeve has not
 changed since the proposal was made.
 
-After every sync, the sleeve is reconciled against the account. If the broker
-holds less than the sleeve believes, the system halts.
+After every sync, the sleeve is reconciled against the account, on signed
+positions. If the broker holds less than the sleeve believes, or on the other
+side, the system halts.
+
+**Several strategies.** Each deployed strategy has an id, its own config
+(`configs/strategies/<id>.yaml`), its own journal and state folder, and its own
+IBKR account. The id is written on every order it sends (IBKR's Order Ref is
+`ql-<id>.<hash>`), so a strategy recognises its own fills and stops, and a
+statement says which strategy sent what. Two strategies in one account are
+refused by configuration: the broker would net their orders, and splitting fills
+between virtual sub-accounts is machinery deliberately not built.
+
+**Any bar size, either side.** The deployed strategy is weekly and long-only;
+the system is neither. The bar size comes from the strategy and drives the data
+refresh, the order type (opening auction for daily and weekly bars, day orders
+intraday), how long a proposal stays valid, and the data-age limits. Monitoring
+settings are calendar durations converted into bars, because a market's memory
+is fixed in calendar time. Shorts need `allow_short`, a margin account, borrow
+availability and a passing what-if margin check before a proposal is made.
 
 `validation/monitoring.py` judges live results against distributions built from
 the backtest, never against a single number. It uses four checks:
@@ -280,4 +308,11 @@ from a versioned JSON document.
 
 - **Delisted instruments.** The universe carries survivorship bias until
   point-in-time data is bought.
+- **Borrow costs in backtests.** Shorts are backtested without borrow fees,
+  margin interest or recalls, so a short strategy's backtest is optimistic.
+- **Intraday readiness.** No exchange calendar (holidays, half days) and only
+  IBKR's short intraday history. The plumbing handles hourly and minute bars;
+  validating a strategy on them needs data this project does not have.
+- **Borrow fees live.** The TWS API rarely reports them; the fee limit applies
+  only when it does.
 - **Automatic execution.** Not planned: approval stays manual by design.

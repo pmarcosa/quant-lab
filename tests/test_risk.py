@@ -23,8 +23,11 @@ from execution.simulated import CostModel, SimulatedBroker
 from risk.rules import (
     CorrelatedClusterWarning,
     GrossExposureLimit,
+    NetExposureLimit,
     ProtectiveStop,
+    ReduceOnly,
     RiskSupervisor,
+    ShortSales,
 )
 from tests.conftest import at
 
@@ -69,34 +72,38 @@ def _portfolio(portfolio):
 
 # -- the invariant -----------------------------------------------------------
 
+LONG = {AAA: 100.0}
+SHORT = {AAA: -100.0}
+
 
 def test_risk_may_not_enlarge_a_buy(portfolio):
     proposed = (order(AAA, Side.BUY, 100),)
     with pytest.raises(ContractViolation, match="only reduce exposure"):
-        RiskReview(proposed=proposed, approved=(order(AAA, Side.BUY, 150),))
+        RiskReview(proposed=proposed, approved=(order(AAA, Side.BUY, 150),), held={})
 
 
 def test_risk_may_not_add_a_buy_that_was_not_proposed(portfolio):
     with pytest.raises(ContractViolation, match="only reduce exposure"):
-        RiskReview(proposed=(), approved=(order(BBB, Side.BUY, 10),))
+        RiskReview(proposed=(), approved=(order(BBB, Side.BUY, 10),), held={})
 
 
 def test_risk_may_not_shrink_a_sell(portfolio):
-    """A sell is an exit; watering one down is an increase wearing a limit's clothes."""
+    """A sell out of a long is an exit; watering one down keeps exposure on."""
     proposed = (order(AAA, Side.SELL, 100),)
     with pytest.raises(ContractViolation, match="exit"):
-        RiskReview(proposed=proposed, approved=(order(AAA, Side.SELL, 40),))
+        RiskReview(proposed=proposed, approved=(order(AAA, Side.SELL, 40),), held=LONG)
 
 
 def test_risk_may_not_drop_a_sell(portfolio):
     with pytest.raises(ContractViolation, match="exit"):
-        RiskReview(proposed=(order(AAA, Side.SELL, 100),), approved=())
+        RiskReview(proposed=(order(AAA, Side.SELL, 100),), approved=(), held=LONG)
 
 
 def test_risk_may_shrink_a_buy_and_add_a_sell(portfolio):
     review = RiskReview(
         proposed=(order(AAA, Side.BUY, 100),),
         approved=(order(AAA, Side.BUY, 60), order(BBB, Side.SELL, 25)),
+        held={BBB: 50.0},
     )
     assert review.changed
 
@@ -105,6 +112,7 @@ def test_findings_separate_a_warning_from_a_limit():
     review = RiskReview(
         proposed=(),
         approved=(),
+        held={},
         findings=(
             RiskFinding("cluster", Severity.WARN, "28% of the book"),
             RiskFinding("gross", Severity.LIMIT, "trimmed"),
@@ -114,32 +122,166 @@ def test_findings_separate_a_warning_from_a_limit():
     assert len(review.limits_applied) == 1
 
 
+# -- the invariant, on a book that can be short -------------------------------
+
+
+def test_risk_may_not_shrink_a_buy_that_covers_a_short(portfolio):
+    """For a short, the exit is a buy. The same rule protects it."""
+    with pytest.raises(ContractViolation, match="exit"):
+        RiskReview(
+            proposed=(order(AAA, Side.BUY, 100),),
+            approved=(order(AAA, Side.BUY, 40),),
+            held=SHORT,
+        )
+
+
+def test_risk_may_trim_a_short_sale_that_opens_exposure(portfolio):
+    review = RiskReview(
+        proposed=(order(AAA, Side.SELL, 100),), approved=(order(AAA, Side.SELL, 30),), held={}
+    )
+    assert review.changed
+
+
+def test_risk_may_not_enlarge_a_short_sale(portfolio):
+    with pytest.raises(ContractViolation, match="only reduce exposure"):
+        RiskReview(
+            proposed=(order(AAA, Side.SELL, 100),), approved=(order(AAA, Side.SELL, 150),), held={}
+        )
+
+
+def test_risk_may_stop_a_reversal_at_flat_but_not_before_it(portfolio):
+    """Long 100, asked to go short 50: flat is allowed, still long is not."""
+    proposed = (order(AAA, Side.SELL, 150),)
+    RiskReview(proposed=proposed, approved=(order(AAA, Side.SELL, 100),), held=LONG)
+    with pytest.raises(ContractViolation, match="exit"):
+        RiskReview(proposed=proposed, approved=(order(AAA, Side.SELL, 60),), held=LONG)
+
+
+def test_risk_may_add_a_cover_the_strategy_did_not_ask_for(portfolio):
+    RiskReview(proposed=(), approved=(order(AAA, Side.BUY, 100),), held=SHORT)
+    with pytest.raises(ContractViolation, match="only reduce exposure"):
+        RiskReview(proposed=(), approved=(order(AAA, Side.BUY, 150),), held=SHORT)
+
+
 # -- the rules ---------------------------------------------------------------
+
+MARKS = {AAA: 100.0, BBB: 100.0, CCC: 100.0}
 
 
 def test_gross_exposure_trims_a_buy_that_would_overshoot(portfolio):
     rule = GrossExposureLimit(maximum=1.0)
-    positions = {AAA: position(AAA, weight=0.90, mark=100.0)}
+    positions = {AAA: position(AAA, quantity=90, weight=0.90, mark=100.0)}
     intents = (order(AAA, Side.BUY, 50),)  # 5,000 against 1,000 of room
-    approved, findings = rule.apply(intents, positions, equity=10_000.0)
+    approved, findings = rule.apply(intents, positions, equity=10_000.0, marks=MARKS)
     assert approved[0].quantity == 10
     assert findings[0].severity is Severity.LIMIT
-    RiskReview(proposed=intents, approved=approved)  # the invariant still holds
+    RiskReview(proposed=intents, approved=approved, held={AAA: 90.0})
 
 
 def test_gross_exposure_never_touches_a_sell(portfolio):
     rule = GrossExposureLimit(maximum=0.1)
-    positions = {AAA: position(AAA, weight=0.99, mark=100.0)}
-    intents = (order(AAA, Side.SELL, 100),)
-    approved, _ = rule.apply(intents, positions, equity=10_000.0)
+    positions = {AAA: position(AAA, quantity=99, weight=0.99, mark=100.0)}
+    intents = (order(AAA, Side.SELL, 99),)
+    approved, _ = rule.apply(intents, positions, equity=10_000.0, marks=MARKS)
     assert approved == intents
+
+
+def test_gross_exposure_counts_what_a_rotation_releases(portfolio):
+    """Fully invested, selling A to buy B: not over the limit.
+
+    The earlier rule ignored the room a sale frees and let any name the book did
+    not hold through unpriced, so it only ever limited additions to positions.
+    """
+    rule = GrossExposureLimit(maximum=1.0)
+    positions = {AAA: position(AAA, quantity=99, weight=0.99, mark=100.0)}
+    intents = (order(AAA, Side.SELL, 99), order(BBB, Side.BUY, 120))
+    approved, findings = rule.apply(intents, positions, equity=10_000.0, marks=MARKS)
+    assert [o.quantity for o in approved] == [99, 100]
+    assert findings[0].instrument == BBB
+
+
+def test_gross_exposure_counts_shorts_as_exposure(portfolio):
+    rule = GrossExposureLimit(maximum=1.0)
+    positions = {AAA: position(AAA, quantity=60, weight=0.6, mark=100.0)}
+    intents = (order(BBB, Side.SELL, 60),)  # a 60% short on top of a 60% long
+    approved, _ = rule.apply(intents, positions, equity=10_000.0, marks=MARKS)
+    assert approved[0].quantity == 40
+
+
+def test_gross_exposure_trims_only_the_opening_leg_of_a_reversal(portfolio):
+    rule = GrossExposureLimit(maximum=0.5)
+    positions = {AAA: position(AAA, quantity=40, weight=0.4, mark=100.0)}
+    intents = (order(AAA, Side.SELL, 140),)  # close 40 long, open 100 short
+    approved, _ = rule.apply(intents, positions, equity=10_000.0, marks=MARKS)
+    assert approved[0].quantity == 90  # 40 closed, 50 short allowed
+    RiskReview(proposed=intents, approved=approved, held={AAA: 40.0})
+
+
+def test_a_new_position_without_a_mark_fails_closed(portfolio):
+    rule = GrossExposureLimit(maximum=1.0)
+    with pytest.raises(ContractViolation, match="cannot value"):
+        rule.apply((order(BBB, Side.BUY, 10),), {}, equity=10_000.0, marks={})
+
+
+def test_net_exposure_limits_both_sides(portfolio):
+    rule = NetExposureLimit(minimum=-0.2, maximum=0.2)
+    longs, _ = rule.apply((order(AAA, Side.BUY, 50),), {}, equity=10_000.0, marks=MARKS)
+    shorts, _ = rule.apply((order(AAA, Side.SELL, 50),), {}, equity=10_000.0, marks=MARKS)
+    assert longs[0].quantity == 20 and shorts[0].quantity == 20
+
+
+def test_a_hedged_book_has_net_room_but_uses_gross(portfolio):
+    positions = {AAA: position(AAA, quantity=50, weight=0.5, mark=100.0)}
+    net, _ = NetExposureLimit(-0.1, 0.1).apply(
+        (order(BBB, Side.SELL, 50),), positions, equity=10_000.0, marks=MARKS
+    )
+    assert net[0].quantity == 50, "a short against a long brings net back to zero"
+
+
+def test_short_sales_are_off_unless_enabled(portfolio):
+    intents = (order(AAA, Side.SELL, 30),)
+    approved, findings = ShortSales().apply(intents, {}, 10_000.0, MARKS)
+    assert approved == () and "not enabled" in findings[0].message
+    # Selling a long is not a short sale.
+    positions = {AAA: position(AAA, quantity=30)}
+    approved, findings = ShortSales().apply(intents, positions, 10_000.0, MARKS)
+    assert approved == intents and findings == ()
+
+
+def test_a_short_is_cut_to_what_can_be_borrowed(portfolio):
+    rule = ShortSales(allowed=True, availability={AAA: 12.0, BBB: None})
+    approved, findings = rule.apply(
+        (order(AAA, Side.SELL, 30), order(BBB, Side.SELL, 5)), {}, 10_000.0, MARKS
+    )
+    assert [(o.instrument, o.quantity) for o in approved] == [(AAA, 12.0)]
+    assert "no borrow availability" in findings[1].message
+
+
+def test_an_expensive_borrow_is_refused(portfolio):
+    rule = ShortSales(allowed=True, availability={AAA: 1e6}, borrow_fees={AAA: 0.30},
+                      max_borrow_fee=0.05)
+    approved, _ = rule.apply((order(AAA, Side.SELL, 30),), {}, 10_000.0, MARKS)
+    assert approved == ()
+
+
+def test_reduce_only_lets_a_short_be_covered_and_nothing_opened(portfolio):
+    rule = ReduceOnly()
+    positions = {AAA: position(AAA, quantity=-100), BBB: position(BBB, quantity=50)}
+    intents = (
+        order(AAA, Side.BUY, 150),   # cover 100, would open a 50 long
+        order(BBB, Side.BUY, 10),    # adds to a long
+        order(CCC, Side.SELL, 10),   # opens a short
+    )
+    approved, findings = rule.apply(intents, positions, 10_000.0, MARKS)
+    assert [(o.instrument, o.side, o.quantity) for o in approved] == [(AAA, Side.BUY, 100.0)]
+    assert len(findings) == 3
 
 
 def test_a_correlated_cluster_warns_and_does_not_block(portfolio):
     rule = CorrelatedClusterWarning(clusters={"crypto": frozenset({AAA, BBB})}, threshold=0.25)
     positions = {AAA: position(AAA, weight=0.20), BBB: position(BBB, weight=0.15)}
     intents = (order(CCC, Side.BUY, 10),)
-    approved, findings = rule.apply(intents, positions, equity=10_000.0)
+    approved, findings = rule.apply(intents, positions, equity=10_000.0, marks=MARKS)
     assert approved == intents, "warned, not blocked"
     assert findings[0].severity is Severity.WARN
     assert "35%" in findings[0].message
@@ -147,7 +289,7 @@ def test_a_correlated_cluster_warns_and_does_not_block(portfolio):
 
 def test_a_cluster_below_the_threshold_says_nothing(portfolio):
     rule = CorrelatedClusterWarning(clusters={"crypto": frozenset({AAA})}, threshold=0.25)
-    _, findings = rule.apply((), {AAA: position(AAA, weight=0.2)}, equity=1.0)
+    _, findings = rule.apply((), {AAA: position(AAA, weight=0.2)}, equity=1.0, marks=MARKS)
     assert findings == ()
 
 
@@ -205,6 +347,18 @@ def test_stops_rest_as_gtc_orders():
     assert placed.side is Side.SELL
 
 
+def test_a_short_is_protected_by_a_buy_stop_above_the_anchor():
+    stop = ProtectiveStop(distance=0.12)
+    (placed,) = stop.orders_for(
+        {AAA: position(AAA, quantity=-40, anchor=100.0)},
+        run=RUN, portfolio=_PORTFOLIO, strategy_version=VERSION,
+        moment=at(2020, 1, 3), constraints_for=lambda i: InstrumentConstraints(i, "USD"),
+    )
+    assert placed.side is Side.BUY
+    assert placed.quantity == 40
+    assert placed.stop_price == pytest.approx(112.0)
+
+
 # -- the broker's side of it -------------------------------------------------
 
 
@@ -247,6 +401,22 @@ def test_a_resting_stop_survives_a_week_with_no_print(portfolio):
     assert len(fills) == 1
 
 
+def test_a_buy_stop_fills_when_the_bar_trades_up_to_it(portfolio):
+    broker = SimulatedBroker(costs=CostModel(0.0, 0.0))
+    broker.submit(order(AAA, Side.BUY, 40, OrderType.STOP, stop=112.0))
+    assert broker.advance(at(2020, 1, 10), {AAA: 105.0}, lows={AAA: 100.0}, highs={AAA: 110.0}) == ()
+    fills = broker.advance(at(2020, 1, 17), {AAA: 105.0}, lows={AAA: 100.0}, highs={AAA: 115.0})
+    assert fills[0].price == pytest.approx(112.0)
+
+
+def test_a_buy_stop_gapped_through_fills_at_the_open(portfolio):
+    """A squeeze that opens above the stop: the fill is the open, however far."""
+    broker = SimulatedBroker(costs=CostModel(0.0, 0.0))
+    broker.submit(order(AAA, Side.BUY, 40, OrderType.STOP, stop=112.0))
+    fills = broker.advance(at(2020, 1, 10), {AAA: 140.0}, lows={AAA: 135.0}, highs={AAA: 150.0})
+    assert fills[0].price == pytest.approx(140.0)
+
+
 def test_a_day_order_with_no_print_still_expires(portfolio):
     broker = SimulatedBroker(costs=CostModel(0.0, 0.0))
     broker.submit(order(AAA, Side.BUY, 100))
@@ -266,7 +436,7 @@ def test_the_supervisor_runs_every_rule_and_reports_once(portfolio):
         ),
         stop=ProtectiveStop(),
     )
-    positions = {AAA: position(AAA, weight=0.95, mark=100.0)}
+    positions = {AAA: position(AAA, quantity=95, weight=0.95, mark=100.0)}
     review = supervisor.review((order(AAA, Side.BUY, 100),), positions, equity=10_000.0)
     assert len(review.limits_applied) == 1
     assert len(review.warnings) == 1
@@ -445,3 +615,80 @@ def test_a_rotation_sell_and_a_resting_stop_never_both_fill(portfolio):
             f"went short at {step.marked_at}: a stop and an exit both filled"
         )
     assert result.steps[-1].book_after.quantity(AAA) == 0
+
+
+class _HoldsShort(_Holds):
+    """Short one name at half the equity, rebalanced on the rotation schedule."""
+
+    def target(self, filtration, held):
+        from contracts.targets import TargetIntent
+
+        self._n += 1
+        rotated = (self._n - 1) % self.rotate_every == 0
+        weights = {self.instrument: -0.5} if rotated else dict(held)
+        return TargetIntent(
+            weights=weights, horizon_bars=1, as_of=filtration.decision_time,
+            diagnostics={"rotated": 1.0 if rotated else 0.0},
+        )
+
+
+def test_a_short_in_a_backtest_is_stopped_on_the_high_and_never_flips_long(portfolio):
+    """The engine's side of shorting: a buy stop above the entry, triggered by
+    the bar's high, filled at its level, and no re-entry before the rotation."""
+    from engine.decide import SizingPolicy
+    from engine.run import run_backtest
+    from risk.rules import ShortSales
+
+    weeks = _weekly(6)
+    closes = _prices(weeks, [100.0, 100.0, 100.0, 120.0, 118.0, 116.0])
+    opens = _prices(weeks, [100.0, 100.0, 100.0, 105.0, 118.0, 116.0])
+    lows = _prices(weeks, [99.0, 99.0, 99.0, 104.0, 117.0, 115.0])
+    highs = _prices(weeks, [101.0, 101.0, 101.0, 125.0, 119.0, 117.0])
+
+    result = run_backtest(
+        run=RUN,
+        opening=Book.opening(portfolio, 100_000.0, weeks[0]),
+        strategy=_HoldsShort(AAA, rotate_every=4),
+        schedule=weeks,
+        filtration_at=_NoFiltration,
+        marks_at=closes.__getitem__,
+        execution_at=opens.__getitem__,
+        broker=SimulatedBroker(costs=CostModel(0.0, 0.0)),
+        tradable_at=lambda m: {AAA},
+        lows_at=lows.__getitem__,
+        highs_at=highs.__getitem__,
+        supervisor=RiskSupervisor(
+            rules=(ShortSales(allowed=True),), stop=ProtectiveStop(distance=0.12)
+        ),
+        policy=SizingPolicy(cash_buffer=0.0, min_trade_fraction=0.0, allow_short=True),
+    )
+
+    assert result.steps[1].book_after.quantity(AAA) < 0, "the short was opened"
+    assert result.stops_fired() == 1
+    stopped_at = next(i for i, s in enumerate(result.steps) if s.stopped_out)
+    assert result.steps[stopped_at].book_after.quantity(AAA) == 0
+    for step in result.steps:
+        assert step.book_after.quantity(AAA) <= 0, f"went long at {step.marked_at}"
+    for step in result.steps[stopped_at + 1 :]:
+        assert not any(o.side is Side.SELL for o in step.intents), "no re-entry before rotation"
+
+
+def test_a_short_backtest_without_permission_fails_loudly(portfolio):
+    from engine.decide import SizingPolicy
+    from engine.run import run_backtest
+
+    weeks = _weekly(3)
+    prices = _prices(weeks, [100.0, 100.0, 100.0])
+    with pytest.raises(ContractViolation, match="short targets are not permitted"):
+        run_backtest(
+            run=RUN,
+            opening=Book.opening(portfolio, 100_000.0, weeks[0]),
+            strategy=_HoldsShort(AAA),
+            schedule=weeks,
+            filtration_at=_NoFiltration,
+            marks_at=prices.__getitem__,
+            execution_at=prices.__getitem__,
+            broker=SimulatedBroker(costs=CostModel(0.0, 0.0)),
+            tradable_at=lambda m: {AAA},
+            policy=SizingPolicy(cash_buffer=0.0, min_trade_fraction=0.0),
+        )

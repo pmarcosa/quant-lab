@@ -28,6 +28,10 @@ class FakeGateway:
         self._exec = 1
         self.placed = 0
         self.history: dict[str, list] = {}
+        #: Shortable shares per symbol; a symbol not listed reports nothing.
+        self.shortable: dict[str, float] = {}
+        #: Initial margin per unit of short notional, for what-if orders.
+        self.short_margin = 0.5
 
     # -- the API the adapter uses ------------------------------------------
 
@@ -119,6 +123,37 @@ class FakeGateway:
 
     # -- test controls: the exchange ---------------------------------------
 
+    def reqMktData(self, contract, genericTickList="", snapshot=False, regulatorySnapshot=False,
+                   mktDataOptions=None):
+        ticker = ib_async.Ticker(contract=contract)
+        if contract.symbol in self.shortable:
+            ticker.shortableShares = self.shortable[contract.symbol]
+        return ticker
+
+    def cancelMktData(self, contract):
+        return None
+
+    def whatIfOrder(self, contract, order):
+        price = self.prices.get(contract.symbol, 100.0)
+        held = self._positions.get(contract.symbol, 0.0)
+        signed = order.totalQuantity if order.action == "BUY" else -order.totalQuantity
+        short_before = max(-held, 0.0) * price
+        short_after = max(-(held + signed), 0.0) * price
+        equity = self.cash + sum(q * self.prices.get(s, 0.0) for s, q in self._positions.items())
+        before = self._short_margin_total()
+        change = self.short_margin * (short_after - short_before)
+        return ib_async.OrderState(
+            initMarginBefore=str(before), initMarginChange=str(change),
+            initMarginAfter=str(before + change), equityWithLoanBefore=str(equity),
+            equityWithLoanAfter=str(equity),
+        )
+
+    def _short_margin_total(self):
+        return sum(
+            self.short_margin * -q * self.prices.get(s, 100.0)
+            for s, q in self._positions.items() if q < 0
+        )
+
     def hold(self, symbol, quantity, cost):
         """Seed a position that exists before the system starts."""
         self._positions[symbol] = quantity
@@ -150,10 +185,10 @@ class FakeGateway:
         signed = shares if order.action == "BUY" else -shares
         symbol = trade.contract.symbol
         held = self._positions.get(symbol, 0.0)
-        if signed > 0:
-            total = held + signed
+        if held == 0 or (held > 0) == (signed > 0):  # opening or adding, either side
+            total = abs(held) + abs(signed)
             self._costs[symbol] = (
-                (held * self._costs.get(symbol, 0.0) + signed * price) / total if total else 0.0
+                (abs(held) * self._costs.get(symbol, 0.0) + abs(signed) * price) / total
             )
         self._positions[symbol] = held + signed
         self.cash -= signed * price + commission
@@ -172,14 +207,24 @@ class FakeGateway:
             if trade.order.tif == "OPG" and trade.contract.symbol in opens:
                 self.execute(trade, opens[trade.contract.symbol], when=when)
 
-    def trigger_stops(self, lows, when=None):
-        """Fill resting stops whose level the market touched."""
+    def trigger_stops(self, lows, when=None, highs=None):
+        """Fill resting stops whose level the market touched: sell stops on the
+        low, buy stops (a short's) on the high."""
         when = when or datetime.now(timezone.utc)
+        highs = highs or {}
         for trade in list(self.openTrades()):
             order = trade.order
-            low = lows.get(trade.contract.symbol)
-            if order.orderType == "STP" and low is not None and low <= order.auxPrice:
-                self.execute(trade, order.auxPrice, when=when)
+            if order.orderType != "STP":
+                continue
+            symbol = trade.contract.symbol
+            if order.action == "SELL":
+                low = lows.get(symbol)
+                if low is not None and low <= order.auxPrice:
+                    self.execute(trade, order.auxPrice, when=when)
+            else:
+                high = highs.get(symbol)
+                if high is not None and high >= order.auxPrice:
+                    self.execute(trade, order.auxPrice, when=when)
 
     def trade_for(self, reference):
         return next(t for t in self._trades if t.order.orderRef == reference)

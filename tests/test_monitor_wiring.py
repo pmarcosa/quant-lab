@@ -33,8 +33,11 @@ def make_session(tmp_path, weeks=120, **strategy):
     broker = IBKRBroker(gateway, "DU1234567", TradingMode.PAPER, settle_seconds=0)
     clock = Clock(SATURDAY)
     config = LiveConfig(
+        strategy_id="momentum",
         mode=TradingMode.PAPER, account="DU1234567", sleeve_capital=100_000.0,
-        strategy=StrategySettings(**{"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13, **strategy}),
+        strategy=StrategySettings(
+            params={"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13, **strategy}
+        ),
         risk=RiskSettings(stop_distance=0.12),
         state_dir=tmp_path / "state",
     )
@@ -73,7 +76,7 @@ def test_a_baseline_is_built_saved_and_reloaded(tmp_path):
     baseline.save(baseline_path(session))
     reloaded = load_baseline(session)
     assert reloaded == baseline
-    assert len(baseline.weekly_returns) > 20
+    assert len(baseline.returns) > 20
     assert baseline.modeled_bps > 0
 
 
@@ -84,7 +87,7 @@ def test_a_baseline_built_for_other_settings_is_refused(tmp_path):
     changed.config.state_dir.mkdir(parents=True, exist_ok=True)
     stale = Baseline.load(baseline_path(session))
     stale.save(baseline_path(changed))
-    with pytest.raises(ContractViolation, match="different strategy or risk settings"):
+    with pytest.raises(ContractViolation, match="other strategy or risk settings"):
         load_baseline(changed)
 
 
@@ -98,10 +101,10 @@ def test_several_live_weeks_produce_a_full_report(tmp_path):
     assert len(returns) == len(weeks) - 1
 
     report = run_monitor(session)
-    assert report.assessment.weeks == len(returns)
+    assert report.assessment.periods == len(returns)
     assert report.assessment.drawdown is not None
     assert report.assessment.shortfall is not None and report.assessment.shortfall.fills > 0
-    assert report.process.buy_compliance == 1.0, "every proposed buy was approved and filled"
+    assert report.process.entry_compliance == 1.0, "every proposed entry was approved and filled"
     assert report.process.stop_coverage == 1.0
     assert report.health.last_reconciliation == "ok"
     assert report.state_after in tuple(DegradationState)
@@ -119,7 +122,7 @@ def test_a_rejected_proposal_is_counted_and_priced(tmp_path):
     session.sync()
     report = run_monitor(session)
     assert report.process.rejected == 1
-    assert report.process.buy_compliance == 0.0
+    assert report.process.entry_compliance == 0.0
     assert report.process.override_cost is not None, "what not following the system cost"
 
 

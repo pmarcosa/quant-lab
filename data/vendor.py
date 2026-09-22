@@ -30,7 +30,7 @@ from contracts.errors import ContractViolation
 CACHE_COLUMNS = ("open", "high", "low", "close", "volume")
 
 #: What the ingest reads. Anything else is a different dataset, not a variant.
-FREQUENCIES = ("weekly", "daily")
+FREQUENCIES = ("weekly", "daily", "hourly", "minute")
 
 
 def bars_from_connector(payload: Mapping[str, Any]) -> pd.DataFrame:

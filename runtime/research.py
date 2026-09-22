@@ -139,6 +139,7 @@ def run_once(
         broker=broker,
         tradable_at=market.window.fresh_at,
         lows_at=market.window.lows_at,
+        highs_at=market.window.highs_at,
         supervisor=supervisor,
         policy=policy,
     )

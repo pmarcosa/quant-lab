@@ -20,6 +20,7 @@ from tests.live_fixtures import Clock, append_week, build_market  # noqa: E402
 from tests.test_monitor_wiring import SATURDAY  # noqa: E402
 
 CONFIG = """
+strategy_id: momentum
 mode: paper
 account: DU1234567
 sleeve_capital: 100000
@@ -45,12 +46,16 @@ class Harness:
 
     def broker(self, config):
         self.connections += 1
-        return IBKRBroker(self.gateway, config.account, config.mode, settle_seconds=0)
+        from runtime.cli import _prefix
+
+        return IBKRBroker(self.gateway, config.account, config.mode, settle_seconds=0,
+                          order_prefix=_prefix(config))
 
     def run(self, *argv: str) -> tuple[int, str]:
         start = len(self.lines)
         context = Context(
             config_path=self.config, store=self.root / "store", cache=self.root / "cache",
+            configs_root=self.root / "configs",
             broker_factory=self.broker, clock=lambda: self.clock.now,
             input=lambda prompt: self.answers.pop(0), out=self.lines.append,
         )

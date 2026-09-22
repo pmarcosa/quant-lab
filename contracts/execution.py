@@ -40,6 +40,41 @@ class Side(str, Enum):
     BUY = "buy"
     SELL = "sell"
 
+    @property
+    def sign(self) -> float:
+        """+1 for a buy, -1 for a sell: the direction the order moves a position."""
+        return 1.0 if self is Side.BUY else -1.0
+
+    @classmethod
+    def closing(cls, position: float) -> Side:
+        """The side that moves a signed position towards zero.
+
+        A sell for a long, a buy for a short. Every exit, stop and liquidation
+        in the system asks this rather than assuming "sell", because in a book
+        that can be short, "sell" is also how exposure is *added*.
+        """
+        if position == 0:
+            raise ContractViolation("a flat position has no closing side")
+        return cls.SELL if position > 0 else cls.BUY
+
+
+def split_legs(held: float, side: Side, quantity: float) -> tuple[float, float]:
+    """An order against a signed position, as (closing, opening) quantities.
+
+    Buying 150 against a short of 100 closes 100 and opens a 50 long; selling 30
+    of a 100 long closes 30 and opens nothing. Exposure is reduced only by the
+    closing leg, and increased only by the opening one -- which is the
+    distinction every risk rule needs, and which "buy" and "sell" do not make
+    once a book can be short.
+    """
+    if quantity < 0:
+        raise ContractViolation(f"order quantities are unsigned; got {quantity}")
+    delta = side.sign * quantity
+    if held == 0 or (held > 0) == (delta > 0):
+        return 0.0, quantity
+    closing = min(quantity, abs(held))
+    return closing, quantity - closing
+
 
 class OrderType(str, Enum):
     MARKET = "market"
@@ -145,6 +180,43 @@ class BrokerCapabilities:
             )
 
 
+#: Every order this system sends starts with this. Anything without it was
+#: placed by someone else -- by hand in TWS, or by another program.
+ORDER_PREFIX = "ql-"
+#: Between the strategy id and the hash. Not a character an id may contain.
+ORDER_ID_SEPARATOR = "."
+
+#: A strategy tag: lowercase letters, digits and dashes, starting with a letter.
+_TAG_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
+MAX_TAG_LENGTH = 16
+
+
+def strategy_tag(portfolio: PortfolioId) -> str:
+    """The short, readable strategy id carried on every order of this book.
+
+    The book's name *is* the strategy id in live trading (``LiveConfig``
+    enforces the format), so the id travels with each order to the broker and
+    back: in IBKR it appears in the Order Ref column, in executions, and in
+    statements. A book name that is not a valid tag -- research runs use free
+    text -- is reduced to one deterministically.
+    """
+    raw = portfolio.name.lower()
+    cleaned = "".join(c if c in _TAG_CHARS else "-" for c in raw).strip("-")
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    return (cleaned or "book")[:MAX_TAG_LENGTH].rstrip("-")
+
+
+def order_prefix(portfolio: PortfolioId) -> str:
+    """What every order of this book starts with: ``ql-<strategy>.``.
+
+    The dot cannot occur in a strategy id, so no strategy's prefix is the start
+    of another's: ``ql-trend.`` does not match ``ql-trend-fx.…``. With a dash
+    there, strategy ``trend`` would recognise ``trend-fx``'s orders as its own.
+    """
+    return f"{ORDER_PREFIX}{strategy_tag(portfolio)}{ORDER_ID_SEPARATOR}"
+
+
 def client_order_id(
     run: RunId,
     portfolio: PortfolioId,
@@ -159,9 +231,13 @@ def client_order_id(
     decision after a timeout produces the same id and the broker rejects the
     duplicate instead of filling it twice.
 
+    Shaped ``ql-<strategy>.<hash>``: the strategy id is readable, so an order
+    found at the broker says which strategy sent it without looking anything
+    up, and two strategies can never claim each other's fills.
+
     Args:
         run: The run the order belongs to.
-        portfolio: The book being traded.
+        portfolio: The book being traded. Its name is the strategy id.
         instrument: What is being traded.
         decision_time: The decision this order implements.
         side: Buy or sell.
@@ -177,7 +253,19 @@ def client_order_id(
             f"{quantity:.8f}",
         ]
     )
-    return "ql-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+    return order_prefix(portfolio) + hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+
+
+def is_valid_strategy_id(value: str) -> bool:
+    """Whether ``value`` can be used verbatim as a strategy tag."""
+    return (
+        0 < len(value) <= MAX_TAG_LENGTH
+        and value[0].isalpha()
+        and set(value) <= _TAG_CHARS
+        and value == value.lower()
+        and not value.endswith("-")
+        and "--" not in value
+    )
 
 
 @dataclass(frozen=True, slots=True)

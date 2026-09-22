@@ -73,8 +73,14 @@ class DegradationState(str, Enum):
         return {"normal": 0, "reduce_only": 1, "halted": 2}[self.value]
 
     @property
-    def permits_buys(self) -> bool:
+    def permits_entries(self) -> bool:
+        """Whether new exposure may be opened -- a buy for a long, a sale for a short."""
         return self is DegradationState.NORMAL
+
+    @property
+    def permits_buys(self) -> bool:
+        """The long-only name for :attr:`permits_entries`."""
+        return self.permits_entries
 
     @property
     def permits_proposals(self) -> bool:

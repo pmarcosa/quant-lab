@@ -39,6 +39,7 @@ import pandas as pd
 
 from contracts.errors import ContractViolation
 from contracts.identifiers import InstrumentId
+from contracts.temporal import BarInterval
 from data.bitemporal import BitemporalStore
 from data.universe import PointInTimeUniverse, derive_memberships
 
@@ -66,16 +67,39 @@ def load_price_csv(path: Path) -> pd.DataFrame:
     return frame.set_index("timestamp").sort_index()
 
 
-def bar_close(label: datetime, week_ending: bool = False) -> datetime:
+def _resolve(interval: BarInterval | None, week_ending: bool) -> BarInterval:
+    """The bar size, from the explicit interval or the older ``week_ending`` flag."""
+    if interval is not None:
+        return interval
+    return BarInterval.WEEK if week_ending else BarInterval.DAY
+
+
+def bar_close(
+    label: datetime, week_ending: bool = False, interval: BarInterval | None = None
+) -> datetime:
     """When the bar labelled ``label`` actually closed.
 
     Args:
-        label: The vendor's date for the bar.
-        week_ending: The bar is weekly. Its close is the Friday of the label's
-            ISO week, whatever day the vendor labelled it with.
+        label: The vendor's label for the bar.
+        week_ending: Legacy spelling of ``interval=BarInterval.WEEK``.
+        interval: The bar size. Weekly bars close on the Friday of the label's
+            ISO week, whatever day the vendor labelled them with; daily bars at
+            that day's session close; intraday bars, which IBKR labels with
+            their *start*, one bar length after the label. An intraday bar
+            stamped at its start would be visible to a decision it had not
+            finished forming for -- a lookahead of exactly one bar.
     """
+    kind = _resolve(interval, week_ending)
+    if kind.is_intraday:
+        stamp = pd.Timestamp(label)
+        if stamp.tzinfo is None:
+            raise ContractViolation(
+                f"intraday bar label {label!r} has no timezone; intraday data must "
+                f"arrive with explicit UTC timestamps"
+            )
+        return (stamp + kind.duration).to_pydatetime().astimezone(timezone.utc)
     day = pd.Timestamp(label).date()
-    if week_ending:
+    if kind is BarInterval.WEEK:
         day = day + timedelta(days=4 - day.weekday())
     return datetime.combine(day, US_SESSION_CLOSE.replace(tzinfo=None), tzinfo=timezone.utc)
 
@@ -84,18 +108,21 @@ def to_observations(
     bars: pd.DataFrame,
     week_ending: bool = False,
     available_at: datetime | None = None,
+    interval: BarInterval | None = None,
 ) -> pd.DataFrame:
     """Attach event and availability timestamps to session bars.
 
     Args:
         bars: OHLCV indexed by the vendor's bar label.
-        week_ending: Weekly bars: stamp each at the close of its week.
+        week_ending: Legacy spelling of ``interval=BarInterval.WEEK``.
         available_at: When these rows became known, if later than the close plus
             the publication lag. Historical files leave it unset; a live refresh
             passes the moment of the fetch, because that is the truth.
+        interval: The bar size; see :func:`bar_close`.
     """
+    kind = _resolve(interval, week_ending)
     closes = pd.to_datetime(
-        [bar_close(d, week_ending) for d in pd.to_datetime(bars.index)], utc=True
+        [bar_close(d, interval=kind) for d in bars.index], utc=True
     )
     available = closes + PUBLICATION_LAG
     if available_at is not None:
@@ -138,7 +165,10 @@ def merge_split_weeks(bars: pd.DataFrame) -> pd.DataFrame:
 
 
 def complete_bars(
-    bars: pd.DataFrame, now: datetime, week_ending: bool = False
+    bars: pd.DataFrame,
+    now: datetime,
+    week_ending: bool = False,
+    interval: BarInterval | None = None,
 ) -> pd.DataFrame:
     """Only the bars whose session had closed, and been published, by ``now``.
 
@@ -148,7 +178,8 @@ def complete_bars(
     """
     if bars.empty:
         return bars
-    closes = [bar_close(d, week_ending) + PUBLICATION_LAG for d in pd.to_datetime(bars.index)]
+    kind = _resolve(interval, week_ending)
+    closes = [bar_close(d, interval=kind) + PUBLICATION_LAG for d in bars.index]
     keep = [close <= now for close in closes]
     return bars.loc[keep]
 
@@ -159,24 +190,26 @@ def ingest_directory(
     week_ending: bool = False,
     symbols: Sequence[str] | None = None,
     now: datetime | None = None,
+    interval: BarInterval | None = None,
 ) -> dict[str, int]:
     """Load every price CSV in a directory into the store.
 
     Args:
         source: Directory of ``<SYMBOL>.csv`` files.
         store: Destination.
-        week_ending: The files hold weekly bars; stamp each at its week's close.
+        week_ending: Legacy spelling of ``interval=BarInterval.WEEK``.
         symbols: Restrict to these symbols; all of them when omitted.
         now: Bars not yet closed and published by this moment are left out —
             a partial bar's high, low and close are not final, and a partial bar
             is a live-versus-backtest discrepancy waiting to happen.
+        interval: The bar size of the files.
 
     Returns:
         Symbol to number of observations written.
     """
     if not source.is_dir():
         raise ContractViolation(f"no such directory: {source}")
-
+    kind = _resolve(interval, week_ending)
     written: dict[str, int] = {}
     wanted = set(symbols) if symbols else None
     for path in sorted(source.glob("*.csv")):
@@ -184,13 +217,13 @@ def ingest_directory(
         if wanted is not None and symbol not in wanted:
             continue
         bars = load_price_csv(path)
-        if week_ending:
+        if kind is BarInterval.WEEK:
             bars = merge_split_weeks(bars)
-        bars = complete_bars(bars, now or datetime.now(timezone.utc), week_ending)
+        bars = complete_bars(bars, now or datetime.now(timezone.utc), interval=kind)
         if bars.empty:
             continue
         written[symbol] = store.append(
-            InstrumentId(symbol), to_observations(bars, week_ending=week_ending)
+            InstrumentId(symbol), to_observations(bars, interval=kind)
         )
     return written
 

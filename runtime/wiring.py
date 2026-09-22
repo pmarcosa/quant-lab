@@ -28,9 +28,22 @@ _FAR_FUTURE = datetime(2100, 1, 1, tzinfo=timezone.utc)
 
 
 
+def _period_keys(index: pd.DatetimeIndex, interval: BarInterval) -> list[tuple]:
+    """One comparable key per bar, so instruments line up period by period."""
+    if interval is BarInterval.WEEK:
+        iso = index.isocalendar()
+        return list(zip(iso.year.tolist(), iso.week.tolist(), strict=True))
+    if interval is BarInterval.DAY:
+        return [(d.year, d.timetuple().tm_yday) for d in index.date]
+    return [(t.value, 0) for t in index]
+
+
 @dataclass(frozen=True, slots=True)
 class MarketWindow:
-    """Prices by week, the decision schedule, and which prices are actually fresh.
+    """Prices by period, the decision schedule, and which prices are actually fresh.
+
+    A period is one bar of the dataset's interval: an ISO week for weekly bars,
+    a session date for daily bars, and the bar's own close time intraday.
 
     Instruments do not share a calendar. IBKR stamps a weekly bar on the first
     trading day of the week, so a holiday shifts one instrument's stamp and not
@@ -57,6 +70,8 @@ class MarketWindow:
     fresh: pd.DataFrame
     index: tuple[datetime, ...]
     schedule: tuple[datetime, ...]
+    highs: pd.DataFrame | None = None
+    interval: BarInterval = BarInterval.WEEK
 
     @classmethod
     def from_store(
@@ -65,39 +80,46 @@ class MarketWindow:
         universe: PointInTimeUniverse,
         horizon: datetime,
         start: datetime | None = None,
+        interval: BarInterval = BarInterval.WEEK,
     ) -> MarketWindow:
-        """Load every member's bars once and align them by ISO week.
+        """Load every member's bars once and align them by period.
 
         Args:
             store: Where the bars live.
             universe: Which instruments to load.
             horizon: The as-of time to read the store at.
             start: Earliest decision moment to schedule, if not the beginning.
+            interval: The bar size, which decides what "the same period" means
+                across instruments. Aligning daily bars by ISO week -- what
+                this did before intervals were threaded through -- silently
+                turned a daily backtest into a weekly one.
         """
         horizon = utc(horizon)
         opens: dict[str, pd.Series] = {}
         closes: dict[str, pd.Series] = {}
         lows: dict[str, pd.Series] = {}
-        stamps: dict[tuple[int, int], list[pd.Timestamp]] = {}
+        highs: dict[str, pd.Series] = {}
+        stamps: dict[tuple, list[pd.Timestamp]] = {}
 
         for instrument in universe.survivors_only():
-            known = store.as_of(instrument, horizon, fields=["open", "low", "close"])
+            known = store.as_of(instrument, horizon, fields=["open", "high", "low", "close"])
             if known.empty:
                 continue
             # When each bar first became knowable. The decision for a week is
             # scheduled after the last of these, so a bar fetched on a Saturday
             # is decided on after the fetch, not at a time it did not yet exist.
             first = store.first_known(instrument, horizon).reindex(known.index)
-            iso = known.index.isocalendar()
-            weeks = pd.MultiIndex.from_arrays([iso.year, iso.week])
-            # Two bars in one week happens where a session was split. The later
-            # one carries the week's close, so it wins.
-            frame = known.assign(_week=weeks)
-            frame = frame[~frame["_week"].duplicated(keep="last")]
-            index = pd.MultiIndex.from_tuples(list(frame["_week"]), names=("year", "week"))
+            periods = _period_keys(known.index, interval)
+            # Two bars in one period happens where a session was split. The later
+            # one carries the period's close, so it wins.
+            frame = known.assign(_period=periods)
+            frame = frame[~frame["_period"].duplicated(keep="last")]
+            index = pd.MultiIndex.from_tuples(list(frame["_period"]), names=("a", "b"))
             opens[str(instrument)] = pd.Series(frame["open"].astype(float).values, index=index)
             lows[str(instrument)] = pd.Series(frame["low"].astype(float).values, index=index)
             closes[str(instrument)] = pd.Series(frame["close"].astype(float).values, index=index)
+            if "high" in frame.columns:
+                highs[str(instrument)] = pd.Series(frame["high"].astype(float).values, index=index)
             for week, event in zip(index, frame.index, strict=True):
                 stamps.setdefault(week, []).append(first.loc[event])
 
@@ -107,6 +129,7 @@ class MarketWindow:
         close_frame = pd.DataFrame(closes).sort_index()
         open_frame = pd.DataFrame(opens).reindex(close_frame.index)
         low_frame = pd.DataFrame(lows).reindex(close_frame.index)
+        high_frame = pd.DataFrame(highs).reindex(close_frame.index) if highs else None
         fresh = close_frame.notna() & (close_frame > 0)
 
         # One decision moment per week, at the last close that week plus the
@@ -131,6 +154,8 @@ class MarketWindow:
             fresh=fresh,
             index=index,
             schedule=schedule,
+            highs=high_frame,
+            interval=interval,
         )
 
     def _position(self, moment: datetime) -> int:
@@ -138,7 +163,9 @@ class MarketWindow:
         try:
             return self.index.index(utc(moment))
         except ValueError as error:
-            raise ContractViolation(f"no week at {utc(moment).isoformat()}") from error
+            raise ContractViolation(
+                f"no {self.interval.noun} at {utc(moment).isoformat()}"
+            ) from error
 
     def marks_at(self, moment: datetime) -> Mapping[InstrumentId, float]:
         """Closing prices for valuation and sizing, carried forward if stale.
@@ -167,6 +194,17 @@ class MarketWindow:
         without them.
         """
         row = self.lows.iloc[self._position(moment)]
+        return {
+            InstrumentId(name): float(value)
+            for name, value in row.items()
+            if pd.notna(value) and value > 0
+        }
+
+    def highs_at(self, moment: datetime) -> Mapping[InstrumentId, float]:
+        """The bar's highs: what a resting *buy* stop -- a short's -- is triggered against."""
+        if self.highs is None:
+            return {}
+        row = self.highs.iloc[self._position(moment)]
         return {
             InstrumentId(name): float(value)
             for name, value in row.items()
@@ -229,7 +267,7 @@ def load_market(
         start: Earliest decision moment.
         min_bars: Default history an instrument needs to count as available.
     """
-    frequency = "weekly" if interval is BarInterval.WEEK else "daily"
+    frequency = interval.frequency
     dataset = f"bars_{interval.value.lower()}"
     store = BitemporalStore(root, dataset)
     universe = PointInTimeUniverse.from_csv(root / f"universe_{frequency}.csv")
@@ -254,6 +292,6 @@ def load_market(
         store=store,
         universe=universe,
         filtrations=ReplayFiltrations(store, universe, horizon, min_bars=min_bars),
-        window=MarketWindow.from_store(store, universe, horizon, start=start),
+        window=MarketWindow.from_store(store, universe, horizon, start=start, interval=interval),
         interval=interval,
     )

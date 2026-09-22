@@ -74,7 +74,7 @@ def test_a_collapsing_strategy_lands_in_the_tail_within_months(reference):
 def test_the_horizon_matches_the_live_record_not_a_fixed_year(reference):
     """A ten-week loss judged against one-year drawdowns would look mild."""
     live = np.random.default_rng(4).normal(-0.01, SD, 10)
-    assert drawdown_check(reference, live, paths=500).weeks == 10
+    assert drawdown_check(reference, live, paths=500).periods == 10
 
 
 # -- changepoints ------------------------------------------------------------
@@ -114,7 +114,7 @@ def test_the_trend_is_not_judged_early():
 
 def test_a_steady_decline_is_significantly_negative_once_judged():
     live = np.random.default_rng(9).normal(-0.01, 0.01, 30)
-    assert trend_check(live, min_weeks=26).significantly_negative
+    assert trend_check(live, min_bars=26).significantly_negative
 
 
 def test_a_healthy_trend_is_not_negative():
@@ -126,7 +126,7 @@ def test_a_healthy_trend_is_not_negative():
     """
     rng = np.random.default_rng(10)
     flagged = [
-        trend_check(rng.normal(MEAN, SD, 40), min_weeks=26).significantly_negative
+        trend_check(rng.normal(MEAN, SD, 40), min_bars=26).significantly_negative
         for _ in range(60)
     ]
     assert np.mean(flagged) <= 0.05

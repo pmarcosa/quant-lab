@@ -12,6 +12,7 @@ which settings it was built with so a mismatch is refused rather than used.
 from __future__ import annotations
 
 import json
+import math
 import statistics
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -23,14 +24,19 @@ import numpy as np
 from contracts.errors import ContractViolation
 from contracts.identifiers import RunId
 from contracts.live import DegradationState, EventKind
-from contracts.temporal import BarInterval
 from engine.decide import SizingPolicy
 from execution.simulated import CostModel
-from risk.rules import GrossExposureLimit, ProtectiveStop, RiskSupervisor
+from risk.rules import (
+    GrossExposureLimit,
+    NetExposureLimit,
+    ProtectiveStop,
+    RiskSupervisor,
+    ShortSales,
+)
 from runtime.live import LiveSession
-from runtime.research import precompute_indicators, run_once
-from runtime.wiring import Market, load_market
-from strategies.momentum import MomentumParams, WeeklyMomentum
+from runtime.research import run_once
+from runtime.strategies import build_strategy
+from runtime.wiring import Market
 from validation.monitoring import (
     Assessment,
     ExecutionRecord,
@@ -39,20 +45,27 @@ from validation.monitoring import (
     assess,
 )
 
-BASELINE_FORMAT = 1
+BASELINE_FORMAT = 2
 
 
 @dataclass(frozen=True, slots=True)
 class Baseline:
-    """The backtest that live results are measured against."""
+    """The backtest that live results are measured against.
+
+    ``returns`` are per bar of the strategy's own interval, from the first bar
+    the backtest held anything: the warm-up before a strategy can decide is
+    cash, and a run of zero returns in the reference would make every live
+    drawdown look unusual.
+    """
 
     strategy_version: str
     settings: dict[str, Any]
-    weekly_returns: list[float]
+    interval: str
+    returns: list[float]
     modeled_bps: float
     expected_rotation_return: float
-    first_week: str
-    last_week: str
+    first_bar: str
+    last_bar: str
     built_at: str
 
     def save(self, path) -> None:
@@ -72,37 +85,68 @@ class Baseline:
 
 
 def baseline_path(session: LiveSession):
-    return session.config.state_dir / "live" / f"{session.config.mode.value}-baseline.json"
+    return session.config.baseline_path
 
 
 def _settings(session: LiveSession) -> dict[str, Any]:
+    """Everything that changes what the baseline backtest would produce."""
     c = session.config
     return {
-        "rebalance_weeks": c.strategy.rebalance_weeks, "top_n": c.strategy.top_n,
-        "lookback_weeks": c.strategy.lookback_weeks, "stop_distance": c.risk.stop_distance,
+        "strategy": c.strategy.name,
+        "params": dict(sorted(c.strategy.params.items())),
+        "interval": session.interval.value,
+        "stop_distance": c.risk.stop_distance,
         "max_gross": c.risk.max_gross,
+        "max_net": c.risk.max_net,
+        "min_net": c.risk.min_net,
+        "allow_short": c.risk.allow_short,
     }
+
+
+def _strategy_for_backtest(session: LiveSession, market: Market):
+    if session.strategy_factory is not None:
+        return session.strategy_factory(session.config)
+    s = session.config.strategy
+    return build_strategy(s.name, s.params, market)
 
 
 def build_baseline(session: LiveSession, now: datetime) -> Baseline:
     """Backtest the configured strategy over the store and keep what monitoring needs."""
     c = session.config
-    market = load_market(session.store_root, interval=BarInterval.WEEK)
-    params = MomentumParams(
-        rebalance_weeks=c.strategy.rebalance_weeks, top_n=c.strategy.top_n,
-        lookback_weeks=c.strategy.lookback_weeks,
-    )
-    strategy = WeeklyMomentum(params, precomputed=precompute_indicators(market, params))
+    market = session.market()
+    strategy = _strategy_for_backtest(session, market)
     stop = ProtectiveStop(c.risk.stop_distance) if c.risk.stop_distance > 0 else None
-    supervisor = RiskSupervisor(rules=(GrossExposureLimit(c.risk.max_gross),), stop=stop)
-    schedule = list(market.schedule)[params.warmup_weeks + params.min_history_weeks:]
-    result = run_once(
-        market, strategy, schedule, RunId("baseline"),
-        CostModel(commission_bps=10.0, slippage_bps=10.0),
-        SizingPolicy(cash_buffer=0.01, min_trade_fraction=0.005), supervisor=supervisor,
+    supervisor = RiskSupervisor(
+        rules=(
+            ShortSales(allowed=c.risk.allow_short),
+            GrossExposureLimit(c.risk.max_gross),
+            NetExposureLimit(c.risk.min_net, c.risk.max_net),
+        ),
+        stop=stop,
     )
-    equity = np.array([e for _, e in result.equity_curve()], dtype=float)
+    result = run_once(
+        market, strategy, list(market.schedule), RunId("baseline"),
+        CostModel(commission_bps=10.0, slippage_bps=10.0),
+        SizingPolicy(
+            cash_buffer=0.01, min_trade_fraction=0.005, allow_short=c.risk.allow_short,
+            time_in_force=c.execution.resolve(market.interval),
+        ),
+        supervisor=supervisor,
+    )
+    curve = result.equity_curve()
+    equity = np.array([e for _, e in curve], dtype=float)
     returns = equity[1:] / equity[:-1] - 1.0
+
+    # Trading steps: where orders other than stops filled. The reference starts
+    # at the first, and rotations are measured between them.
+    trading = [
+        k for k, step in enumerate(result.steps)
+        if any(not f.client_order_id.endswith("-stop") for f in step.fills)
+    ]
+    if not trading:
+        raise ContractViolation("the baseline backtest never traded; nothing to compare with")
+    first = trading[0]
+    returns = returns[first:]
 
     # What the backtest paid to execute, against the decision price: the number
     # live shortfall is compared with.
@@ -118,19 +162,24 @@ def build_baseline(session: LiveSession, now: datetime) -> Baseline:
             notional += fill.quantity * mark
     modeled = 10_000.0 * costs / notional if notional else 20.0
 
-    k = c.strategy.rebalance_weeks
+    # Expected return of one rotation: compounded returns between consecutive
+    # trading steps. Strategy-agnostic -- it reads when the strategy traded,
+    # not what its parameters say about when it should.
     per_rotation = [
-        float(np.prod(1.0 + returns[i : i + k]) - 1.0) for i in range(0, len(returns) - k + 1, k)
+        float(np.prod(1.0 + (equity[b:e + 1][1:] / equity[b:e + 1][:-1])) - 1.0)
+        for b, e in zip(trading, trading[1:], strict=False)
+        if e > b
     ]
-    moments = [m for m, _ in result.equity_curve()]
+    moments = [m for m, _ in curve]
     return Baseline(
         strategy_version=str(strategy.version),
         settings=_settings(session),
-        weekly_returns=[float(r) for r in returns],
+        interval=market.interval.value,
+        returns=[float(r) for r in returns],
         modeled_bps=float(modeled),
         expected_rotation_return=float(np.mean(per_rotation)) if per_rotation else 0.0,
-        first_week=moments[0].date().isoformat(),
-        last_week=moments[-1].date().isoformat(),
+        first_bar=moments[first].date().isoformat(),
+        last_bar=moments[-1].date().isoformat(),
         built_at=now.isoformat(),
     )
 
@@ -139,37 +188,39 @@ def load_baseline(session: LiveSession) -> Baseline:
     baseline = Baseline.load(baseline_path(session))
     if baseline.settings != _settings(session):
         raise ContractViolation(
-            "the monitoring baseline was built with different strategy or risk settings "
-            f"({baseline.settings}); rebuild it with `ql monitor baseline`"
+            "the baseline was built for other strategy or risk settings; rebuild it with "
+            "`ql monitor baseline`"
         )
     return baseline
 
 
-# -- reading the journal -----------------------------------------------------
+def live_returns(session: LiveSession) -> tuple[list[str], list[float], list[float]]:
+    """Sleeve returns per bar, from snapshots: the last snapshot of each data bar.
 
-
-def live_weekly_returns(session: LiveSession) -> tuple[list[str], list[float], list[float]]:
-    """Weekly sleeve returns from snapshots: the last snapshot of each data week.
-
-    External cash — an adjustment's ``cash_delta`` — is removed from the week it
+    External cash -- an adjustment's ``cash_delta`` -- is removed from the bar it
     arrived in, so a correction is not reported as performance.
     """
-    by_week: dict[str, tuple[datetime, float]] = {}
+    by_bar: dict[str, tuple[datetime, float]] = {}
     for event in session.journal.events(EventKind.SNAPSHOT):
-        week = datetime.fromisoformat(event.payload["marks_as_of"]).date().isoformat()
-        by_week[week] = (event.at, float(event.payload["sleeve_equity"]))
-    weeks = sorted(by_week)
+        label = datetime.fromisoformat(event.payload["marks_as_of"])
+        key = label.date().isoformat() if not session.interval.is_intraday else label.isoformat()
+        by_bar[key] = (event.at, float(event.payload["sleeve_equity"]))
+    labels = sorted(by_bar)
     flows = [
         (e.at, float(e.payload.get("cash_delta", 0.0)))
         for e in session.journal.events(EventKind.ADJUSTMENT)
     ]
-    equity = [by_week[w][1] for w in weeks]
+    equity = [by_bar[k][1] for k in labels]
     returns = []
-    for i in range(1, len(weeks)):
-        start, end = by_week[weeks[i - 1]][0], by_week[weeks[i]][0]
+    for i in range(1, len(labels)):
+        start, end = by_bar[labels[i - 1]][0], by_bar[labels[i]][0]
         flow = sum(amount for at, amount in flows if start < at <= end)
         returns.append((equity[i] - flow) / equity[i - 1] - 1.0 if equity[i - 1] > 0 else 0.0)
-    return weeks, equity, returns
+    return labels, equity, returns
+
+
+#: The weekly name, kept for callers written before intervals were general.
+live_weekly_returns = live_returns
 
 
 def execution_records(session: LiveSession, market: Market) -> list[ExecutionRecord]:
@@ -195,12 +246,14 @@ def execution_records(session: LiveSession, market: Market) -> list[ExecutionRec
             continue
         later = [m for m in schedule if m > decision]
         reference_open = after_1w = after_4w = None
+        # Markouts one and four calendar weeks on, in bars of this interval.
+        one = max(int(round(market.interval.bars_per_week)), 1)
         if later:
             reference_open = market.window.opens_at(later[0]).get(_id(p["instrument"]))
-        if len(later) >= 1:
-            after_1w = market.window.marks_at(later[0]).get(_id(p["instrument"]))
-        if len(later) >= 4:
-            after_4w = market.window.marks_at(later[3]).get(_id(p["instrument"]))
+        if len(later) >= one:
+            after_1w = market.window.marks_at(later[one - 1]).get(_id(p["instrument"]))
+        if len(later) >= 4 * one:
+            after_4w = market.window.marks_at(later[4 * one - 1]).get(_id(p["instrument"]))
         records.append(ExecutionRecord(
             rotation=rotation, instrument=p["instrument"], side=p["side"],
             quantity=float(p["quantity"]), decision_price=float(mark),
@@ -216,6 +269,21 @@ def _id(ticker: str):
     return InstrumentId(ticker)
 
 
+def _kind(row: dict[str, Any]) -> str:
+    """Whether a proposed order was an entry (new exposure) or an exit.
+
+    Read from the order's reason, which describes exposure; the side does not
+    (covering a short is a buy and an exit). Orders journaled before reasons
+    were recorded fall back to the long-only reading.
+    """
+    reason = row.get("reason") or ""
+    if reason in ("open", "increase"):
+        return "entry"
+    if reason:
+        return "exit"
+    return "entry" if row["side"] == "buy" else "exit"
+
+
 def process_metrics(session: LiveSession, market: Market, now: datetime) -> ProcessMetrics:
     """How proposals, approvals and fills have lined up so far."""
     journal = session.journal
@@ -224,15 +292,15 @@ def process_metrics(session: LiveSession, market: Market, now: datetime) -> Proc
     rejections = {e.payload["proposal_id"]: e for e in journal.events(EventKind.REJECTION)}
     filled = {e.payload["client_order_id"] for e in journal.events(EventKind.FILL)}
 
-    # One proposal per decision week counts: the last one made for it.
-    final_by_week: dict[str, Any] = {}
+    # One proposal per decision bar counts: the last one made for it.
+    final_by_bar: dict[str, Any] = {}
     for event in proposals:
-        final_by_week[event.payload["decision_time"]] = event
+        final_by_bar[event.payload["decision_time"]] = event
     expired = 0
-    proposed = {"buy": 0, "sell": 0}
-    executed = {"buy": 0, "sell": 0}
+    proposed = {"entry": 0, "exit": 0}
+    executed = {"entry": 0, "exit": 0}
     latencies = []
-    for event in final_by_week.values():
+    for event in final_by_bar.values():
         pid = event.payload["proposal_id"]
         if pid not in approvals and pid not in rejections:
             if now >= datetime.fromisoformat(event.payload["expires_at"]):
@@ -240,9 +308,10 @@ def process_metrics(session: LiveSession, market: Market, now: datetime) -> Proc
             else:
                 continue  # still open: not yet a decision either way
         for row in event.payload["intents"]:
-            proposed[row["side"]] += 1
+            kind = _kind(row)
+            proposed[kind] += 1
             if row["client_order_id"] in filled:
-                executed[row["side"]] += 1
+                executed[kind] += 1
         if pid in approvals:
             latencies.append((approvals[pid].at - event.at).total_seconds() / 3600)
 
@@ -275,12 +344,12 @@ def process_metrics(session: LiveSession, market: Market, now: datetime) -> Proc
         )
         coverage = 1.0 - unprotected / len(book.positions) if book.positions else 1.0
 
-    def ratio(side: str) -> float | None:
-        return executed[side] / proposed[side] if proposed[side] else None
+    def ratio(kind: str) -> float | None:
+        return executed[kind] / proposed[kind] if proposed[kind] else None
 
     return ProcessMetrics(
         proposals=len(proposals), approved=len(approvals), rejected=len(rejections),
-        expired=expired, buy_compliance=ratio("buy"), sell_compliance=ratio("sell"),
+        expired=expired, entry_compliance=ratio("entry"), exit_compliance=ratio("exit"),
         median_latency_hours=statistics.median(latencies) if latencies else None,
         override_cost=override_cost, stop_coverage=coverage,
     )
@@ -288,19 +357,27 @@ def process_metrics(session: LiveSession, market: Market, now: datetime) -> Proc
 
 @dataclass(frozen=True, slots=True)
 class Health:
-    data_age_days: float | None
+    data_age_hours: float | None
     last_sync_hours: float | None
     last_reconciliation: str | None
     pending_proposal: str | None
     open_findings: tuple[str, ...]
+    data_age_limit_hours: float = 240.0
+    sync_limit_hours: float = 240.0
+
+    @property
+    def data_age_days(self) -> float | None:
+        return None if self.data_age_hours is None else self.data_age_hours / 24
 
     @property
     def problems(self) -> tuple[str, ...]:
         found = []
-        if self.data_age_days is None or self.data_age_days > 10:
+        if self.data_age_hours is None or self.data_age_hours > self.data_age_limit_hours:
             found.append("price data is stale; run `ql data refresh`")
-        if self.last_sync_hours is None or self.last_sync_hours > 24 * 8:
-            found.append("no sync for over a week; run `ql live sync`")
+        if self.last_sync_hours is None or self.last_sync_hours > self.sync_limit_hours:
+            found.append(
+                f"no sync for over {self.sync_limit_hours / 24:.0f} days; run `ql live sync`"
+            )
         if self.last_reconciliation == "mismatch":
             found.append("reconciliation mismatch outstanding")
         return tuple(found)
@@ -311,12 +388,17 @@ def health(session: LiveSession, market: Market, now: datetime) -> Health:
     snapshot = journal.last(EventKind.SNAPSHOT)
     reconciliation = journal.last(EventKind.RECONCILIATION)
     pending = session.pending_proposal()
+    interval = market.interval
     return Health(
-        data_age_days=(now - market.schedule[-1]).total_seconds() / 86400 if market.schedule else None,
+        data_age_hours=(now - market.schedule[-1]).total_seconds() / 3600 if market.schedule else None,
         last_sync_hours=(now - snapshot.at).total_seconds() / 3600 if snapshot else None,
         last_reconciliation=reconciliation.payload["status"] if reconciliation else None,
         pending_proposal=pending.payload["proposal_id"] if pending else None,
         open_findings=tuple(reconciliation.payload["findings"]) if reconciliation else (),
+        data_age_limit_hours=session.config.monitoring.data_age_hours(interval),
+        # One bar plus three days: a weekly strategy synced every Saturday, a
+        # daily one every session, both allowed a long weekend.
+        sync_limit_hours=interval.duration.total_seconds() / 3600 + 72,
     )
 
 
@@ -332,19 +414,38 @@ class MonitorReport:
     assessment: Assessment
     process: ProcessMetrics
     health: Health
-    weeks: tuple[str, ...]
+    periods: tuple[str, ...]
     equity: tuple[float, ...]
     returns: tuple[float, ...]
     baseline: Baseline
     benchmark: tuple[float, ...] = ()
+    strategy_id: str = ""
+    interval: str = "1Week"
+
+    @property
+    def weeks(self) -> tuple[str, ...]:
+        """The older name for :attr:`periods`."""
+        return self.periods
+
+
+def bars(weeks: float, interval) -> float:
+    """A calendar duration in weeks, as a number of bars of ``interval``."""
+    return float(weeks) * interval.bars_per_week
 
 
 def run_monitor(session: LiveSession, apply: bool = True, benchmark: str = "SPY") -> MonitorReport:
-    """Every check, the resulting state, and everything a report needs."""
+    """Every check, the resulting state, and everything a report needs.
+
+    The monitoring settings are calendar durations; they are converted into
+    bars of the strategy's interval here, following the expert's rule that the
+    market's memory and the expected time between regimes are fixed in
+    calendar time, not in observations.
+    """
     now = session.clock()
     baseline = load_baseline(session)
     market = session.market()
-    weeks, equity, returns = live_weekly_returns(session)
+    interval = market.interval
+    labels, equity, returns = live_returns(session)
     records = execution_records(session, market)
     m = session.config.monitoring
     thresholds = Thresholds(
@@ -357,38 +458,43 @@ def run_monitor(session: LiveSession, apply: bool = True, benchmark: str = "SPY"
     )
     sleeve_equity = equity[-1] if equity else session.config.sleeve_capital
     assessment = assess(
-        baseline.weekly_returns, returns, records,
+        baseline.returns, returns, records,
         modeled_bps=baseline.modeled_bps,
         expected_rotation_return=baseline.expected_rotation_return,
         sleeve_equity=sleeve_equity, thresholds=thresholds,
-        paths=m.bootstrap_paths, block=m.bootstrap_block_weeks,
-        hazard_weeks=m.changepoint_hazard_weeks, trend_min_weeks=m.trend_min_weeks,
+        paths=m.bootstrap_paths,
+        block=max(bars(m.bootstrap_block_weeks, interval), 1.0),
+        hazard_bars=max(bars(m.changepoint_hazard_weeks, interval), 2.0),
+        trend_min_bars=max(int(math.ceil(bars(m.trend_min_weeks, interval))), 3),
+        horizon=max(int(round(bars(m.horizon_weeks, interval))), 1),
+        unit=interval.noun,
     )
     before = session.state()
     after = (
         session.apply_assessment(assessment.recommended, assessment.reasons)
         if apply and session.journal.is_open else before
     )
-    bench = _benchmark_returns(market, weeks, benchmark)
+    bench = _benchmark_returns(market, labels, benchmark)
     return MonitorReport(
         generated_at=now, mode=session.config.mode.value,
         state_before=before, state_after=after, assessment=assessment,
         process=process_metrics(session, market, now), health=health(session, market, now),
-        weeks=tuple(weeks), equity=tuple(equity), returns=tuple(returns),
+        periods=tuple(labels), equity=tuple(equity), returns=tuple(returns),
         baseline=baseline, benchmark=bench,
+        strategy_id=session.config.strategy_id, interval=interval.value,
     )
 
 
-def _benchmark_returns(market: Market, weeks: Sequence[str], ticker: str) -> tuple[float, ...]:
-    """The benchmark's weekly returns over the same weeks, where the data has it."""
-    index = {m.date().isoformat(): m for m in market.schedule}
+def _benchmark_returns(market: Market, labels: Sequence[str], ticker: str) -> tuple[float, ...]:
+    """The benchmark's returns over the same bars, where the data has it."""
+    intraday = market.interval.is_intraday
+    index = {(m.isoformat() if intraday else m.date().isoformat()): m for m in market.schedule}
     closes = []
-    for week in weeks:
-        moment = index.get(week)
+    for label in labels:
+        moment = index.get(label)
         price = market.window.marks_at(moment).get(_id(ticker)) if moment else None
         closes.append(price)
     out = []
     for a, b in zip(closes, closes[1:], strict=False):
         out.append(b / a - 1.0 if a and b else 0.0)
     return tuple(out)
-

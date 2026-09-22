@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from contracts.temporal import BarInterval  # noqa: E402
 from data.bitemporal import BitemporalStore  # noqa: E402
 from data.ingest import ingest_directory, universe_from_store  # noqa: E402
+from data.vendor import FREQUENCIES  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / "data" / "ibkr_cache"
@@ -28,7 +29,10 @@ STORE = ROOT / "var" / "store"
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--freq", choices=("weekly", "daily", "both"), default="both")
+    parser.add_argument(
+        "--freq", choices=("weekly", "daily", "hourly", "minute", "both", "all"), default="all",
+        help="Which cache folders to ingest. 'all' (default): every one that exists.",
+    )
     parser.add_argument(
         "--still-trading-after",
         default="2026-06-01",
@@ -48,10 +52,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"removed {STORE.relative_to(ROOT)}")
 
     cutoff = datetime.fromisoformat(args.still_trading_after).replace(tzinfo=timezone.utc)
-    frequencies = ("weekly", "daily") if args.freq == "both" else (args.freq,)
+    if args.freq == "all":
+        frequencies = tuple(f for f in FREQUENCIES if (CACHE / f).is_dir())
+    elif args.freq == "both":
+        frequencies = ("weekly", "daily")
+    else:
+        frequencies = (args.freq,)
 
     for frequency in frequencies:
-        interval = BarInterval.WEEK if frequency == "weekly" else BarInterval.DAY
+        interval = BarInterval.parse(frequency)
         dataset = f"bars_{interval.value.lower()}"
         store = BitemporalStore(STORE, dataset)
         if store.path.exists():
@@ -61,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         # Weekly bars are stamped at their week's close; any bar whose session
         # has not closed yet is left out rather than stored half-finished.
         written = ingest_directory(
-            CACHE / frequency, store, week_ending=(frequency == "weekly")
+            CACHE / frequency, store, interval=interval
         )
         print(f"{dataset}: {len(written)} instruments, {sum(written.values()):,} observations")
 

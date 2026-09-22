@@ -266,9 +266,12 @@ def decide(
             )
         )
 
-    # Sells first so their proceeds fund the buys; within a side, by instrument,
-    # so the sequence is deterministic and two runs are comparable line by line.
-    intents.sort(key=lambda o: (o.side is Side.BUY, str(o.instrument)))
+    # Exits before entries, so the cash and margin they release is there for
+    # what they fund; then sells before buys, by instrument, so the sequence is
+    # deterministic and two runs are comparable line by line. For a long-only
+    # book this is the old "sells first" rule; with shorts, covering a short (a
+    # buy) is an exit and goes early, and opening one (a sell) is an entry.
+    intents.sort(key=lambda o: (o.reason in ("open", "increase"), o.side is Side.BUY, str(o.instrument)))
 
     return Decision(
         run=run,
@@ -289,8 +292,17 @@ def _usable(price: float) -> bool:
 
 
 def _reason(held: float, desired: float) -> str:
+    """What an order does to exposure, on either side of zero.
+
+    ``open``, ``increase``, ``reduce``, ``close`` and ``reverse``. Monitoring
+    counts entries (open, increase) against exits (reduce, close, reverse), so
+    this must describe exposure, not direction: covering a short is a buy and
+    an exit.
+    """
     if held == 0.0:
         return "open"
     if desired == 0.0:
         return "close"
-    return "increase" if desired > held else "reduce"
+    if (desired > 0) != (held > 0):
+        return "reverse"
+    return "increase" if abs(desired) > abs(held) else "reduce"

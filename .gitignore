@@ -9,3 +9,4 @@ var/
 reports/out/
 state/
 configs/live.yaml
+configs/strategies/

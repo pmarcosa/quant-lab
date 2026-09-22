@@ -88,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         execution_at=market.window.opens_at,
         tradable_at=market.window.fresh_at,
         lows_at=market.window.lows_at,
+        highs_at=market.window.highs_at,
         supervisor=supervisor,
         broker=broker,
         policy=SizingPolicy(

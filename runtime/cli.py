@@ -1,7 +1,8 @@
 """``ql`` — one command for everything a person does with the system.
 
-    ql data status                      what is cached, what is stored, how old
-    ql data refresh                     fetch the latest weekly bars (needs the gateway)
+    ql strategies                       every configured strategy, its account and sleeve
+    ql data status [--interval day]     what is cached, what is stored, how old
+    ql data refresh                     fetch the latest complete bars (needs the gateway)
     ql data fetch --symbols A,B         add instruments to the universe (needs the gateway)
     ql data import A=a.json             add instruments without the gateway
     ql data ingest --rebuild            rebuild the store from the cache
@@ -11,9 +12,17 @@
     ql monitor baseline|run             build the reference, then judge live results
     ql report render FILE.json          re-render a saved report
 
-Every command that touches the broker connects with ``configs/live.yaml`` and
+Each deployed strategy has its own config, ``configs/strategies/<id>.yaml``, and
+its own IBKR account. With one strategy configured every command uses it; with
+several, say which: ``ql --strategy <id> live sync``. The id is written on every
+order the strategy sends (IBKR's Order Ref, ``ql-<id>.<hash>``).
+
+Every command that touches the broker connects with that strategy's config and
 disconnects when it is done. Nothing is ever sent without ``ql live approve``,
 which asks you to type the proposal's confirmation phrase.
+
+Data commands work on the strategy's bar size (weekly, daily, hourly, minute);
+``--interval`` overrides it.
 
 Run ``ql <command> --help`` for the options of each.
 """
@@ -32,7 +41,15 @@ from typing import Any
 
 from contracts.errors import ContractViolation, QuantLabError
 from contracts.live import DegradationState, EventKind
-from runtime.config import DEFAULT_CONFIG, ROOT, LiveConfig, load_config
+from runtime.config import (
+    CONFIGS,
+    ROOT,
+    LiveConfig,
+    check_accounts,
+    config_paths,
+    interval_of,
+    load_config,
+)
 
 STORE = ROOT / "var" / "store"
 CACHE = ROOT / "data" / "ibkr_cache"
@@ -45,21 +62,72 @@ def now_utc() -> datetime:
 
 @dataclass
 class Context:
-    """What every command needs. Tests replace the broker factory and the clock."""
+    """What every command needs. Tests replace the broker factory and the clock.
 
-    config_path: Path = DEFAULT_CONFIG
+    Which strategy a command acts on: ``--config PATH``, else ``--strategy NAME``
+    (``configs/strategies/<NAME>.yaml``; normally the file is named after its
+    ``strategy_id``, and a paper twin of a live strategy is a second file with
+    the same id), else the only strategy configured. With
+    several configured and neither given, the command refuses and lists them --
+    guessing which account to trade in is not a default.
+    """
+
+    config_path: Path | None = None
     store: Path = STORE
     cache: Path = CACHE
     broker_factory: Callable[[LiveConfig], Any] | None = None
     clock: Callable[[], datetime] = now_utc
     input: Callable[[str], str] = input
     out: Callable[[str], None] = print
+    strategy: str | None = None
+    configs_root: Path = CONFIGS
     _config: LiveConfig | None = field(default=None, init=False)
     _broker: Any = field(default=None, init=False)
 
+    def resolve_config_path(self) -> Path:
+        if self.config_path is not None:
+            return Path(self.config_path)
+        if self.strategy:
+            path = self.configs_root / "strategies" / f"{self.strategy}.yaml"
+            if not path.exists():
+                known = [q.stem for q in config_paths(self.configs_root)]
+                raise ContractViolation(
+                    f"no config for strategy {self.strategy!r} at {path}; configured: "
+                    f"{known or 'none'}"
+                )
+            return path
+        found = config_paths(self.configs_root)
+        if len(found) == 1:
+            return found[0]
+        if not found:
+            raise ContractViolation(
+                "no strategy is configured. Copy configs/live.example.yaml to "
+                "configs/strategies/<id>.yaml and fill it in (manual, section 7)."
+            )
+        raise ContractViolation(
+            f"several strategies are configured ({', '.join(q.stem for q in found)}); "
+            f"say which with --strategy <id>"
+        )
+
+    def has_config(self) -> bool:
+        try:
+            self.resolve_config_path()
+        except ContractViolation:
+            return False
+        return True
+
     def config(self) -> LiveConfig:
         if self._config is None:
-            self._config = load_config(self.config_path)
+            path = self.resolve_config_path()
+            config = load_config(path)
+            # One strategy per account, and unique ids, across every config --
+            # checked whenever any one of them is used.
+            others = [
+                load_config(q) for q in config_paths(self.configs_root)
+                if q.resolve() != path.resolve()
+            ]
+            check_accounts([config, *others])
+            self._config = config
         return self._config
 
     def broker(self):
@@ -72,9 +140,10 @@ class Context:
 
                 g = config.gateway
                 self.out(f"connecting to {g.host}:{g.port} as {config.account} "
-                         f"({config.mode.value}) ...")
+                         f"({config.mode.value}, strategy {config.strategy_id}) ...")
                 self._broker = IBKRBroker.connect(
-                    g.host, g.port, g.client_id, config.account, config.mode, g.timeout_seconds
+                    g.host, g.port, g.client_id, config.account, config.mode,
+                    g.timeout_seconds, order_prefix=_prefix(config),
                 )
         return self._broker
 
@@ -89,6 +158,14 @@ class Context:
             with contextlib.suppress(Exception):  # best effort on the way out
                 self._broker.disconnect()
         self._broker = None
+
+
+def _prefix(config: LiveConfig) -> str:
+    from contracts.execution import order_prefix
+    from contracts.identifiers import PortfolioId
+    from runtime.live import TENANT
+
+    return order_prefix(PortfolioId(TENANT, config.strategy_id))
 
 
 # -- helpers ----------------------------------------------------------------------
@@ -119,7 +196,7 @@ def _run_script(name: str, argv: Sequence[str]) -> int:
 
 
 def _report_paths(ctx: Context, stem: str) -> tuple[Path, Path]:
-    base = ctx.config().reports_dir if ctx.config_path.exists() else ROOT / "state" / "reports"
+    base = ctx.config().reports_dir if ctx.has_config() else ROOT / "state" / "reports"
     stamp = ctx.clock().strftime("%Y%m%d-%H%M%S")
     return base / f"{stem}-{stamp}.json", base / f"{stem}-{stamp}.html"
 
@@ -138,43 +215,84 @@ def _write_report(ctx: Context, report, stem: str) -> Path:
 # -- data -----------------------------------------------------------------------------
 
 
+def cmd_strategies(ctx: Context, args) -> int:
+    from runtime.journal import Journal
+
+    paths = config_paths(ctx.configs_root)
+    if not paths:
+        ctx.out("no strategy is configured; see the manual, section 7")
+        return 0
+    configs = [load_config(q) for q in paths]
+    check_accounts(configs)
+    rows = []
+    for c in configs:
+        journal = Journal(c.journal_path)
+        opened = "open" if journal.is_open else "not opened"
+        rows.append((c.strategy_id, c.strategy.name, interval_of(c).frequency,
+                     c.mode.value, c.account, f"{c.sleeve_capital:,.0f}", opened))
+    _table(ctx, ("id", "strategy", "bars", "mode", "account", "capital", "sleeve"), rows)
+    return 0
+
+
+def _interval(ctx: Context, args):
+    """The bar size a data command works on: ``--interval``, else the strategy's."""
+    from contracts.temporal import BarInterval
+
+    chosen = getattr(args, "interval", None)
+    if chosen:
+        return BarInterval.parse(chosen)
+    if ctx.has_config():
+        return interval_of(ctx.config())
+    return BarInterval.WEEK
+
+
 def cmd_data_status(ctx: Context, args) -> int:
     from data.vendor import cache_inventory
     from runtime.wiring import load_market
 
-    inventory = cache_inventory(ctx.cache, "weekly")
-    ctx.out(f"cache      {len(inventory)} weekly instruments in {ctx.cache}")
+    interval = _interval(ctx, args)
+    inventory = cache_inventory(ctx.cache, interval.frequency)
+    ctx.out(f"cache      {len(inventory)} {interval.frequency} instruments in {ctx.cache}")
     if args.verbose and len(inventory):
         _table(ctx, list(inventory.columns), inventory.astype(str).values.tolist())
     try:
-        market = load_market(ctx.store)
+        market = load_market(ctx.store, interval=interval)
     except Exception as error:
         ctx.out(f"store      not usable ({error}); run `ql data ingest --rebuild`")
         return 1
     last = market.schedule[-1]
-    age = (ctx.clock() - last).total_seconds() / 86400
-    ctx.out(f"store      {len(market.schedule)} weeks, {market.schedule[0].date()} to {last.date()}")
-    ctx.out(f"data age   {age:.1f} days since the last complete week closed")
-    if age > 10:
+    age = (ctx.clock() - last).total_seconds() / 3600
+    ctx.out(f"store      {len(market.schedule)} {interval.noun}s, "
+            f"{market.schedule[0].date()} to {last.date()}")
+    ctx.out(f"data age   {age / 24:.1f} days since the last complete {interval.noun} closed")
+    from runtime.config import DEFAULT_DATA_AGE_HOURS
+
+    limit = (
+        ctx.config().monitoring.data_age_hours(interval) if ctx.has_config()
+        else DEFAULT_DATA_AGE_HOURS[interval]
+    )
+    if age > limit:
         ctx.out("           stale: run `ql data refresh` (gateway) before proposing")
     return 0
 
 
 def cmd_data_refresh(ctx: Context, args) -> int:
     from data.bitemporal import BitemporalStore
-    from runtime.refresh import refresh_weekly
+    from runtime.refresh import refresh
 
-    store = BitemporalStore(ctx.store, "bars_1week")
+    interval = _interval(ctx, args)
+    store = BitemporalStore(ctx.store, f"bars_{interval.value.lower()}")
     symbols = [s.strip() for s in args.symbols.split(",")] if args.symbols else None
-    results = refresh_weekly(ctx.broker(), ctx.cache, store, ctx.clock(), symbols=symbols,
-                             duration=args.duration)
+    results = refresh(ctx.broker(), ctx.cache, store, ctx.clock(), interval,
+                      symbols=symbols, duration=args.duration)
     failed = [r for r in results if r.error]
-    _table(ctx, ("instrument", "new weeks", "revised", "last week", "error"),
-           [(r.instrument, r.new_weeks, r.revised_weeks, r.last_week, r.error or "")
-            for r in results if r.error or r.new_weeks or r.revised_weeks or args.verbose])
-    ctx.out(f"\n{len(results)} instruments, {sum(r.new_weeks for r in results)} new weeks, "
-            f"{sum(r.revised_weeks for r in results)} revisions, {len(failed)} failed")
-    if any(r.revised_weeks for r in results):
+    noun = interval.noun
+    _table(ctx, ("instrument", f"new {noun}s", "revised", f"last {noun}", "error"),
+           [(r.instrument, r.new_bars, r.revised_bars, r.last_bar, r.error or "")
+            for r in results if r.error or r.new_bars or r.revised_bars or args.verbose])
+    ctx.out(f"\n{len(results)} instruments, {sum(r.new_bars for r in results)} new {noun}s, "
+            f"{sum(r.revised_bars for r in results)} revisions, {len(failed)} failed")
+    if any(r.revised_bars for r in results):
         ctx.out("revisions are kept as new versions: backtests as-of an earlier date still "
                 "see what was known then")
     return 1 if failed else 0
@@ -183,9 +301,7 @@ def cmd_data_refresh(ctx: Context, args) -> int:
 def cmd_data_passthrough(script: str, gateway: bool = False):
     def run(ctx: Context, args) -> int:
         argv = list(args.rest)
-        if gateway and ctx.config_path.exists() and not any(
-            a.startswith("--port") for a in argv
-        ):
+        if gateway and ctx.has_config() and not any(a.startswith("--port") for a in argv):
             g = ctx.config().gateway
             argv += ["--host", g.host, "--port", str(g.port), "--client-id", str(g.client_id)]
         return _run_script(script, argv)
@@ -199,38 +315,69 @@ def cmd_backtest(ctx: Context, args) -> int:
     from contracts.identifiers import RunId
     from engine.decide import SizingPolicy
     from execution.simulated import CostModel
-    from risk.rules import GrossExposureLimit, ProtectiveStop, RiskSupervisor
+    from risk.rules import (
+        GrossExposureLimit,
+        NetExposureLimit,
+        ProtectiveStop,
+        RiskSupervisor,
+        ShortSales,
+    )
+    from runtime.config import RiskSettings, StrategySettings
     from runtime.reporting import backtest_report
-    from runtime.research import periodic_returns, precompute_indicators, run_once
+    from runtime.research import periodic_returns, run_once
+    from runtime.strategies import build_strategy
     from runtime.wiring import load_market
-    from strategies.momentum import MomentumParams, WeeklyMomentum
     from validation.ledger import ResearchLedger, Study
     from validation.metrics import summarise
 
-    defaults = ctx.config() if ctx.config_path.exists() else None
-    s = defaults.strategy if defaults else None
-    top = args.top or (s.top_n if s else 4)
-    lookback = args.lookback or (s.lookback_weeks if s else 13)
-    rebalance = args.rebalance_weeks or (s.rebalance_weeks if s else 4)
-    stop = args.stop if args.stop is not None else (defaults.risk.stop_distance if defaults else 0.12)
+    config = ctx.config() if ctx.has_config() else None
+    chosen = config.strategy if config else StrategySettings()
+    risk = config.risk if config else RiskSettings()
+    params = dict(chosen.params)
+    overrides = {"top_n": args.top, "lookback_weeks": args.lookback,
+                 "rebalance_weeks": args.rebalance_weeks}
+    given = {k: v for k, v in overrides.items() if v}
+    if given and chosen.name != "weekly-momentum":
+        raise ContractViolation(
+            f"--top/--lookback/--rebalance-weeks are weekly-momentum parameters; the "
+            f"configured strategy is {chosen.name}. Edit its params in the config instead."
+        )
+    params.update(given)
+    stop = args.stop if args.stop is not None else risk.stop_distance
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc) if args.start else None
-    market = load_market(ctx.store, start=start)
-    params = MomentumParams(rebalance_weeks=rebalance, top_n=top, lookback_weeks=lookback)
-    strategy = WeeklyMomentum(params, precomputed=precompute_indicators(market, params))
+    interval = build_strategy(chosen.name, params).filtration_spec.interval
+    market = load_market(ctx.store, interval=interval, start=start)
+    strategy = build_strategy(chosen.name, params, market)
     supervisor = RiskSupervisor(
-        rules=(GrossExposureLimit(1.0),), stop=ProtectiveStop(stop) if stop > 0 else None
+        rules=(
+            ShortSales(allowed=risk.allow_short),
+            GrossExposureLimit(risk.max_gross),
+            NetExposureLimit(risk.min_net, risk.max_net),
+        ),
+        stop=ProtectiveStop(stop) if stop > 0 else None,
     )
-    schedule = list(market.schedule)[params.warmup_weeks + params.min_history_weeks:]
+    # A strategy that needs a warm-up says so in its parameters; the backtest
+    # window starts after it, so its first bars are not reported as flat returns.
+    spec = getattr(strategy, "params", None)
+    warmup = (
+        int(getattr(spec, "warmup_weeks", 0)) + int(getattr(spec, "min_history_weeks", 0))
+        if spec is not None else 0
+    )
+    schedule = list(market.schedule)[warmup:]
     costs = CostModel(commission_bps=args.cost_bps, slippage_bps=args.slippage_bps)
-    result = run_once(market, strategy, schedule, RunId(f"bt-{top}-{lookback}-{rebalance}"),
-                      costs, SizingPolicy(cash_buffer=0.01, min_trade_fraction=0.005),
+    run_name = "bt-" + "-".join(str(v) for _, v in sorted(params.items()))[:40]
+    result = run_once(market, strategy, schedule, RunId(run_name), costs,
+                      SizingPolicy(cash_buffer=0.01, min_trade_fraction=0.005,
+                                   allow_short=risk.allow_short),
                       supervisor=supervisor)
 
     # Every backtest is a trial. Recording it keeps the Deflated Sharpe honest.
     returns = periodic_returns(result)
     window = f"{schedule[0].date()}..{schedule[-1].date()}"
     note = f"stop={stop} cost={args.cost_bps} slip={args.slippage_bps}"
+    if risk.allow_short:
+        note += f" short gross={risk.max_gross} net=[{risk.min_net},{risk.max_net}]"
     ledger = ResearchLedger(Path(args.ledger))
     with Study("manual", ledger) as study:
         if study.existing(strategy.version, window, note) is None:
@@ -241,10 +388,11 @@ def cmd_backtest(ctx: Context, args) -> int:
             }, returns=returns, note=note)
 
     stats = summarise(result.equity_curve(), periods_per_year=market.periods_per_year)
-    ctx.out(f"strategy     {strategy.version}")
-    ctx.out(f"settings     top {top} · lookback {lookback}w · rotate every {rebalance}w · "
-            f"stop {stop:.0%} · costs {args.cost_bps}+{args.slippage_bps} bp")
-    ctx.out(f"window       {window} ({len(result.steps)} weekly marks)")
+    shown = " · ".join(f"{k} {v}" for k, v in sorted(params.items()))
+    ctx.out(f"strategy     {strategy.version} ({chosen.name}, {interval.frequency})")
+    ctx.out(f"settings     {shown} · stop {stop:.0%} · costs {args.cost_bps}+{args.slippage_bps} bp"
+            + (" · shorts allowed" if risk.allow_short else ""))
+    ctx.out(f"window       {window} ({len(result.steps)} {interval.frequency} marks)")
     ctx.out(f"CAGR         {stats.cagr:.1%}")
     ctx.out(f"volatility   {stats.volatility:.1%}")
     ctx.out(f"Sharpe       {stats.sharpe:.2f}")
@@ -252,8 +400,10 @@ def cmd_backtest(ctx: Context, args) -> int:
     ctx.out(f"final equity {stats.final_equity:,.0f} from 100,000")
     ctx.out(f"stops fired  {result.stops_fired()}")
     ctx.out(f"ledger       recorded in study 'manual' ({ledger.count('manual')} manual trials)")
+    if risk.allow_short:
+        ctx.out("note         the backtest charges no borrow fees or margin interest on shorts")
     if args.report:
-        settings = {"top_n": top, "lookback_weeks": lookback, "rebalance_weeks": rebalance,
+        settings = {**params, "strategy": chosen.name, "interval": interval.frequency,
                     "stop_distance": stop, "commission_bps": args.cost_bps,
                     "slippage_bps": args.slippage_bps, "window": window}
         report = backtest_report(result, market, f"Backtest — {strategy.version}", settings,
@@ -263,6 +413,12 @@ def cmd_backtest(ctx: Context, args) -> int:
 
 
 # -- live ---------------------------------------------------------------------------------
+
+
+def _print_strategy(ctx: Context) -> None:
+    config = ctx.config()
+    ctx.out(f"strategy    {config.strategy_id} ({config.strategy.name}, "
+            f"{interval_of(config).frequency} bars)")
 
 
 def _print_status(ctx: Context, status: dict[str, Any]) -> None:
@@ -312,6 +468,7 @@ def cmd_live_sync(ctx: Context, args) -> int:
 
 def cmd_live_status(ctx: Context, args) -> int:
     session = ctx.session(with_broker=not args.offline)
+    _print_strategy(ctx)
     if not session.journal.is_open:
         config = ctx.config()
         if not args.offline:
@@ -463,8 +620,9 @@ def cmd_monitor_baseline(ctx: Context, args) -> int:
     path = baseline_path(session)
     baseline.save(path)
     ctx.out(f"baseline   {baseline.strategy_version}")
-    ctx.out(f"history    {baseline.first_week} to {baseline.last_week}, "
-            f"{len(baseline.weekly_returns)} weekly returns")
+    unit = session.interval.noun
+    ctx.out(f"history    {baseline.first_bar} to {baseline.last_bar}, "
+            f"{len(baseline.returns)} returns, one per {unit}")
     ctx.out(f"modelled   {baseline.modeled_bps:.1f} bp execution cost per unit traded")
     ctx.out(f"expected   {baseline.expected_rotation_return:.2%} gross return per rotation")
     ctx.out(f"saved      {path}")
@@ -482,14 +640,15 @@ def cmd_monitor_run(ctx: Context, args) -> int:
               else f" (was {report.state_before.value.upper()})")
     ctx.out(f"state      {report.state_after.value.upper()}{change}"
             + ("  [dry run: not applied]" if args.dry_run else ""))
-    ctx.out(f"live weeks {a.weeks}")
+    ctx.out(f"strategy   {report.strategy_id} ({report.mode})")
+    ctx.out(f"live {a.unit}s {a.periods}")
     if a.drawdown:
         ctx.out(f"drawdown   {-a.drawdown.live_drawdown:.1%}, deeper than "
                 f"{a.drawdown.percentile:.0%} of bootstrapped backtest windows")
     if a.break_probability is not None:
         ctx.out(f"break      {a.break_probability:.0%} probability the return process changed")
     if a.trend:
-        ctx.out(f"trend      {a.trend.weekly_slope:+.2%}/week, CI {a.trend.low:+.2%} … "
+        ctx.out(f"trend      {a.trend.slope:+.2%}/{a.unit}, CI {a.trend.low:+.2%} … "
                 f"{a.trend.high:+.2%}" + ("" if a.trend.judged else " (not judged yet)"))
     if a.shortfall:
         ctx.out(f"shortfall  {a.shortfall.mean_bps:.1f} bp per rotation vs "
@@ -521,7 +680,7 @@ def cmd_report_render(ctx: Context, args) -> int:
 
 
 def cmd_report_list(ctx: Context, args) -> int:
-    base = ctx.config().reports_dir if ctx.config_path.exists() else ROOT / "state" / "reports"
+    base = ctx.config().reports_dir if ctx.has_config() else ROOT / "state" / "reports"
     pages = sorted(base.glob("*.html"))[-args.tail:]
     if not pages:
         ctx.out(f"no reports in {base}")
@@ -537,18 +696,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ql", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--config", default=None, help="Path to live.yaml")
+    parser.add_argument("--strategy", default=None,
+                        help="Acts on configs/strategies/<name>.yaml (normally named "
+                             "after its strategy_id)")
+    parser.add_argument("--config", default=None, help="Path to a strategy config file")
     parser.add_argument("--store", default=None, help="Path to the bitemporal store")
     top = parser.add_subparsers(dest="command", required=True)
+
+    p = top.add_parser("strategies", help="Every configured strategy, its account and state")
+    p.set_defaults(func=cmd_strategies)
 
     data = top.add_parser("data", help="Price data and the universe").add_subparsers(
         dest="sub", required=True)
     p = data.add_parser("status", help="What is cached and stored, and how old it is")
     p.add_argument("-v", "--verbose", action="store_true", help="List every instrument")
+    p.add_argument("--interval", default=None,
+                   help="week, day, hour or minute (default: the strategy's)")
     p.set_defaults(func=cmd_data_status)
-    p = data.add_parser("refresh", help="Fetch the latest weekly bars for the universe (gateway)")
+    p = data.add_parser("refresh", help="Fetch the latest bars for the universe (gateway)")
     p.add_argument("--symbols", default=None, help="Only these, comma-separated")
-    p.add_argument("--duration", default="2 Y", help="How far back to re-fetch (IBKR syntax)")
+    p.add_argument("--duration", default=None,
+                   help="How far back to re-fetch (IBKR syntax; default by interval)")
+    p.add_argument("--interval", default=None,
+                   help="week, day, hour or minute (default: the strategy's)")
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=cmd_data_refresh)
     for name, script, gw, text in (
@@ -655,6 +825,8 @@ def main(argv: Sequence[str] | None = None, context: Context | None = None) -> i
     ctx = context or Context()
     if args.config:
         ctx.config_path = Path(args.config)
+    if args.strategy:
+        ctx.strategy = args.strategy
     if args.store:
         ctx.store = Path(args.store)
     try:

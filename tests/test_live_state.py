@@ -165,6 +165,7 @@ def test_the_fingerprint_changes_when_the_book_does(journal, portfolio):
 
 def write_config(tmp_path: Path, **overrides) -> Path:
     base = {
+        "strategy_id": "momentum",
         "mode": "paper", "account": "DU1234567", "sleeve_capital": 25_000,
         "gateway": {"port": 4002},
     }
@@ -199,7 +200,7 @@ def test_a_live_mode_on_a_paper_port_is_refused(tmp_path):
 
 def test_a_missing_setting_is_named(tmp_path):
     path = tmp_path / "live.yaml"
-    path.write_text(yaml.safe_dump({"mode": "paper", "account": "DU1"}))
+    path.write_text(yaml.safe_dump({"strategy_id": "x", "mode": "paper", "account": "DU1"}))
     with pytest.raises(ContractViolation, match="sleeve_capital"):
         load_config(path)
 

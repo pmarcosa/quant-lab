@@ -42,7 +42,21 @@ cd ~/Library/Mobile\ Documents/com~apple~CloudDocs/VIsual\ Studio/quant-lab
 **What it trades.** The weekly momentum strategy ranks the universe by 13-week
 momentum and holds the top 4, equally weighted. It rotates every 4 weeks. Each
 position gets a protective stop 12% below its entry price. These are the
-defaults in `configs/live.yaml`.
+defaults in `configs/live.example.yaml`; your own settings live in
+`configs/strategies/<id>.yaml` (section 7).
+
+**One strategy, one account, one id.** Each deployed strategy has a short id
+(for example `momentum`), its own config file, and its own IBKR account: a
+linked account under the same login when you run more than one. The id is
+written on every order the strategy sends. IBKR shows it in the *Order Ref*
+column as `ql-momentum.3fa9…`, so you can tell in TWS or in a statement which
+strategy sent an order, and the system recognises its own fills and stops by it.
+Section 7.5.
+
+**Not only weekly, not only long.** The momentum strategy is weekly and
+long-only. The machinery is not: a strategy can decide on weekly, daily, hourly
+or minute bars, and can hold short positions when its config allows it.
+Section 7.6 says what changes.
 
 **How it trades.** The system *proposes*, and you *approve* by typing a code.
 Nothing reaches the market any other way: no automatic mode exists, and no flag
@@ -50,22 +64,24 @@ creates one. Orders are market-on-open orders (MOO), so they fill in Monday's
 opening auction. That is exactly how the backtest assumes they fill, so live
 fills and simulated fills can be compared honestly.
 
-**The sleeve.** The strategy manages a fixed amount of capital inside your IBKR
+**The sleeve.** The strategy manages a fixed amount of capital inside its IBKR
 account, the `sleeve_capital`. It only knows the positions it opened or that you
-handed to it. Anything else in the account is invisible to it and never traded.
+handed to it, and it never trades anything else. By default the account is
+*dedicated* to the strategy, so anything else found in it stops the system; with
+`account_scope: shared`, other holdings are only reported (section 7.2).
 
 **The journal.** Every proposal, approval, order, fill, stop, snapshot,
 reconciliation, correction and state change is appended to one file:
-`state/live/<mode>-journal.jsonl`. The sleeve's positions and cash are *replayed*
+`state/live/<id>/<mode>-journal.jsonl`. The sleeve's positions and cash are *replayed*
 from that file every time they are needed. That makes the journal the source of
 truth, and the one file you must never lose (section 13).
 
 **The degradation ladder.** The system is always in one of three states:
 
-| state | proposals | buys | who can put it there | who can lift it |
+| state | proposals | new exposure | who can put it there | who can lift it |
 |---|---|---|---|---|
 | `NORMAL` | yes | yes | — | — |
-| `REDUCE_ONLY` | yes | **no**, only sells and stops | monitoring, or you (`pause`) | monitoring lifts its own; you lift yours with `clear` |
+| `REDUCE_ONLY` | yes | **no**: only orders that shrink positions (selling a long, covering a short) and stops | monitoring, or you (`pause`) | monitoring lifts its own; you lift yours with `clear` |
 | `HALTED` | only `--liquidate` | no | monitoring, a reconciliation mismatch, or you (`halt`) | **only you**, with `clear` and a written reason |
 
 **Where things are:**
@@ -81,9 +97,10 @@ execution/    Broker adapters: simulated.py (backtests) and ibkr.py (IB Gateway 
 reports/      Report documents (JSON) and their offline HTML pages.
 runtime/      Wiring. cli.py is the `ql` command; live.py the live session;
               monitor.py the monitoring pass; journal.py the event journal;
-              refresh.py the weekly data refresh; reporting.py builds reports.
+              refresh.py the data refresh; reporting.py builds reports;
+              strategies.py the registry of deployable strategies.
 scripts/      The research scripts `ql` delegates to.
-configs/      live.example.yaml (committed); live.yaml (yours, gitignored).
+configs/      live.example.yaml (committed); strategies/<id>.yaml (yours, gitignored).
 data/ibkr_cache/   Raw weekly and daily CSVs, committed: the reproducible input.
 var/store/    The bitemporal store, derived from the cache. Safe to delete and rebuild.
 state/        Irreplaceable: journals, baselines, the research ledger, reports. Gitignored.
@@ -137,8 +154,10 @@ deletes `var/store` first, and nothing else.
 pytest -q && ruff check .
 ```
 
-Both must pass (about 490 tests, about 20 seconds). The tests include the IBKR
-adapter and the whole live weekly cycle, run against a stand-in gateway. A red
+Both must pass (about 580 tests, about 25 seconds). The tests include the IBKR
+adapter and the whole live cycle, run against a stand-in gateway: the weekly
+long-only momentum strategy, and a daily long/short test strategy that exists
+only to prove the machinery does not assume either. A red
 test means the machine you are on differs from the one the code was verified on,
 and nothing should be traded until it is green.
 
@@ -148,8 +167,9 @@ and nothing should be traded until it is green.
 ql data status
 ```
 
-It shows how many instruments are cached, how many weeks the store holds, and
-how old the latest complete week is. Use it whenever you are unsure what the
+It shows how many instruments are cached, how many bars the store holds, and
+how old the latest complete bar is. It looks at the configured strategy's bar
+size; `--interval daily` (or `weekly`, `hourly`, `minute`) chooses another. Use it whenever you are unsure what the
 system is looking at.
 
 ---
@@ -158,11 +178,18 @@ system is looking at.
 
 ### What the data is
 
-Weekly bars, one per instrument per week. Each bar is stamped at the moment it
-became knowable: **Friday 21:00 UTC**, after the US close. That time is a safe
+For the momentum strategy, weekly bars, one per instrument per week. Each bar is
+stamped at the moment it became knowable: **Friday 21:00 UTC**, after the US close. That time is a safe
 bound all year round, because it is 16:00 or 17:00 in New York depending on
 daylight saving. A backtest decision on Friday's close can therefore never use a
 bar that was not yet complete.
+
+Other bar sizes follow the same rule. A daily bar is stamped at 21:00 UTC on its
+own day. An intraday bar is stamped at its *end*: IBKR labels hourly and minute
+bars with their start time, and a bar stamped there would be visible to a
+decision it had not finished forming for. Each bar size has its own store
+(`bars_1week`, `bars_1day`, …) and its own cache folder
+(`data/ibkr_cache/weekly`, `daily`, …).
 
 The store is **bitemporal**: every row carries both the week it describes and
 the moment it was recorded. When IBKR restates history, for example after a
@@ -175,12 +202,14 @@ backtest run "as of" an earlier date still sees what was known then.
 ql data refresh
 ```
 
-For every instrument in the universe, this does four things:
+It works on the configured strategy's bar size (`--interval` chooses another).
+For every instrument in the universe, it does four things:
 
-1. Asks the gateway for the last two years of weekly bars.
+1. Asks the gateway for recent bars: the last two years of weekly bars, one year
+   of daily bars, ten days of hourly or two days of minute bars.
 2. Merges any week split across a holiday into one bar. IBKR sometimes returns
    two bars for one week.
-3. Drops the current week while it is still incomplete.
+3. Drops the current bar while it is still incomplete.
 4. Updates the CSV cache and appends only what is new or restated to the store,
    stamped with the moment of the fetch.
 
@@ -238,8 +267,8 @@ ql data fetch --symbols NFLX,ORCL,ADBE,CRM,NOW --freq weekly
 
 This asks the gateway for the full weekly history of each symbol, converts it,
 validates it, and writes one CSV per symbol to `data/ibkr_cache/weekly/`. The
-host, port and client id come from `configs/live.yaml`; `--port` overrides
-them. IBKR caps one request at roughly 1,000 bars, which is about 20 years of
+host, port and client id come from the strategy's config (with several
+configured, put `--strategy <name>` before `data`); `--port` overrides them. IBKR caps one request at roughly 1,000 bars, which is about 20 years of
 weekly bars.
 
 ### Step 4.2b — Or import saved payloads (no gateway needed)
@@ -314,7 +343,17 @@ browser (section 6.1).
 | `--cost-bps` / `--slippage-bps` | 10 / 10 | commission and slippage per side, in basis points |
 | `--start` | the first week in the store | earliest week, as an ISO date |
 | `--benchmark` | SPY | the comparison line in the report |
-| `--report` | off | writes `state/reports/backtest-<time>.html` and `.json` |
+| `--report` | off | writes `state/reports/<id>/backtest-<time>.html` and `.json` |
+
+`--top`, `--lookback` and `--rebalance-weeks` are the momentum strategy's
+parameters. For any other strategy the command refuses them and uses the
+`strategy.params` in its config. With several strategies configured, say which:
+`ql --strategy trend backtest`.
+
+**Shorts in a backtest.** A strategy allowed to short (`risk.allow_short`) is
+backtested with its gross and net exposure limits and with buy stops above its
+shorts. The backtest charges **no borrow fees, no margin interest and no
+recalls**, so its short side is optimistic; the output says so.
 
 **Why the defaults come from the config.** A backtest you are going to act on
 should be of the strategy you are actually going to trade.
@@ -391,7 +430,7 @@ needs.
 ## 6. Reading the reports
 
 Every report is written twice, as data (`.json`) and as a page (`.html`), side
-by side in `state/reports/`. The page is drawn *only* from the data, so the two
+by side in `state/reports/<id>/`, one folder per strategy. The page is drawn *only* from the data, so the two
 can never disagree, and the JSON can be archived, diffed or loaded into anything.
 
 The page is a single file with no internet dependency. Open it by
@@ -434,7 +473,7 @@ ql report render state/reports/live-paper-20261003-101500.json
 
 ### 6.2 The live monitoring dashboard
 
-Written by `ql monitor run` (section 10) to `state/reports/live-<mode>-<time>.html`.
+Written by `ql monitor run` (section 10) to `state/reports/<id>/live-<mode>-<time>.html`.
 Read it top to bottom. It is ordered by what needs your attention first.
 
 1. **The status bar.** The state (NORMAL, REDUCE-ONLY or HALTED), whether it
@@ -463,6 +502,10 @@ Read it top to bottom. It is ordered by what needs your attention first.
 9. **Thresholds in force.** The exact lines this run was judged against.
 10. **Notes.** Especially "trend not judged before 26 weeks" and the warning
     that early statistics are wide.
+
+For a strategy that is not weekly, the dashboard counts in its own bars (days,
+hours): the title names the bar size, and "weekly returns" read as daily or
+hourly ones. The thresholds' durations stay in calendar weeks (section 10.3).
 
 ---
 ## 7. Before trading: IB Gateway, the config, the baseline
@@ -494,26 +537,48 @@ one.
 ### Step 7.2 — Write your config
 
 ```bash
-cp configs/live.example.yaml configs/live.yaml
+mkdir -p configs/strategies
+cp configs/live.example.yaml configs/strategies/momentum.yaml
 ```
 
-Edit `configs/live.yaml`:
+Edit `configs/strategies/momentum.yaml`. Name the file after the strategy's id.
 
 | setting | what to put | why |
 |---|---|---|
+| `strategy_id` | `momentum` | Lowercase letters, digits and single dashes, at most 16 characters, starting with a letter. It is written on every order (`ql-momentum.…`) and names the strategy's state folder. **Never change it on a running sleeve**: the journal is filed under it, and the system refuses a journal that belongs to another id. |
 | `mode` | `paper` | Always start here (section 12). |
 | `account` | your `DU…` account | Checked against the accounts the gateway manages, and against the mode: `DU` is paper, `U` is live. |
 | `sleeve_capital` | the capital the strategy manages | It sizes against this, not the whole account. |
 | `gateway.port` | 4002 | Must match the gateway (step 7.1). |
 | `gateway.client_id` | any number not used by another API program | Two programs with the same id disconnect each other. |
-| `strategy.*` | the strategy you researched | Changing any of these changes the strategy's identity and requires a new baseline. |
-| `risk.stop_distance` | 0.12 | The protective stop. `0` disables it (not recommended). |
-| `risk.max_order_fraction` | 0.6 | No single order may exceed this share of the sleeve. It is a guard against unit errors, not a sizing rule. |
-| `monitoring.*` | the defaults | Section 10.3 explains each one and when to change it. |
-| `proposal_ttl_hours` | 60 | A Saturday proposal must still be approvable on Monday morning. |
-| `unmanaged` | tickers the strategy must never touch | For things you hold in the same account for your own reasons. |
+| `account_scope` | `dedicated` | The account belongs to this strategy: a position the sleeve does not know, or extra shares, stops the system. Use `shared` only if you must keep other holdings in the same account; they are then reported, not treated as an incident. |
+| `strategy.name` | `weekly-momentum` | Which strategy. The deployable ones are registered in `runtime/strategies.py`; an unknown name is refused. |
+| `strategy.params` | the values you researched | Changing any of these changes the strategy's identity and requires a new baseline. |
+| `execution.time_in_force` | `auto` | `auto` sends orders to the opening auction (`opg`) for daily and weekly strategies, and as day orders for intraday ones. |
+| `risk.stop_distance` | 0.12 | The protective stop: below a long, above a short. `0` disables it (not recommended). |
+| `risk.max_gross` | 1.0 | Longs plus shorts, as a share of sleeve equity. |
+| `risk.max_net` / `risk.min_net` | 1.0 / −1.0 | Longs minus shorts. Only binds for a strategy that can be short. |
+| `risk.allow_short` | `false` | Section 7.6. Off, a strategy that asks for a short fails loudly instead of borrowing stock. |
+| `risk.max_borrow_fee` | empty | Refuse a short whose annual borrow fee is above this, when IBKR reports a fee. |
+| `risk.max_order_fraction` | 0.6 | No single order may *open* more than this share of the sleeve. It is a guard against unit errors, not a sizing rule. |
+| `monitoring.*` | the defaults | Durations are in **calendar weeks** whatever the bar size. Section 10.3 explains each one and when to change it. |
+| `monitoring.max_data_age_hours` | empty | Empty means by bar size: 240 hours for weekly bars, 100 for daily, 72 for intraday. |
+| `proposal_ttl_hours` | 60 | A Saturday proposal must still be approvable on Monday morning. A proposal is also dead as soon as a newer bar has closed. |
+| `unmanaged` | tickers the strategy must never touch | Only meaningful with `account_scope: shared`. |
 
-`configs/live.yaml` is gitignored because it names your account.
+`configs/strategies/` is gitignored because it names your accounts. An older
+`configs/live.yaml` still works if you add a `strategy_id` to it; moving it to
+`configs/strategies/<id>.yaml` is the tidy option.
+
+Check what is configured:
+
+```bash
+ql strategies
+```
+
+It lists every strategy with its bar size, mode, account, capital and whether its
+sleeve is open. It refuses, as every command does, when two configs share an id
+in the same mode or two strategies share an account.
 
 ### Step 7.3 — Check the connection
 
@@ -523,11 +588,12 @@ With the gateway running and logged in:
 ql live status
 ```
 
-Before the sleeve is opened it prints `connected DU… (paper)` with the account's
-net liquidation value, and `sleeve not open yet`. That means the gateway, the
+It first names the strategy, for example `strategy momentum (weekly-momentum,
+weekly bars)`. Before the sleeve is opened it then prints `connected DU… (paper)`
+with the account's net liquidation value, and `sleeve not open yet`. That means the gateway, the
 port and the account all check out. If it fails, the message says why: the
 gateway is not running, the port is wrong, or the account is not one this
-gateway manages.
+gateway manages. The account is checked on every connection, not only here.
 
 ### Step 7.4 — Build the monitoring baseline
 
@@ -537,9 +603,9 @@ ql monitor baseline
 
 **What it does.** It backtests the configured strategy (same universe, settings,
 stop and costs) over the store and saves three things to
-`state/live/<mode>-baseline.json`:
+`state/live/<id>/<mode>-baseline.json`:
 
-- the weekly returns;
+- the returns per bar (weekly, for momentum);
 - the execution cost the backtest paid;
 - the return an average rotation earned.
 
@@ -547,14 +613,113 @@ stop and costs) over the store and saves three things to
 with what the backtest said would happen?* The baseline is "what the backtest
 said".
 
-- The baseline is **tied to the settings**. If you change `top_n`, `lookback`,
-  `rebalance_weeks`, the stop or `max_gross`, monitoring refuses to run until you
-  rebuild it. This stops live results from being compared against a different
+- The baseline is **tied to the settings**. If you change a strategy parameter,
+  the stop, an exposure limit or `allow_short`, monitoring refuses to run until
+  you rebuild it. This stops live results from being compared against a different
   strategy.
 - **Rebuild it** after changing the strategy settings, and after expanding the
   universe.
 - **Don't rebuild it** week after week just to fold in new data. A reference
   that moves every week can quietly absorb a problem.
+
+### Step 7.5 — Running more than one strategy
+
+Each strategy runs in **its own IBKR account**. That is IBKR's own way of keeping
+money apart: positions, cash, margin and orders never mix, and each strategy's
+reconciliation stays "this account against this sleeve".
+
+1. **Open an account for it.** In Client Portal, add a linked account under the
+   same login and fund it with the strategy's capital. Trade it on paper first,
+   like the first one.
+2. **Write its config**, `configs/strategies/<id>.yaml`, with its own
+   `strategy_id` and that account's number. Give it a `gateway.client_id` of
+   its own.
+3. **Gateway.** If the accounts share a login, one IB Gateway serves them all,
+   and the system checks that each config's account is one the gateway manages.
+   If they do not, run a second gateway on another port and put that port in the
+   config.
+4. **Check** with `ql strategies`.
+5. **Name the strategy in every command** once more than one is configured:
+
+   ```bash
+   ql --strategy trend live sync
+   ql --strategy trend live propose
+   ql --strategy trend monitor run
+   ```
+
+   Without `--strategy`, a command refuses and lists the configured ones:
+   guessing which account to trade in is not a default. `--strategy` names the
+   config file, `configs/strategies/<name>.yaml`, which is normally named after
+   the id. With a single strategy configured, no flag is needed.
+
+What keeps two strategies apart:
+
+| what | how |
+|---|---|
+| orders | Every order's reference starts with `ql-<id>.`. A strategy only claims fills, and only manages stops, that carry its own prefix. The dot cannot occur in an id, so `trend` can never claim `trend-fx`'s orders. |
+| state | `state/live/<id>/` holds its journal and baseline; `state/reports/<id>/` its reports. |
+| account | Checked against the gateway on every connection. The journal records the account at `init`, and the system refuses to run a sleeve against another one: a sleeve does not move between accounts. |
+| config | No command runs while two configs share an id in the same mode, or two strategies share an account. |
+
+**Why not two strategies in one account.** It is possible: the project's expert
+describes it as virtual sub-accounts. But the broker would then net their orders
+and hold one combined position per name, so the system would need to split every
+fill between strategies, reconcile against a sum, and decide who owns a stop.
+Each of those is a new way to be wrong about money. Separate accounts need none
+of it, so it is not built, and `ql` refuses the configuration.
+
+**Paper next to live, for one strategy.** Give it two files with the same
+`strategy_id`: for example `momentum.yaml` (`mode: live`) and
+`momentum-paper.yaml` (`mode: paper`, the paper account and port). Select the
+paper one with `ql --strategy momentum-paper …`. Their journals are
+`state/live/momentum/live-journal.jsonl` and `paper-journal.jsonl`.
+
+### Step 7.6 — Strategies that are not weekly, or can be short
+
+The momentum strategy is weekly and long-only. Nothing else in the system
+assumes either.
+
+**The bar size** comes from the strategy itself, and `ql strategies` shows it.
+Everything periodic follows it:
+
+| what | how it follows the bar size |
+|---|---|
+| data | `ql data refresh` fetches that bar size, stamped as in section 3. |
+| the cycle | Section 9 runs once per bar: for a daily strategy, every evening after the close or every morning before the open. |
+| orders | `execution.time_in_force: auto`: opening auction for daily and weekly strategies, day market orders for intraday ones. |
+| proposals | A proposal is dead once a newer bar has closed, whatever `proposal_ttl_hours` says. |
+| data age | `propose` refuses bars older than 240 hours (weekly), 100 hours (daily, so Friday's bar still serves on Monday) or 72 hours (intraday), unless `monitoring.max_data_age_hours` says otherwise. |
+| monitoring | Its durations are calendar weeks and are converted into bars: a 6-week bootstrap block is 6 weekly bars or about 29 daily bars. The expert's rule: how long the market remembers, and how long a regime lasts, are properties of calendar time, not of how often you sample it. |
+
+**Intraday is not ready for money.** The system has no exchange calendar yet, so
+it does not know holidays or half days, and IBKR serves only a short intraday
+history, too short to validate a strategy on. Both need solving before an
+intraday strategy trades.
+
+**Shorts** are off unless `risk.allow_short: true`. With them on:
+
+1. **The account must be a margin account.** IBKR refuses short sales in a cash
+   account.
+2. **Before any proposal that opens a short, the system asks IBKR:**
+   - *how many shares can be borrowed.* A short is cut to that number, and a
+     name with no figure is treated as not borrowable;
+   - *what the orders do to margin*, with a what-if order. The proposal is
+     refused if the account cannot carry them;
+   - *the borrow fee*, checked against `risk.max_borrow_fee`. The standard API
+     usually does not report fees, so check hard-to-borrow names in TWS.
+3. **Exposure** is limited by `max_gross` (longs plus shorts) and by
+   `min_net`/`max_net` (longs minus shorts).
+4. **Each short gets a buy stop** `stop_distance` above its entry. The expert's
+   warnings about the short side: the loss is not bounded by zero; a gap up
+   fills the stop above its level; crowded shorts get squeezed; and the lender
+   can recall the shares, which forces a buy-in.
+5. **Reduce-only** covers shorts but never opens or enlarges one. An order that
+   would reverse a short into a long stops at flat. A liquidation buys to cover.
+6. **Reconciliation compares signed positions.** A long where the sleeve holds a
+   short is a mismatch.
+7. **Backtests** charge no borrow fees, no margin interest and no recalls.
+8. **`ql live adjust`** takes negative quantities for shorts, and only for a
+   strategy that allows them.
 
 ---
 
@@ -570,9 +735,10 @@ This records the sleeve's opening balance: `sleeve_capital` in cash and no
 positions. It then runs a first sync: it snapshots the account and reconciles
 the (empty) sleeve against it.
 
-A sleeve opens once per mode. The paper and live sleeves have separate journals
-(`paper-journal.jsonl`, `live-journal.jsonl`), so paper history never leaks
-into live.
+A sleeve opens once per strategy and mode. The paper and live sleeves have
+separate journals (`paper-journal.jsonl`, `live-journal.jsonl`, in the
+strategy's folder), so paper history never leaks into live. The opening entry
+records the strategy id, its version, its bar size and the account.
 
 ### Step 8.2 — Or hand over positions you already hold
 
@@ -605,6 +771,9 @@ between then and the **Monday open**. Rotations happen every
 `rebalance_weeks` (4 by default). The other weeks are "hold weeks": the
 cycle still runs, but the proposal is usually empty.
 
+A strategy with another bar size runs the same steps once per bar (section 7.6).
+With several strategies configured, add `--strategy <name>` to every command.
+
 Keep IB Gateway running and logged in for the steps that need it (marked 🔌).
 
 ### Step 9.1 — Refresh the data 🔌 (Saturday)
@@ -614,8 +783,9 @@ ql data refresh
 ```
 
 This adds the week that closed on Friday (section 3.1). **Why first:** the
-proposal is made on the latest complete week. `propose` refuses if that week is
-more than 10 days old, so a forgotten refresh cannot turn into a stale decision.
+proposal is made on the latest complete week. `propose` refuses if that week
+closed more than 240 hours (10 days) ago, so a forgotten refresh cannot turn into
+a stale decision. The limit depends on the bar size (section 7.6).
 
 ### Step 9.2 — Sync 🔌
 
@@ -625,22 +795,26 @@ ql live sync
 
 Sync brings the journal up to date with the account, in this order:
 
-1. **Fills.** Every execution of an order this system sent (they are
-   recognised by their `ql-` order reference), including stops that fired, is
-   recorded once. Duplicates are ignored by execution id.
+1. **Fills.** Every execution of an order this strategy sent (recognised by
+   its order reference, `ql-<id>.…`), including stops that fired, is recorded
+   once. Duplicates are ignored by execution id. Orders placed by hand carry no
+   such reference, so their fills are never claimed.
 2. **Order statuses.** Orders that filled, were cancelled or were rejected are
    recorded.
-3. **Stops.** Every sleeve position gets a good-till-cancelled protective stop.
-   Positions that no longer need one have theirs cancelled.
+3. **Stops.** Every sleeve position gets a good-till-cancelled protective stop:
+   a sell stop below a long, a buy stop above a short. Positions that no longer
+   need one have theirs cancelled.
 4. **Snapshot.** The sleeve is marked at the latest closes. This is the weekly
    equity point that monitoring uses.
 5. **Reconciliation.** The sleeve is compared with the account:
    - **OK**: they agree.
-   - **WARN**: the account holds *more* than the sleeve. That is expected in a
-     shared account, for example your own other positions. A missing stop and
-     low account cash are also warnings.
-   - **MISMATCH**: the account holds *less* than the sleeve believes, or an order
-     the system sent has vanished. **The system halts**, because it would
+   - **WARN**: in a *shared* account, the account holds more than the sleeve,
+     for example your own other positions. A missing stop and low account cash
+     are also warnings.
+   - **MISMATCH**: the account holds *less* than the sleeve believes, holds it on
+     the other side (long where the sleeve is short, or the reverse), an order
+     the system sent has vanished, or, in a *dedicated* account, it holds
+     anything the sleeve does not. **The system halts**, because it would
      otherwise be sizing and protecting positions that do not exist. See 11.1.
 
 Proposals require a reconciliation less than 24 hours old, and without a
@@ -680,8 +854,13 @@ Things `propose` refuses, and why:
 |---|---|
 | no reconciliation, or one older than a day, or a mismatch | Sizing from a sleeve that may not match the account. |
 | orders from the last approval still working | Two sets of orders for the same shares. |
-| data older than 10 days | A decision on stale prices. |
+| data older than its limit (10 days for weekly bars) | A decision on stale prices. |
 | the system is halted | Only `--liquidate` is allowed (11.2). |
+| a short the account cannot margin, or a broker that cannot report margin | A short sale IBKR would refuse, or one nobody checked (7.6). |
+| a short target from a strategy without `allow_short` | A short by accident fails instead of borrowing stock. |
+
+A short that cannot be borrowed is not a refusal: the order is cut to what can
+be borrowed, possibly to nothing, and the finding says so.
 
 Names that a stop closed since the last rotation are not bought back until the
 next rotation. The backtest does the same.
@@ -703,16 +882,21 @@ Anything else sends nothing. Before sending, `approve` checks four things:
 
 - the proposal is the latest undecided one;
 - it has not expired;
+- no newer bar has closed since it was decided (it would be a decision on old
+  data);
 - the sleeve has not changed since the proposal was computed (a fill, a stop or
   an adjustment in between makes its quantities wrong);
 - the system has not been halted since.
 
 It then does the following:
 
-- cancels any resting stop on a name it is about to sell. Otherwise the stop
-  and the sell together would sell the shares twice;
-- sends sells first, then buys, as market-on-open orders, each tagged with a
-  unique reference so a retry can never send an order twice.
+- cancels any resting stop on a name it is about to trade on the same side: a
+  sell against a long's stop, a buy against a short's. Otherwise the stop and
+  the order together would close the same shares twice, and push the position
+  through zero;
+- sends the orders that reduce exposure first, then those that add to it, as
+  market-on-open orders, each tagged with the strategy's reference and a unique
+  code so a retry can never send an order twice.
 
 **Timing.** Market-on-open orders must reach IBKR before the opening auction
 closes to new orders, at **09:28 New York time**. That is normally 15:28 in
@@ -827,8 +1011,10 @@ store.
 - *Supporting numbers.*
   - Execution drag: the fill against the bar's opening price. This is the part
     the backtest cannot model.
-  - Markouts: the price move 1 and 4 weeks after the fill. Persistently
-    negative markouts mean you are buying tops.
+  - Markouts: the price move 1 and 4 calendar weeks after the fill, in the
+    trade's favour (up after a buy, down after a sale). Persistently negative
+    markouts mean you are trading at turning points: buying tops, or selling and
+    shorting bottoms.
 - *Lines.* Reduce-only at 1.5× the modelled cost. Halt when the cost exceeds
   half of the return a rotation is expected to earn, two rotations in a row:
   execution would then be eating the edge.
@@ -839,20 +1025,24 @@ thresholds, but they are shown on every dashboard:
 | metric | meaning | watch for |
 |---|---|---|
 | approved / proposed, rejected, expired | how often proposals are acted on | Expiries are skipped weeks by default. |
-| buy and sell compliance | share of proposed buys and sells that were executed | |
-| **asymmetry** | buy compliance minus sell compliance | Positive means you execute buys and skip sells. It is the most expensive override habit: it keeps losers the system wanted out of. Amber at +10%, red at +25%. |
+| entry and exit compliance | share of proposed entries and exits that were executed. Entries open or add to a position (buying a long, selling a short); exits reduce or close one | |
+| **asymmetry** | entry compliance minus exit compliance | Positive means you execute entries and skip exits. It is the most expensive override habit: it keeps losers the system wanted out of. Amber at +10%, red at +25%. |
 | override cost | what the rejected orders would have made over the following week, in dollars | Positive means the overrides cost money. |
 | median latency | hours from proposal to approval | |
 | stop coverage | share of positions with a working stop | Anything under 100% is an unprotected position. |
 
-**6. Health.** Data age (over 10 days is stale), time since the last sync (over
-a week), and whether the last reconciliation was a mismatch. Health problems do
+**6. Health.** Data age (past the limit `propose` uses: 10 days for weekly
+bars), time since the last sync (over one bar plus three days: 10 days for a
+weekly strategy, 4 for a daily one), and whether the last reconciliation was a
+mismatch. Health problems do
 not change the state, but they turn the status bar amber: every other check is
 only as good as the data it reads.
 
 ### 10.3 The thresholds, and when to change them
 
-The defaults are in `configs/live.yaml` under `monitoring:`. They come from the
+The defaults are in the strategy's config under `monitoring:`. The durations
+(`bootstrap_block_weeks`, `changepoint_hazard_weeks`, `trend_min_weeks`,
+`horizon_weeks`) are calendar weeks for every bar size (section 7.6). They come from the
 project's expert, with one deliberate change: **the drawdown halt is at the 99th
 percentile, not the 95th.**
 
@@ -879,8 +1069,8 @@ crossed is switching the alarm off.
 
 - **NORMAL.** Nothing. Keep the weekly cycle.
 - **REDUCE_ONLY (set by monitoring).**
-  - Proposals continue, but buys are removed: sells, stops and exits still
-    happen, new risk does not.
+  - Proposals continue, but orders that add exposure are removed: selling
+    longs, covering shorts, stops and exits still happen; new risk does not.
   - Read the reasons on the dashboard. Usually it is a drawdown past P80, which
     is common.
   - No action is needed: monitoring lifts it when the evidence clears. If you
@@ -898,10 +1088,12 @@ crossed is switching the alarm off.
 
 *Symptom:* `ql live sync` prints `MISMATCH` and the system is **HALTED**.
 
-*Meaning:* the account holds **less** of something than the sleeve believes, or
-an order the system sent has disappeared. Typical causes:
+*Meaning:* the account holds **less** of something than the sleeve believes,
+holds it on the other side, or an order the system sent has disappeared. In a
+dedicated account, it can also mean the account holds something the sleeve does
+not. Typical causes:
 
-- you sold shares manually in TWS or the app;
+- you sold or bought shares manually in TWS or the app;
 - a corporate action (a merger, a spin-off, a symbol change);
 - IBKR cancelled an order the system still thinks is working.
 
@@ -954,8 +1146,8 @@ and the written reason is the record of that judgement.
 
 ### 11.3 Data is stale
 
-*Symptom:* `propose` refuses with "the latest complete week is N days old", or
-the dashboard shows a data-age warning.
+*Symptom:* `propose` refuses with "the latest complete week closed N hours ago",
+or the dashboard shows a data-age warning.
 
 *Steps:* `ql data refresh` (gateway needed), then continue the cycle. If the
 refresh fails for some symbols, see the error column. A symbol that fails
@@ -982,10 +1174,18 @@ fill. The name is not bought back until the next rotation.
 
 ### 11.6 You traded in the account yourself
 
-- **You bought something the sleeve does not hold.** Reconciliation warns that
-  it is "held at the broker but not by the sleeve". To silence it, list the
-  ticker under `unmanaged:` in the config. The strategy will never touch it.
+- **In a dedicated account (the default)**, anything you bought that the sleeve
+  does not hold, or extra shares of a name it does, is a mismatch and halts the
+  system. The account is the strategy's, so a stray position is an incident.
+  Undo the trade, or move the position to another account, then
+  `ql live reconcile` and `ql live clear`.
+- **In a shared account**, reconciliation only warns that it is "held at the
+  broker but not by the sleeve". To silence it, list the ticker under
+  `unmanaged:` in the config. The strategy will never touch it.
 - **You changed a sleeve position.** Treat it as 11.1.
+
+Orders you place by hand have no `ql-` reference, so the system never mistakes
+them for its own.
 
 ### 11.7 Deposits and withdrawals
 
@@ -1036,18 +1236,19 @@ before anything is recorded or sent.
 
 1. In IB Gateway, log in to the **live** account. The API settings are the same
    (step 7.1), but the port is **4001**.
-2. In `configs/live.yaml` set `mode: live`, `account: U…` (your live account)
+2. In the strategy's config set `mode: live`, `account: U…` (your live account)
    and `gateway.port: 4001`. Set `sleeve_capital` to the amount you intend to
    commit. Start smaller than the final amount.
 3. `ql live status`. It must say `connected U… (live)`.
-4. `ql monitor baseline`. Baselines are per mode, so this builds the live one.
+4. `ql monitor baseline`. Baselines are per strategy and mode, so this builds
+   the live one.
 5. `ql live init`, or `ql live init --adopt …`.
 6. From now on, `approve` asks you to type `LIVE <id>`.
 
-The paper journal stays in `state/live/paper-journal.jsonl`. To keep paper
-running alongside live, keep a second config (for example
-`configs/paper.yaml`) and pass it explicitly:
-`ql --config configs/paper.yaml live status`.
+The paper journal stays in `state/live/<id>/paper-journal.jsonl`. To keep paper
+running alongside live, keep the paper config as a second file with the same id,
+for example `configs/strategies/momentum-paper.yaml`, and select it with
+`ql --strategy momentum-paper …` (step 7.5).
 
 ---
 
@@ -1057,11 +1258,11 @@ running alongside live, keep a second config (for example
 |---|---|---|
 | `data/ibkr_cache/` | raw CSVs, committed | Recoverable from git. |
 | `var/store/` | derived store | Rebuild: `ql data ingest --rebuild`. |
-| `state/live/<mode>-journal.jsonl` | **every live event; the sleeve is replayed from it** | **Not recoverable.** The sleeve's history, costs and overrides are gone. |
-| `state/live/<mode>-baseline.json` | the monitoring reference | Rebuild with `ql monitor baseline`. |
+| `state/live/<id>/<mode>-journal.jsonl` | **every live event of one strategy; its sleeve is replayed from it** | **Not recoverable.** The sleeve's history, costs and overrides are gone. |
+| `state/live/<id>/<mode>-baseline.json` | the monitoring reference | Rebuild with `ql monitor baseline`. |
 | `state/research.jsonl` | every research trial | **Not recoverable.** The trial count behind the DSR is gone. |
-| `state/reports/` | report pages and their data | Re-render from the JSON; re-run to regenerate. |
-| `configs/live.yaml` | your config | Re-create from the example. |
+| `state/reports/<id>/` | report pages and their data | Re-render from the JSON; re-run to regenerate. |
+| `configs/strategies/*.yaml` | your configs, one per strategy and mode | Re-create from the example, with the **same** `strategy_id`. |
 
 **Back up `state/`.** It is gitignored on purpose, because it names your account
 and positions. The repository lives in iCloud Drive, which syncs it, but sync is
@@ -1094,6 +1295,12 @@ Downloaded**.
   `gateway.client_id` unique.
 - **IB Gateway restarts daily** at the IBKR server reset, and needs a fresh
   login at least once a week. Check it is logged in before the weekly cycle.
+- **A strategy id is for life.** Renaming it on a running sleeve orphans the
+  journal and the orders at IBKR. For a new id, open a new sleeve.
+- **Don't edit an order's reference in TWS.** The system recognises its orders
+  by it; an edited one becomes a stranger's order.
+- **A short strategy's backtest is optimistic.** No borrow fees, no margin
+  interest, no recalls.
 - **The system does not send orders on its own**, and no flag makes it.
 
 ---
@@ -1132,14 +1339,15 @@ fail.
 
 | command | what it does |
 |---|---|
-| `ql data status [-v]` | cache and store contents, data age |
-| `ql data refresh [--symbols A,B] [--duration "2 Y"]` 🔌 | append the latest weekly bars |
+| `ql strategies` | every configured strategy: bar size, mode, account, capital, sleeve |
+| `ql data status [-v] [--interval I]` | cache and store contents, data age |
+| `ql data refresh [--symbols A,B] [--duration "2 Y"] [--interval I]` 🔌 | append the latest complete bars |
 | `ql data fetch --symbols A,B --freq weekly` 🔌 | add instruments to the universe |
 | `ql data import A=a.json … \| --from-dir DIR` | add instruments from saved payloads |
 | `ql data ingest --rebuild` | rebuild the store from the cache |
 | `ql backtest [options] [--report]` | backtest; recorded in the ledger |
 | `ql funnel [--controls N]` | the five research gates |
-| `ql live init [--adopt A,B]` 🔌 | open the sleeve (once per mode) |
+| `ql live init [--adopt A,B]` 🔌 | open the sleeve (once per strategy and mode) |
 | `ql live sync` 🔌 | fills, statuses, stops, snapshot, reconciliation |
 | `ql live status [--offline]` | state, equity, positions, stops |
 | `ql live propose [--liquidate]` 🔌 | compute orders; sends nothing |
@@ -1157,5 +1365,8 @@ fail.
 | `ql report list` | recent report pages |
 | `ql report render FILE.json [--out FILE.html]` | re-render a saved report |
 
-Global options: `--config PATH` (default `configs/live.yaml`) and `--store PATH`
-(default `var/store`). Every command has `--help`.
+Global options, before the command: `--strategy NAME` (acts on
+`configs/strategies/<NAME>.yaml`; needed when more than one is configured),
+`--config PATH` (any config file) and `--store PATH` (default `var/store`).
+`--interval` takes `weekly`, `daily`, `hourly` or `minute`. Every command has
+`--help`.

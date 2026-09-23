@@ -19,8 +19,10 @@ ql = "runtime.cli:main"
 
 [project.optional-dependencies]
 # ib_async is in dev so CI exercises the IBKR adapter against the stand-in gateway.
-dev = ["pytest>=7.4", "ruff>=0.5", "ib_async>=1.0"]
+dev = ["pytest>=7.4", "ruff>=0.5", "ib_async>=1.0", "exchange_calendars>=4.5"]
 ibkr = ["ib_async>=1.0"]
+# The NYSE session calendar: needed only by intraday strategies (data/calendar.py).
+intraday = ["exchange_calendars>=4.5"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["contracts", "access", "data", "strategies", "engine", "risk", "validation", "execution", "runtime", "reports"]

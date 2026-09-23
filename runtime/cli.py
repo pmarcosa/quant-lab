@@ -3,12 +3,15 @@
     ql strategies                       every configured strategy, its account and sleeve
     ql data status [--interval day]     what is cached, what is stored, how old
     ql data refresh                     fetch the latest complete bars (needs the gateway)
+    ql data backfill --interval hour    page back through years of intraday history
     ql data fetch --symbols A,B         add instruments to the universe (needs the gateway)
     ql data import A=a.json             add instruments without the gateway
     ql data ingest --rebuild            rebuild the store from the cache
     ql backtest [--report]              run the configured strategy over history
     ql funnel                           the five research gates
     ql live init|sync|status|propose|approve|reject|stops|reconcile|adjust|pause|halt|clear|journal
+    ql live cycle                       the whole cycle in one command (for a scheduler)
+    ql live auto status|arm|disarm|schedule   automatic sending, off until armed
     ql monitor baseline|run             build the reference, then judge live results
     ql report render FILE.json          re-render a saved report
 
@@ -18,8 +21,10 @@ several, say which: ``ql --strategy <id> live sync``. The id is written on every
 order the strategy sends (IBKR's Order Ref, ``ql-<id>.<hash>``).
 
 Every command that touches the broker connects with that strategy's config and
-disconnects when it is done. Nothing is ever sent without ``ql live approve``,
-which asks you to type the proposal's confirmation phrase.
+disconnects when it is done. Nothing is sent without ``ql live approve`` -- which
+asks you to type the proposal's confirmation phrase -- unless the config allows
+automation (``automation.mode``) *and* a person has armed it with
+``ql live auto arm``; ``ql live cycle`` then sends what its gates allow.
 
 Data commands work on the strategy's bar size (weekly, daily, hourly, minute);
 ``--interval`` overrides it.
@@ -298,6 +303,31 @@ def cmd_data_refresh(ctx: Context, args) -> int:
     return 1 if failed else 0
 
 
+def cmd_data_backfill(ctx: Context, args) -> int:
+    """Page back through the broker's history until the cache holds ``--years``."""
+    from contracts.temporal import BarInterval
+    from data.vendor import cache_inventory
+    from runtime.refresh import BACKFILL_CHUNKS, PACING_SECONDS, backfill
+
+    interval = _interval(ctx, args)
+    if interval is BarInterval.WEEK and not args.interval:
+        interval = BarInterval.HOUR
+    symbols = ([s.strip() for s in args.symbols.split(",")] if args.symbols
+               else list(cache_inventory(ctx.cache, "weekly")["symbol"]))
+    chunk = args.chunk or BACKFILL_CHUNKS[interval]
+    ctx.out(f"backfill   {len(symbols)} instruments, {interval.frequency} bars, {args.years:g} "
+            f"years, {chunk} per request, {PACING_SECONDS:g} s apart (IBKR's pacing limit)")
+    results = backfill(ctx.broker(), ctx.cache, interval, ctx.clock(), args.years, symbols,
+                       chunk=chunk)
+    _table(ctx, ("instrument", "bars added", "first bar", "requests", "note"), [
+        (r.instrument, r.bars_added, r.first_bar or "—", r.requests,
+         r.error or ("the broker has nothing older" if r.exhausted else ""))
+        for r in results
+    ])
+    ctx.out("\nnext: `ql data ingest --rebuild` to load the cache into the store")
+    return 1 if any(r.error for r in results) else 0
+
+
 def cmd_data_passthrough(script: str, gateway: bool = False):
     def run(ctx: Context, args) -> int:
         argv = list(args.rest)
@@ -312,6 +342,8 @@ def cmd_data_passthrough(script: str, gateway: bool = False):
 
 
 def cmd_backtest(ctx: Context, args) -> int:
+    from dataclasses import replace as _replace
+
     from contracts.identifiers import RunId
     from engine.decide import SizingPolicy
     from execution.simulated import CostModel
@@ -322,7 +354,7 @@ def cmd_backtest(ctx: Context, args) -> int:
         RiskSupervisor,
         ShortSales,
     )
-    from runtime.config import RiskSettings, StrategySettings
+    from runtime.config import FinancingSettings, LeverageSettings, RiskSettings, StrategySettings
     from runtime.reporting import backtest_report
     from runtime.research import periodic_returns, run_once
     from runtime.strategies import build_strategy
@@ -333,6 +365,17 @@ def cmd_backtest(ctx: Context, args) -> int:
     config = ctx.config() if ctx.has_config() else None
     chosen = config.strategy if config else StrategySettings()
     risk = config.risk if config else RiskSettings()
+    lev = config.leverage if config else LeverageSettings()
+    fin = config.financing if config else FinancingSettings()
+    if args.leverage is not None:
+        # A research override: a fixed leverage, with the cap raised to meet it.
+        lev = _replace(lev, target=args.leverage, cvar_target=None,
+                       floor=min(lev.floor, args.leverage))
+        cap = max(risk.max_gross, args.leverage)
+        risk = _replace(risk, max_gross=cap, max_net=max(risk.net_cap, cap))
+    if args.margin_rate is not None:
+        fin = _replace(fin, margin_rate=args.margin_rate)
+    schedule_rule = lev.schedule(risk.max_gross)
     params = dict(chosen.params)
     overrides = {"top_n": args.top, "lookback_weeks": args.lookback,
                  "rebalance_weeks": args.rebalance_weeks}
@@ -353,7 +396,7 @@ def cmd_backtest(ctx: Context, args) -> int:
         rules=(
             ShortSales(allowed=risk.allow_short),
             GrossExposureLimit(risk.max_gross),
-            NetExposureLimit(risk.min_net, risk.max_net),
+            NetExposureLimit(risk.min_net, risk.net_cap),
         ),
         stop=ProtectiveStop(stop) if stop > 0 else None,
     )
@@ -370,14 +413,20 @@ def cmd_backtest(ctx: Context, args) -> int:
     result = run_once(market, strategy, schedule, RunId(run_name), costs,
                       SizingPolicy(cash_buffer=0.01, min_trade_fraction=0.005,
                                    allow_short=risk.allow_short),
-                      supervisor=supervisor)
+                      supervisor=supervisor,
+                      leverage=None if schedule_rule.is_static_unlevered else schedule_rule,
+                      financing=fin.model())
 
     # Every backtest is a trial. Recording it keeps the Deflated Sharpe honest.
     returns = periodic_returns(result)
     window = f"{schedule[0].date()}..{schedule[-1].date()}"
     note = f"stop={stop} cost={args.cost_bps} slip={args.slippage_bps}"
     if risk.allow_short:
-        note += f" short gross={risk.max_gross} net=[{risk.min_net},{risk.max_net}]"
+        note += f" short gross={risk.max_gross} net=[{risk.min_net},{risk.net_cap}]"
+    if not schedule_rule.is_static_unlevered:
+        note += (f" lev={lev.target}/{risk.max_gross}"
+                 + (f" cvar={lev.cvar_target}" if lev.cvar_target else "")
+                 + f" margin={fin.margin_rate}")
     ledger = ResearchLedger(Path(args.ledger))
     with Study("manual", ledger) as study:
         if study.existing(strategy.version, window, note) is None:
@@ -399,9 +448,18 @@ def cmd_backtest(ctx: Context, args) -> int:
     ctx.out(f"max drawdown {stats.max_drawdown:.1%}")
     ctx.out(f"final equity {stats.final_equity:,.0f} from 100,000")
     ctx.out(f"stops fired  {result.stops_fired()}")
+    if not schedule_rule.is_static_unlevered or result.financing_paid > 0:
+        levels = [s.leverage for s in result.steps]
+        ctx.out(f"leverage     average {sum(levels) / len(levels):.2f}x, range "
+                f"{min(levels):.2f}-{max(levels):.2f}x (cap {risk.max_gross:.2f}x)")
+        ctx.out(f"financing    {result.financing_paid:,.0f} paid (margin {fin.margin_rate:.2%}, "
+                f"borrow {fin.borrow_fee:.2%} a year)")
+        if result.min_cushion is not None:
+            ctx.out(f"cushion      thinnest {result.min_cushion:.0%} (modelled Reg T maintenance)")
     ctx.out(f"ledger       recorded in study 'manual' ({ledger.count('manual')} manual trials)")
     if risk.allow_short:
-        ctx.out("note         the backtest charges no borrow fees or margin interest on shorts")
+        ctx.out("note         shorts pay a flat borrow fee here; hard-to-borrow names cost more, "
+                "and recalls are not modelled")
     if args.report:
         settings = {**params, "strategy": chosen.name, "interval": interval.frequency,
                     "stop_distance": stop, "commission_bps": args.cost_bps,
@@ -424,6 +482,7 @@ def _print_strategy(ctx: Context) -> None:
 def _print_status(ctx: Context, status: dict[str, Any]) -> None:
     ctx.out(f"mode        {status['mode']}  account {status['account']}")
     ctx.out(f"state       {status['state'].upper()}")
+    ctx.out(f"automation  {status.get('automation') or 'off: every order needs your approval'}")
     ctx.out(f"equity      {_money(status['sleeve_equity'])}  (cash {_money(status['cash'])})")
     hours = status.get("last_snapshot_hours")
     ctx.out(f"last sync   {'never' if hours is None else f'{hours:.1f} h ago'}")
@@ -664,6 +723,126 @@ def cmd_monitor_run(ctx: Context, args) -> int:
     return 0
 
 
+# -- automation ----------------------------------------------------------------------------
+
+
+def cmd_live_cycle(ctx: Context, args) -> int:
+    """Everything a week (or a day) needs, in order; sends only if armed."""
+    from runtime.automation import run_cycle
+
+    session = ctx.session()
+    stamp = ctx.clock().strftime("%Y-%m-%d %H:%M UTC")
+    ctx.out(f"cycle      {stamp}  strategy {session.config.strategy_id} "
+            f"({session.config.mode.value}), automation "
+            f"{session.automation_scope() or 'not armed'}")
+
+    def refresh() -> str:
+        from data.bitemporal import BitemporalStore
+        from runtime.refresh import refresh as fetch
+
+        interval = session.interval
+        store = BitemporalStore(ctx.store, f"bars_{interval.value.lower()}")
+        results = fetch(session.broker, ctx.cache, store, ctx.clock(), interval)
+        failed = [r for r in results if r.error]
+        return (f"{sum(r.new_bars for r in results)} new {interval.noun}s, "
+                f"{len(failed)} of {len(results)} instruments failed")
+
+    def monitor() -> str:
+        from runtime.monitor import run_monitor
+        from runtime.reporting import live_report
+
+        report = run_monitor(session, apply=True)
+        page = live_report(report, session.status(), asdict(session.config.monitoring), "SPY")
+        _write_report(ctx, page, f"live-{report.mode}")
+        return report.state_after.value
+
+    result = run_cycle(session, refresh=None if args.no_refresh else refresh,
+                       monitor=None if args.no_monitor else monitor)
+    if result.refreshed:
+        ctx.out(f"data       {result.refreshed}")
+    if result.sync is not None:
+        s = result.sync
+        ctx.out(f"sync       {s.new_fills} fills, {s.stops_placed} stops placed, "
+                f"reconcile {s.reconciliation.status.upper()}, state {s.state.value.upper()}")
+    if result.breaker:
+        ctx.out(f"HALTED     {result.breaker}")
+    if result.monitored:
+        ctx.out(f"monitor    state {result.monitored.upper()}")
+    if result.proposal_id:
+        ctx.out(f"proposal   {result.proposal_id} with {result.proposed_orders} orders")
+    if result.decision is not None:
+        d = result.decision
+        ctx.out(f"automatic  scope {d.scope}: {len(d.sent)} sent, {len(d.held)} held for a person")
+        for gate in d.failed:
+            ctx.out(f"  gate {gate.name}: {gate.detail}")
+    elif session.pending_proposal() is not None:
+        pid = session.pending_proposal().payload["proposal_id"]
+        ctx.out(f"waiting    {pid} needs `ql live approve {pid}`")
+    for note in result.notes:
+        ctx.out(f"  {note}")
+    for error in result.errors:
+        ctx.out(f"error: {error}")
+    return 0 if result.ok else 1
+
+
+def cmd_live_auto(ctx: Context, args) -> int:
+    from runtime import automation
+
+    session = ctx.session(with_broker=False)
+    if args.action == "status":
+        config = session.config.automation
+        ctx.out(f"allowed    {config.mode} (automation.mode in the config)")
+        ctx.out(f"armed      {session.automation_scope() or 'no'}")
+        evidence = automation.graduation(session)
+        ctx.out(f"evidence   {evidence.weeks_exits:.1f} weeks armed for exits "
+                f"({evidence.source}), {evidence.exit_fills} automatic exit fills, "
+                f"{evidence.mismatches} mismatches"
+                + (f", shortfall {evidence.shortfall_ratio:.2f}x modelled"
+                   if evidence.shortfall_ratio is not None else ""))
+        ctx.out("graduated  " + ("yes" if evidence.ok else "no: " + "; ".join(evidence.reasons)))
+        last = [e for e in session.journal.events(EventKind.AUTOMATION)][-5:]
+        for event in last:
+            payload = event.payload
+            ctx.out(f"  {event.at:%Y-%m-%d %H:%M}  {payload.get('action')}  "
+                    + ", ".join(f"{k}={v}" for k, v in payload.items()
+                                if k in ("scope", "reason", "proposal_id", "sent", "held", "fired")))
+        return 0
+    if args.action == "arm":
+        phrase = automation.arm_phrase(session, args.scope)
+        typed = args.confirm if args.confirm is not None else ctx.input(
+            f"type {phrase} to let the system send {args.scope} orders on its own: ")
+        automation.arm(session, args.scope, typed, override=args.override)
+        ctx.out(f"armed for {args.scope}. `ql live cycle` now sends what the gates allow; "
+                f"`ql live auto disarm` stops it.")
+        return 0
+    if args.action == "disarm":
+        automation.disarm(session, args.reason or "")
+        ctx.out("disarmed: nothing is sent without a typed approval")
+        return 0
+    if args.action == "schedule":
+        import sys
+
+        config = session.config
+        times = automation.schedule_times(session.interval)
+        label = f"com.quantlab.{config.strategy_id}.{config.mode.value}.cycle"
+        name = ctx.resolve_config_path().stem
+        command = [sys.executable, "-m", "runtime.cli", "--strategy", name, "live", "cycle"]
+        folder = config.live_dir / "launchd"
+        folder.mkdir(parents=True, exist_ok=True)
+        plist = folder / f"{label}.plist"
+        plist.write_text(automation.launchd_plist(
+            label, command, ROOT, config.live_dir / "cycle.log", times))
+        days = {0: "Sun", 1: "Mon", 2: "Tue", 3: "Wed", 4: "Thu", 5: "Fri", 6: "Sat", None: "daily"}
+        ctx.out(f"wrote      {plist}")
+        ctx.out("runs at   " + ", ".join(f"{days[d]} {h:02d}:{m:02d}" for d, h, m in times)
+                + " (the Mac's local time)")
+        ctx.out("install:  cp '" + str(plist) + "' ~/Library/LaunchAgents/ && "
+                "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/" + plist.name)
+        ctx.out("remove:   launchctl bootout gui/$(id -u)/" + label)
+        return 0
+    raise ContractViolation(f"unknown action {args.action}")
+
+
 # -- reports -------------------------------------------------------------------------------
 
 
@@ -721,6 +900,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="week, day, hour or minute (default: the strategy's)")
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(func=cmd_data_refresh)
+    p = data.add_parser("backfill", help="Page back through intraday history (gateway)")
+    p.add_argument("--interval", default=None, help="hour or minute (default: hour)")
+    p.add_argument("--years", type=float, default=5.0)
+    p.add_argument("--symbols", default=None, help="Comma-separated; default: the universe")
+    p.add_argument("--chunk", default=None, help='Per request, IBKR syntax (e.g. "1 Y")')
+    p.set_defaults(func=cmd_data_backfill)
     for name, script, gw, text in (
         ("fetch", "fetch_ibkr", True, "Add instruments from the gateway (scripts/fetch_ibkr.py)"),
         ("import", "import_ibkr_json", False, "Add instruments from saved JSON payloads"),
@@ -741,6 +926,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--benchmark", default="SPY")
     p.add_argument("--ledger", default=str(ROOT / "state" / "research.jsonl"))
     p.add_argument("--report", action="store_true", help="Write an HTML + JSON report")
+    p.add_argument("--leverage", type=float, default=None,
+                   help="Research override: a fixed gross leverage (e.g. 1.3)")
+    p.add_argument("--margin-rate", type=float, default=None,
+                   help="Annual interest on borrowed cash (default: config, 0.055)")
     p.set_defaults(func=cmd_backtest)
 
     p = top.add_parser("funnel", help="The five research gates (scripts/run_funnel.py)",
@@ -793,6 +982,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--to", choices=[s.value for s in DegradationState], default="normal")
     p.add_argument("--reason", required=True)
     p.set_defaults(func=cmd_live_clear)
+    p = live.add_parser("cycle", help="Refresh, sync, monitor, propose; send only if armed")
+    p.add_argument("--no-refresh", action="store_true", help="Skip the data refresh")
+    p.add_argument("--no-monitor", action="store_true", help="Skip the monitoring pass")
+    p.set_defaults(func=cmd_live_cycle)
+    p = live.add_parser("auto", help="Automatic sending: status, arm, disarm, schedule")
+    p.add_argument("action", choices=["status", "arm", "disarm", "schedule"])
+    p.add_argument("--scope", choices=["exits", "full"], default="exits")
+    p.add_argument("--confirm", default=None, help="The arming phrase, instead of the prompt")
+    p.add_argument("--override", default=None,
+                   help="Arm full with live money without the exits-stage evidence (a reason)")
+    p.add_argument("--reason", default=None, help="Why, when disarming")
+    p.set_defaults(func=cmd_live_auto)
     p = live.add_parser("journal", help="Read the event journal")
     p.add_argument("--tail", type=int, default=30)
     p.add_argument("--kind", action="append", choices=[k.value for k in EventKind])

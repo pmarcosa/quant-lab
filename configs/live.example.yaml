@@ -47,11 +47,38 @@ execution:
 risk:
   stop_distance: 0.12       # protective stop from the rotation price; 0 disables it
   max_gross: 1.0            # longs plus shorts, as a fraction of equity
-  max_net: 1.0              # longs minus shorts: upper bound
+  max_net: null             # longs minus shorts, upper bound; null: same as max_gross
   min_net: -1.0             # ...and lower bound (binds only when shorts are allowed)
   allow_short: false        # short sales need this AND a margin account
   max_borrow_fee: null      # refuse shorts whose annual borrow fee is above this (e.g. 0.05)
   max_order_fraction: 0.6   # no single order may open more than this share of equity
+
+leverage:
+  # Off: hold exactly the strategy's weights. See docs/MANUAL.md, step 7.7.
+  target: 1.0               # gross leverage wanted; above 1.0 borrows (needs risk.max_gross >= it)
+  cvar_target: null         # or: expected shortfall per bar to aim for (e.g. 0.04); sets the level
+  drawdown_start: 0.10      # de-leveraging starts at this drawdown...
+  drawdown_full: 0.35       # ...and the borrowing is gone at this one
+  step_up_per_week: 0.05    # the fastest leverage may rise
+  floor: 1.0                # the least it goes to (below 1 also cuts the strategy itself)
+  cushion_warning: 0.35     # IBKR margin cushion below which nothing is added
+  cushion_critical: 0.25    # ...and below which the system goes reduce-only
+
+financing:
+  margin_rate: 0.055        # annual interest on borrowed cash (IBKR Pro USD tier 1: benchmark + 1.5%)
+  borrow_fee: 0.005         # annual fee on shorted stock (general collateral)
+
+automation:
+  # The most the system may do without you. Nothing is automatic until you also
+  # arm it: `ql live auto arm --scope exits`. See docs/MANUAL.md, step 9.9.
+  mode: manual              # manual | exits | full
+  max_order_fraction: null  # null: 10% above the largest order the backtest sent
+  turnover_percentile: 0.99 # a cycle busier than this share of backtest rotations waits for you
+  max_orders: 20
+  loss_breaker_percentile: 0.005  # a bar worse than this backtest quantile halts
+  min_cushion: 0.35         # no automatic entries below this margin cushion
+  graduation_weeks: 8       # live 'full' needs this many weeks of automatic exits first
+  graduation_shortfall_multiple: 1.2
 
 monitoring:
   # Thresholds for the degradation ladder: normal -> reduce-only -> halted.

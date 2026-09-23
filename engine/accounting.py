@@ -14,11 +14,12 @@ Two rules make that class of bug unrepresentable here:
 1. **Equity is always ``cash + sum(quantity * price)``.** There is no other
    formula anywhere. A position that closes converts to cash; nothing is
    redistributed, because nothing was ever expressed as a share of a total.
-2. **Only a fill moves the book.** :meth:`Book.apply` is the sole mutator and it
-   is pure: it returns a new book. So the same fills in the same order always
-   produce the same state, a run can be replayed from its fills alone, and there
-   is no path by which a report, a risk check or a strategy can adjust the
-   accounts.
+2. **Only a fill or a charge moves the book.** :meth:`Book.apply` (a fill) and
+   :meth:`Book.charge` (interest on borrowed cash, a borrow fee) are the only
+   mutators, and both are pure: they return a new book. So the same events in
+   the same order always produce the same state, a run can be replayed from its
+   events alone, and there is no path by which a report, a risk check or a
+   strategy can adjust the accounts.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 from contracts.errors import ContractViolation
-from contracts.execution import Fill, PositionLedgerEntry
+from contracts.execution import Charge, ChargeKind, Fill, PositionLedgerEntry
 from contracts.identifiers import InstrumentId, PortfolioId
 from contracts.temporal import utc
 
@@ -53,6 +54,9 @@ class Book:
     positions: Mapping[InstrumentId, PositionLedgerEntry] = field(default_factory=dict)
     realised_pnl: float = 0.0
     commission_paid: float = 0.0
+    #: Interest and borrow fees paid, in total. Kept apart from commission so
+    #: a report can say what leverage and shorts cost on their own.
+    financing_paid: float = 0.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "as_of", utc(self.as_of))
@@ -179,6 +183,27 @@ class Book:
             as_of=fill.at,
             realised_pnl=self.realised_pnl + realised,
             commission_paid=self.commission_paid + fill.commission,
+        )
+
+    def charge(self, charge: Charge) -> Book:
+        """The book after paying ``charge``. Pure, like :meth:`apply`.
+
+        Only cash moves: a carrying cost changes neither quantities nor the cost
+        basis, which describes what was paid for the shares, not what holding
+        them cost afterwards.
+        """
+        if charge.at < self.as_of:
+            raise ContractViolation(
+                f"charge at {charge.at.isoformat()} is before the book at "
+                f"{self.as_of.isoformat()}; charges must be applied in order"
+            )
+        if charge.kind not in ChargeKind:  # pragma: no cover - enum guards it
+            raise ContractViolation(f"unknown charge kind {charge.kind!r}")
+        return replace(
+            self,
+            cash=self.cash - charge.amount,
+            as_of=charge.at,
+            financing_paid=self.financing_paid + charge.amount,
         )
 
     def apply_all(self, fills: Iterable[Fill]) -> Book:

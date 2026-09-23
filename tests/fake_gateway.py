@@ -32,6 +32,11 @@ class FakeGateway:
         self.shortable: dict[str, float] = {}
         #: Initial margin per unit of short notional, for what-if orders.
         self.short_margin = 0.5
+        #: Initial margin per unit of long notional bought on margin (a debit).
+        self.long_margin = 0.5
+        #: IBKR's cushion, when a test wants the gateway to report one.
+        self.cushion: float | None = None
+        self.history_requests: list = []
 
     # -- the API the adapter uses ------------------------------------------
 
@@ -103,19 +108,38 @@ class FakeGateway:
 
     def accountValues(self, account=""):
         value = self.cash + sum(q * self.prices.get(s, 0.0) for s, q in self._positions.items())
-        return [
+        rows = [
             ib_async.AccountValue(self.accounts[0], "NetLiquidation", f"{value:.2f}", "USD", ""),
             ib_async.AccountValue(self.accounts[0], "TotalCashValue", f"{self.cash:.2f}", "USD", ""),
         ]
+        if self.cushion is not None:
+            rows.append(ib_async.AccountValue(self.accounts[0], "Cushion", f"{self.cushion:.4f}", "", ""))
+        return rows
 
     def reqHistoricalData(self, contract, **kwargs):
-        return list(self.history.get(contract.symbol, []))
+        bars = list(self.history.get(contract.symbol, []))
+        end = kwargs.get("endDateTime")
+        self.history_requests.append((contract.symbol, kwargs.get("durationStr"), end))
+        if end:
+            span = _duration(kwargs.get("durationStr") or "1 Y")
+            bars = [b for b in bars if _utc(b.date) < end and _utc(b.date) >= end - span]
+        return bars
 
     def serve_history(self, symbol, frame):
         """Make ``reqHistoricalData`` return this OHLCV frame as ib_async bars."""
         self.history[symbol] = [
             ib_async.BarData(
                 date=label.date(), open=float(r["open"]), high=float(r["high"]),
+                low=float(r["low"]), close=float(r["close"]), volume=float(r["volume"]),
+            )
+            for label, r in frame.iterrows()
+        ]
+
+    def serve_intraday(self, symbol, frame):
+        """Make ``reqHistoricalData`` return this frame's bars, labelled by UTC start."""
+        self.history[symbol] = [
+            ib_async.BarData(
+                date=label.to_pydatetime(), open=float(r["open"]), high=float(r["high"]),
                 low=float(r["low"]), close=float(r["close"]), volume=float(r["volume"]),
             )
             for label, r in frame.iterrows()
@@ -134,25 +158,23 @@ class FakeGateway:
         return None
 
     def whatIfOrder(self, contract, order):
-        price = self.prices.get(contract.symbol, 100.0)
         held = self._positions.get(contract.symbol, 0.0)
         signed = order.totalQuantity if order.action == "BUY" else -order.totalQuantity
-        short_before = max(-held, 0.0) * price
-        short_after = max(-(held + signed), 0.0) * price
         equity = self.cash + sum(q * self.prices.get(s, 0.0) for s, q in self._positions.items())
-        before = self._short_margin_total()
-        change = self.short_margin * (short_after - short_before)
+        before = self._margin_total()
+        change = self._margin_of(contract.symbol, held + signed) - self._margin_of(contract.symbol, held)
         return ib_async.OrderState(
             initMarginBefore=str(before), initMarginChange=str(change),
             initMarginAfter=str(before + change), equityWithLoanBefore=str(equity),
             equityWithLoanAfter=str(equity),
         )
 
-    def _short_margin_total(self):
-        return sum(
-            self.short_margin * -q * self.prices.get(s, 100.0)
-            for s, q in self._positions.items() if q < 0
-        )
+    def _margin_of(self, symbol, quantity):
+        value = abs(quantity) * self.prices.get(symbol, 100.0)
+        return (self.long_margin if quantity > 0 else self.short_margin) * value
+
+    def _margin_total(self):
+        return sum(self._margin_of(s, q) for s, q in self._positions.items() if q)
 
     def hold(self, symbol, quantity, cost):
         """Seed a position that exists before the system starts."""
@@ -228,3 +250,15 @@ class FakeGateway:
 
     def trade_for(self, reference):
         return next(t for t in self._trades if t.order.orderRef == reference)
+
+
+def _utc(value):
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+
+
+def _duration(text):
+    number, unit = text.split()
+    days = {"S": 1 / 86400, "D": 1, "W": 7, "M": 30.5, "Y": 365.25}[unit.upper()]
+    return timedelta(days=float(number) * days)

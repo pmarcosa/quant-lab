@@ -172,3 +172,46 @@ class RiskRule(Protocol):
         instead of waving it through for want of a price.
         """
         ...
+
+
+# -- leverage ----------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class LeverageState:
+    """What a leverage policy may look at when it decides the next gross exposure.
+
+    Everything here is history the book has already lived through, in bars of
+    the strategy's interval, so the same state gives the same answer in a
+    backtest and live.
+
+    Attributes:
+        equity: The book's equity at each past bar, oldest first; the last value
+            is now.
+        base_returns: Per-bar returns *per unit of gross exposure* -- the
+            strategy's own risk, with the leverage that was in force divided
+            out -- oldest first. A tail-risk estimate on levered returns would
+            feed the leverage back into itself.
+        previous: The leverage set at the previous decision.
+        cushion: The account's margin cushion now, ``1 - maintenance / equity``;
+            ``None`` when unknown.
+        bars_per_week: So a per-week speed can be applied per bar.
+    """
+
+    equity: Sequence[float]
+    base_returns: Sequence[float]
+    previous: float
+    cushion: float | None = None
+    bars_per_week: float = 1.0
+
+
+@runtime_checkable
+class LeveragePolicy(Protocol):
+    """Decides the gross exposure the next decision is sized to.
+
+    Sits *before* the risk rules, not among them: it sets how much of the
+    strategy's intent to hold, and the rules -- the gross limit above all --
+    still cut anything beyond their caps.
+    """
+
+    def __call__(self, state: LeverageState) -> float: ...

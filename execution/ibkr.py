@@ -111,6 +111,11 @@ class AccountSnapshot:
     net_liquidation: float
     cash: float
     observed_at: datetime
+    #: The maintenance requirement and IBKR's cushion, ``1 - maintenance / net
+    #: liquidation``. IBKR liquidates without a call when the cushion reaches
+    #: zero; ``None`` when the gateway did not report them.
+    maintenance_margin: float | None = None
+    cushion: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,21 +325,30 @@ class IBKRBroker:
         values = {
             (v.tag, v.currency): v.value
             for v in self._ib.accountValues(self.account)
-            if v.currency in ("USD", "BASE")
+            if v.currency in ("USD", "BASE", "")
         }
 
-        def pick(tag: str) -> float:
-            for currency in ("USD", "BASE"):
+        def pick(tag: str, required: bool = True, currencies=("USD", "BASE")) -> float | None:
+            for currency in currencies:
                 raw = values.get((tag, currency))
                 if raw not in (None, ""):
                     return float(raw)
-            raise ContractViolation(f"the broker did not report {tag} for {self.account}")
+            if required:
+                raise ContractViolation(f"the broker did not report {tag} for {self.account}")
+            return None
 
+        net = pick("NetLiquidation")
+        maintenance = pick("MaintMarginReq", required=False)
+        cushion = pick("Cushion", required=False, currencies=("", "USD", "BASE"))
+        if cushion is None and maintenance is not None and net and net > 0:
+            cushion = 1.0 - maintenance / net
         return AccountSnapshot(
             account=self.account,
-            net_liquidation=pick("NetLiquidation"),
+            net_liquidation=net,
             cash=pick("TotalCashValue"),
             observed_at=datetime.now(timezone.utc),
+            maintenance_margin=maintenance,
+            cushion=cushion,
         )
 
     def fills(self) -> Sequence[BrokerFill]:
@@ -460,11 +474,17 @@ class IBKRBroker:
             )
         return MarginVerdict(True, f"initial margin {after:,.0f} of {equity:,.0f}", after, equity)
 
-    def historical_bars(self, instrument: InstrumentId, bar_size: str, duration: str):
-        """Price history through the same connection, as an ib_async bar list."""
+    def historical_bars(
+        self, instrument: InstrumentId, bar_size: str, duration: str, end: datetime | None = None
+    ):
+        """Price history through the same connection, as an ib_async bar list.
+
+        ``end``: the last moment to fetch up to, for paging backwards through
+        long histories; now when omitted. Regular trading hours only.
+        """
         return self._ib.reqHistoricalData(
             self._stock(instrument),
-            endDateTime="",
+            endDateTime="" if end is None else end.astimezone(timezone.utc),
             durationStr=duration,
             barSizeSetting=bar_size,
             whatToShow="ADJUSTED_LAST",

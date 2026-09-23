@@ -15,7 +15,7 @@ import json
 import math
 import statistics
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -45,7 +45,7 @@ from validation.monitoring import (
     assess,
 )
 
-BASELINE_FORMAT = 2
+BASELINE_FORMAT = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +67,14 @@ class Baseline:
     first_bar: str
     last_bar: str
     built_at: str
+    #: Returns per unit of gross exposure, for the leverage rule's tail-risk
+    #: estimate until the live record is long enough to carry it.
+    base_returns: list[float] = field(default_factory=list)
+    #: Value traded per trading step over equity: what "a normal rotation"
+    #: looks like, for automation's turnover gate.
+    rotation_turnover: list[float] = field(default_factory=list)
+    #: Each order's value over equity: the largest order the backtest sent.
+    order_shares: list[float] = field(default_factory=list)
 
     def save(self, path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,9 +105,11 @@ def _settings(session: LiveSession) -> dict[str, Any]:
         "interval": session.interval.value,
         "stop_distance": c.risk.stop_distance,
         "max_gross": c.risk.max_gross,
-        "max_net": c.risk.max_net,
+        "max_net": c.risk.net_cap,
         "min_net": c.risk.min_net,
         "allow_short": c.risk.allow_short,
+        "leverage": asdict(c.leverage),
+        "financing": asdict(c.financing),
     }
 
 
@@ -116,11 +126,12 @@ def build_baseline(session: LiveSession, now: datetime) -> Baseline:
     market = session.market()
     strategy = _strategy_for_backtest(session, market)
     stop = ProtectiveStop(c.risk.stop_distance) if c.risk.stop_distance > 0 else None
+    schedule = c.leverage.schedule(c.risk.max_gross)
     supervisor = RiskSupervisor(
         rules=(
             ShortSales(allowed=c.risk.allow_short),
             GrossExposureLimit(c.risk.max_gross),
-            NetExposureLimit(c.risk.min_net, c.risk.max_net),
+            NetExposureLimit(c.risk.min_net, c.risk.net_cap),
         ),
         stop=stop,
     )
@@ -132,6 +143,8 @@ def build_baseline(session: LiveSession, now: datetime) -> Baseline:
             time_in_force=c.execution.resolve(market.interval),
         ),
         supervisor=supervisor,
+        leverage=None if schedule.is_static_unlevered else schedule,
+        financing=c.financing.model(),
     )
     curve = result.equity_curve()
     equity = np.array([e for _, e in curve], dtype=float)
@@ -181,6 +194,9 @@ def build_baseline(session: LiveSession, now: datetime) -> Baseline:
         first_bar=moments[first].date().isoformat(),
         last_bar=moments[-1].date().isoformat(),
         built_at=now.isoformat(),
+        base_returns=[float(r) for r in result.base_returns()],
+        rotation_turnover=[float(t) for t in result.turnover()],
+        order_shares=[float(x) for x in result.order_shares()],
     )
 
 

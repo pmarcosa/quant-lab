@@ -16,9 +16,11 @@ The weekly cycle, in the order a person runs it:
 4. ``sync`` again after the fills, which places the new stops.
 
 **Nothing here decides to trade on its own.** ``approve`` requires a typed
-confirmation that no code path supplies. That is the propose-and-approve
-discretion mode; an automatic mode would be a different function, not a flag on
-this one.
+confirmation that no code path supplies. The automatic mode is a different
+module (``runtime.automation``), not a flag on this one: it passes the same
+:meth:`LiveSession.approvable` checks, then its own gates, and sends through the
+same :meth:`LiveSession.send` -- only after a person has armed it with a typed
+phrase, and never after a halt.
 
 **The sleeve is a sub-account.** The strategy manages ``sleeve_capital``, not the
 whole IBKR account. Its cash and positions are rebuilt from the journal; the
@@ -73,6 +75,11 @@ from runtime.strategies import build_strategy
 from runtime.wiring import Market, load_market
 
 TENANT = TenantId("user")
+
+#: The least intraday history an intraday strategy may trade on. The expert asks
+#: for three to five years: enough regimes, rate decisions and earnings seasons
+#: to judge a strategy on, however many bars one year holds.
+INTRADAY_MIN_YEARS = 3.0
 
 
 def now_utc() -> datetime:
@@ -133,6 +140,8 @@ class Proposal:
     target_weights: Mapping[str, float]
     findings: tuple[str, ...]
     fingerprint: str
+    #: Gross leverage the decision was sized to (1.0: no borrowing).
+    leverage: float = 1.0
 
     @property
     def is_empty(self) -> bool:
@@ -274,7 +283,7 @@ class LiveSession:
                 borrow_fees=borrow_fees or {}, max_borrow_fee=r.max_borrow_fee,
             ),
             GrossExposureLimit(maximum=r.max_gross),
-            NetExposureLimit(minimum=r.min_net, maximum=r.max_net),
+            NetExposureLimit(minimum=r.min_net, maximum=r.net_cap),
         ]
         if not state.permits_entries:
             rules.append(ReduceOnly(reason=f"the system is {state.value.replace('_', '-')}"))
@@ -289,16 +298,34 @@ class LiveSession:
         last = self.journal.last(EventKind.STATE_CHANGE)
         return DegradationState(last.payload["to"]) if last else DegradationState.NORMAL
 
-    def degrade(self, to: DegradationState, reason: str) -> DegradationState:
-        """Move down the ladder. Never up: see :meth:`clear`."""
+    def degrade(self, to: DegradationState, reason: str, by: str = "system") -> DegradationState:
+        """Move down the ladder. Never up: see :meth:`clear`.
+
+        A halt also disarms automation: after a halt nothing may resume on its
+        own, and that includes sending orders without a person.
+        """
         current = self.state()
         target = current.worst(to)
         if target is not current:
             self.journal.append(
                 EventKind.STATE_CHANGE, self.clock(),
-                {"from": current.value, "to": target.value, "reason": reason, "by": "system"},
+                {"from": current.value, "to": target.value, "reason": reason, "by": by},
             )
+            if target is DegradationState.HALTED and self.automation_scope() is not None:
+                self.journal.append(EventKind.AUTOMATION, self.clock(), {
+                    "action": "disarm", "reason": f"halted: {reason}", "by": "system",
+                })
         return target
+
+    def automation_scope(self) -> str | None:
+        """What automation is armed for now -- ``exits`` or ``full`` -- or ``None``."""
+        for event in reversed(self.journal.events(EventKind.AUTOMATION)):
+            action = event.payload.get("action")
+            if action == "arm":
+                return str(event.payload["scope"])
+            if action == "disarm":
+                return None
+        return None
 
     def restrict(self, to: DegradationState, reason: str) -> DegradationState:
         """A person moves the system *down* the ladder: a pause or a halt.
@@ -334,7 +361,8 @@ class LiveSession:
             return self.degrade(DegradationState.HALTED, "monitoring: " + reason)
         if current is DegradationState.HALTED:
             return current
-        if current is DegradationState.REDUCE_ONLY and set_by == "person":
+        if current is DegradationState.REDUCE_ONLY and set_by != "monitor":
+            # A person's pause, or the margin guard's: not monitoring's to lift.
             return current
         if recommended is not current:
             self.journal.append(
@@ -494,6 +522,7 @@ class LiveSession:
         # 3. Stops, then 4. a snapshot, then 5. reconciliation.
         placed, cancelled = self.place_stops()
         snapshot = self.snapshot()
+        notes.extend(self._margin_guard(snapshot.get("account_cushion")))
         reconciliation = self.reconcile()
         if reconciliation.status == "mismatch":
             self.degrade(
@@ -510,7 +539,7 @@ class LiveSession:
         )
 
     def snapshot(self) -> dict[str, Any]:
-        """Mark the sleeve at the latest closes and record it."""
+        """Accrue carrying costs, mark the sleeve at the latest closes, record it."""
         market = self.market()
         latest = market.schedule[-1]
         marks = market.window.marks_at(latest)
@@ -518,6 +547,8 @@ class LiveSession:
         missing = [str(i) for i in book.positions if i not in marks]
         if missing:
             raise ContractViolation(f"no price data to mark {missing}; refresh the data")
+        if self._accrue_financing(book, marks):
+            book = self.book()
         equity = book.equity(marks)
         account = self.broker.account_snapshot()
         payload = {
@@ -531,9 +562,94 @@ class LiveSession:
             ],
             "account_net_liquidation": account.net_liquidation,
             "account_cash": account.cash,
+            "account_maintenance_margin": getattr(account, "maintenance_margin", None),
+            "account_cushion": getattr(account, "cushion", None),
         }
         self.journal.append(EventKind.SNAPSHOT, self.clock(), payload)
         return payload
+
+    def readiness(self, market: Market | None = None) -> tuple[str, ...]:
+        """What an intraday strategy still lacks before it may trade; empty when ready.
+
+        The project's expert's prerequisites that the system can check:
+        the exchange's session calendar, and three to five years of intraday
+        history (the market's regimes are measured in calendar time, not in
+        bars). Daily and weekly strategies need neither and are always ready.
+        """
+        interval = self.interval
+        if not interval.is_intraday:
+            return ()
+        from data import calendar
+
+        problems = []
+        if not calendar.is_available():
+            problems.append(
+                "the exchange calendar is not installed (pip install -e \".[intraday]\")"
+            )
+        market = market or self.market()
+        span = (market.schedule[-1] - market.schedule[0]).days / 365.25 if market.schedule else 0
+        if span < INTRADAY_MIN_YEARS:
+            problems.append(
+                f"{span:.1f} years of {interval.frequency} history in the store; at least "
+                f"{INTRADAY_MIN_YEARS:g} are needed (`ql data backfill`)"
+            )
+        return tuple(problems)
+
+    def _margin_guard(self, cushion: float | None) -> list[str]:
+        """Stop new exposure while IBKR's margin cushion is thin; lift it once it is not.
+
+        IBKR liquidates without a call when the cushion reaches zero. Well
+        before that -- below ``leverage.cushion_critical`` -- nothing new is
+        opened, and the leverage rule sizes the next decision back to its
+        floor. The guard lifts its own reduce-only once the cushion is back
+        above ``leverage.cushion_warning``; it never lifts anyone else's.
+        """
+        if cushion is None:
+            return []
+        lv = self.config.leverage
+        state = self.state()
+        last = self.journal.last(EventKind.STATE_CHANGE)
+        if cushion < lv.cushion_critical and state.permits_entries:
+            self.degrade(
+                DegradationState.REDUCE_ONLY,
+                f"margin cushion {cushion:.0%} is below {lv.cushion_critical:.0%}: no new exposure",
+                by="margin",
+            )
+            return [f"margin cushion {cushion:.0%}: reduce-only"]
+        if (
+            state is DegradationState.REDUCE_ONLY and last is not None
+            and last.payload.get("by") == "margin" and cushion >= lv.cushion_warning
+        ):
+            self.journal.append(EventKind.STATE_CHANGE, self.clock(), {
+                "from": state.value, "to": DegradationState.NORMAL.value, "by": "margin",
+                "reason": f"margin cushion back to {cushion:.0%}",
+            })
+            return [f"margin cushion {cushion:.0%}: reduce-only lifted"]
+        return []
+
+    def _accrue_financing(self, book: Book, marks: Mapping[InstrumentId, float]) -> bool:
+        """Charge the sleeve for carrying borrowed cash or stock since the last snapshot.
+
+        The same model the backtest charges, so live and simulated returns pay
+        for leverage alike. It is an estimate of what IBKR bills: the sleeve's
+        debit and short value at the rates in ``financing``. The actual monthly
+        interest can be trued up with ``ql live adjust --cash-delta``.
+        """
+        if book.cash >= 0 and all(p.quantity > 0 for p in book.positions.values()):
+            return False
+        last = self.journal.last(EventKind.SNAPSHOT) or self.journal.last(EventKind.OPENED)
+        if last is None:
+            return False
+        now = self.clock()
+        charges = self.config.financing.model().charges(
+            book, {i: marks[i] for i in book.positions}, last.at, now
+        )
+        for charge in charges:
+            self.journal.append(EventKind.FINANCING, now, {
+                "amount": charge.amount, "kind": charge.kind.value, "detail": charge.detail,
+                "from": last.at.isoformat(), "through": now.isoformat(),
+            })
+        return bool(charges)
 
     # -- reconciliation ------------------------------------------------------
 
@@ -708,7 +824,7 @@ class LiveSession:
             raise ContractViolation(
                 "the last reconciliation is more than a day old; run `ql live sync` first"
             )
-        if self._rotation_orders_working():
+        if self.rotation_orders_working():
             raise ContractViolation(
                 "orders from the last approval are still working; wait for them to finish "
                 "and run `ql live sync`"
@@ -724,6 +840,20 @@ class LiveSession:
                 f"the latest complete {interval.noun} closed {age.total_seconds() / 3600:.0f} "
                 f"hours ago (limit {limit:.0f}); run `ql data refresh`"
             )
+        if interval.is_intraday:
+            missing = self.readiness(market)
+            if missing:
+                raise ContractViolation(
+                    "this intraday strategy is not ready to trade: " + "; ".join(missing)
+                )
+            from data import calendar
+
+            due = calendar.last_closed_bar(now, interval.duration)
+            if due is not None and moment < due:
+                raise ContractViolation(
+                    f"the {interval.noun} that closed at {due:%Y-%m-%d %H:%M} UTC is not in the "
+                    f"data yet (latest {moment:%Y-%m-%d %H:%M}); run `ql data refresh`"
+                )
 
         book = self.book()
         # The decision is taken on the latest complete week, but the sleeve may
@@ -739,6 +869,7 @@ class LiveSession:
         }
         tradable = set(market.window.fresh_at(moment)) - blocked
 
+        leverage, previous_leverage, _ = (1.0, None, None) if liquidate else self.leverage_now()
         if liquidate:
             decision_intents = self._liquidation_intents(book, moment)
             target: dict[str, float] = {}
@@ -751,6 +882,7 @@ class LiveSession:
                 policy=SizingPolicy(
                     time_in_force=self.config.execution.resolve(interval),
                     allow_short=self.config.risk.allow_short,
+                    leverage=leverage, previous_leverage=previous_leverage,
                 ),
             )
             decision_intents = decision.intents
@@ -781,7 +913,7 @@ class LiveSession:
                     f"This is a sanity bound; something upstream is wrong."
                 )
             orders.append(ProposedOrder(intent, price, value, share))
-        self._check_margin(book, [o.intent for o in orders])
+        self._check_margin(book, [o.intent for o in orders], marks)
 
         current = book.weights({i: marks[i] for i in book.positions}) if book.positions else {}
         fingerprint = book_fingerprint(book)
@@ -809,6 +941,7 @@ class LiveSession:
             target_weights=target,
             findings=tuple(f.line() for f in review.findings),
             fingerprint=fingerprint,
+            leverage=leverage,
         )
         self.journal.append(EventKind.PROPOSAL, now, {
             "proposal_id": proposal.proposal_id,
@@ -825,6 +958,7 @@ class LiveSession:
             "current_weights": proposal.current_weights,
             "target_weights": target,
             "findings": list(proposal.findings),
+            "leverage": leverage,
         })
         return proposal
 
@@ -850,29 +984,80 @@ class LiveSession:
             {i: found.get(i).fee_rate if found.get(i) else None for i in shorting},
         )
 
-    def _check_margin(self, book: Book, intents: Sequence[OrderIntent]) -> None:
-        """Refuse a proposal whose short sales the account cannot margin.
+    def _check_margin(
+        self, book: Book, intents: Sequence[OrderIntent],
+        marks: Mapping[InstrumentId, float] | None = None,
+    ) -> None:
+        """Refuse a proposal that borrows more than the account can margin.
 
-        Asked of the broker (IBKR's what-if order), not computed here: margin
-        rules differ by account type, instrument and house policy, and a local
-        approximation that is wrong in the permissive direction is worse than
-        none. Only short-opening orders are checked; long-only proposals are
-        funded by the sleeve's own cash, which sizing already respects.
+        Two things borrow: a short sale (stock) and a purchase the sleeve's cash
+        does not cover (cash). Either way the orders that add exposure are
+        priced by the broker with IBKR's what-if order, not computed here:
+        margin rules differ by account type, instrument and house policy, and a
+        local approximation that is wrong in the permissive direction is worse
+        than none. A proposal that borrows nothing is not asked about.
         """
-        shorts = [
+        opening = [
             i for i in intents
-            if i.side is Side.SELL and split_legs(book.quantity(i.instrument), i.side, i.quantity)[1] > 0
+            if split_legs(book.quantity(i.instrument), i.side, i.quantity)[1] > 0
         ]
-        if not shorts:
+        shorts = [i for i in opening if i.side is Side.SELL]
+        prices = marks or {}
+        cash_after = book.cash - sum(
+            i.side.sign * i.quantity * prices.get(i.instrument, 0.0) for i in intents
+        )
+        borrowing_cash = cash_after < 0 and any(i.side is Side.BUY for i in opening)
+        needs = opening if borrowing_cash else shorts
+        if not needs:
             return
         check = getattr(self.broker, "margin_check", None)
         if check is None:
             raise ContractViolation(
-                "this broker cannot report margin, so short sales cannot be checked; refused"
+                "this broker cannot report margin, so orders that borrow (short sales, or "
+                "buying beyond the sleeve's cash) cannot be checked; refused"
             )
-        verdict = check(shorts)
+        verdict = check(needs)
         if not verdict.ok:
             raise ContractViolation(f"margin check failed: {verdict.message}")
+
+    def _last_leverage(self) -> float:
+        """The leverage of the last approved proposal: what the book was built at."""
+        approved = {e.payload["proposal_id"] for e in self.journal.events(EventKind.APPROVAL)}
+        for event in reversed(self.journal.events(EventKind.PROPOSAL)):
+            if event.payload["proposal_id"] in approved and "leverage" in event.payload:
+                return float(event.payload["leverage"])
+        return 1.0
+
+    def leverage_now(self) -> tuple[float, float | None, float | None]:
+        """The leverage the next decision is sized to, the previous one, and the cushion.
+
+        The same rule the backtest applies (``risk.leverage.LeverageSchedule``),
+        fed the sleeve's own history: equity per bar from snapshots, and the
+        strategy's per-unit returns -- the baseline backtest's, then the live
+        ones -- for the tail-risk estimate. The cushion is IBKR's.
+        """
+        rule = self.config.leverage.schedule(self.config.risk.max_gross)
+        if rule.is_static_unlevered:
+            return 1.0, None, None
+        from contracts.risk import LeverageState
+        from runtime.monitor import Baseline, live_returns
+
+        previous = self._last_leverage()
+        _, equity, returns = live_returns(self)
+        base: list[float] = []
+        if self.config.baseline_path.exists():
+            try:
+                base = list(Baseline.load(self.config.baseline_path).base_returns)
+            except ContractViolation:
+                base = []
+        base += [r / max(previous, 1e-9) for r in returns]
+        account = self.broker.account_snapshot()
+        cushion = getattr(account, "cushion", None)
+        level = rule(LeverageState(
+            equity=equity or [self.config.sleeve_capital], base_returns=base,
+            previous=previous, cushion=cushion, bars_per_week=self.interval.bars_per_week,
+        ))
+        return level, previous, cushion
 
     def _liquidation_intents(self, book: Book, moment: datetime) -> tuple[OrderIntent, ...]:
         """Close everything the sleeve holds at the next open: sell longs, cover shorts."""
@@ -892,7 +1077,7 @@ class LiveSession:
             ))
         return tuple(intents)
 
-    def _rotation_orders_working(self) -> bool:
+    def rotation_orders_working(self) -> bool:
         last_status: dict[str, str] = {}
         for event in self.journal.events(EventKind.SUBMISSION, EventKind.ORDER_STATUS):
             last_status[event.payload["client_order_id"]] = event.payload.get("status", "submitted")
@@ -928,29 +1113,45 @@ class LiveSession:
         return proposal_id
 
     def pending_proposal(self):
-        """The latest proposal, if it has not been approved or rejected."""
-        decided = {
-            e.payload["proposal_id"]
-            for e in self.journal.events(EventKind.APPROVAL, EventKind.REJECTION)
-        }
+        """The latest proposal, if it is still undecided.
+
+        A proposal is decided by a rejection, by a person's approval, or once
+        every one of its orders has been sent. An automatic approval that sent
+        only the exits leaves it pending: its entries wait for a person.
+        """
         latest = self.journal.last(EventKind.PROPOSAL)
-        if latest is None or latest.payload["proposal_id"] in decided:
+        if latest is None:
+            return None
+        pid = latest.payload["proposal_id"]
+        if any(e.payload["proposal_id"] == pid for e in self.journal.events(EventKind.REJECTION)):
+            return None
+        approvals = [
+            e for e in self.journal.events(EventKind.APPROVAL) if e.payload["proposal_id"] == pid
+        ]
+        if any(not e.payload.get("partial") for e in approvals):
+            return None
+        sent = self.sent_orders(pid)
+        if approvals and all(row["client_order_id"] in sent for row in latest.payload["intents"]):
             return None
         return latest
 
-    def approve(self, proposal_id: str, typed: str) -> list[tuple[OrderIntent, Any]]:
-        """Send an approved proposal's orders. The only path to the market.
+    def sent_orders(self, proposal_id: str) -> set[str]:
+        """Order ids already sent for a proposal, by any approval."""
+        return {
+            oid
+            for e in self.journal.events(EventKind.APPROVAL)
+            if e.payload["proposal_id"] == proposal_id
+            for oid in e.payload.get("orders", ())
+        }
 
-        Refuses unless: the typed text is exactly the confirmation phrase; the
-        proposal is the latest and still undecided; it has not expired; no newer
-        bar has arrived since it was decided; the sleeve is exactly the one it
-        was computed against; and the system has not been halted since.
+    def approvable(self, proposal_id: str):
+        """The proposal's event, the book and the state, if it may still be sent.
+
+        Refuses unless: the proposal is the latest and still undecided; it has
+        not expired; no newer bar has arrived since it was decided; the sleeve
+        is exactly the one it was computed against; and the system has not been
+        halted since. Shared by a person's approval and an automatic one.
         """
-        expected = self.confirmation_phrase(proposal_id)
-        if typed.strip() != expected:
-            raise ContractViolation(
-                f"confirmation did not match; type exactly: {expected}"
-            )
         event = self.pending_proposal()
         if event is None or event.payload["proposal_id"] != proposal_id:
             raise ContractViolation(
@@ -981,21 +1182,52 @@ class LiveSession:
         liquidation = bool(event.payload.get("liquidation"))
         if not state.permits_proposals and not liquidation:
             raise ContractViolation("the system was halted after this proposal was made")
+        return event, book, state
 
-        intents = [intent_from_dict(row) for row in event.payload["intents"]]
+    def approve(self, proposal_id: str, typed: str) -> list[tuple[OrderIntent, Any]]:
+        """Send an approved proposal's orders -- those not already sent.
+
+        The typed text must be exactly the confirmation phrase; then every check
+        in :meth:`approvable` applies.
+        """
+        expected = self.confirmation_phrase(proposal_id)
+        if typed.strip() != expected:
+            raise ContractViolation(
+                f"confirmation did not match; type exactly: {expected}"
+            )
+        event, book, state = self.approvable(proposal_id)
+        sent = self.sent_orders(proposal_id)
+        intents = [
+            intent_from_dict(row) for row in event.payload["intents"]
+            if row["client_order_id"] not in sent
+        ]
         if not state.permits_entries:
             # Degraded after the proposal was made: keep only what closes
             # exposure, on either side of zero.
             intents = [
                 kept for kept in (
-                    _closing_part(i, book.quantity(i.instrument)) for i in intents
+                    closing_part(i, book.quantity(i.instrument)) for i in intents
                 ) if kept is not None
             ]
+        return self.send(event, intents, confirmation="typed", by="person", partial=False)
 
+    def send(
+        self, event, intents: Sequence[OrderIntent], confirmation: str, by: str, partial: bool
+    ) -> list[tuple[OrderIntent, Any]]:
+        """Record the approval, cancel stops on the same side, submit. No checks here.
+
+        Called only after :meth:`approvable` has passed, by :meth:`approve` or
+        by automation (``runtime.automation``). ``partial`` marks an approval
+        that leaves orders for a person.
+        """
+        proposal_id = event.payload["proposal_id"]
+        now = self.clock()
         self.journal.append(EventKind.APPROVAL, now, {
             "proposal_id": proposal_id,
             "orders": [i.client_order_id for i in intents],
-            "confirmation": "typed",
+            "confirmation": confirmation,
+            "by": by,
+            "partial": partial,
         })
 
         # Cancel-replace: a resting stop and an approved order on the same side
@@ -1069,7 +1301,7 @@ class LiveSession:
                     "reason": "stops disabled in the config",
                 })
             return 0, len(ours)
-        if self._rotation_orders_working():
+        if self.rotation_orders_working():
             return 0, 0  # wait until the rotation has filled before re-anchoring
 
         anchors = self._current_anchors()
@@ -1212,6 +1444,7 @@ class LiveSession:
             "mode": self.config.mode.value,
             "account": self.config.account,
             "state": self.state().value,
+            "automation": self.automation_scope(),
             "sleeve_equity": equity,
             "cash": book.cash,
             "positions": [
@@ -1252,7 +1485,7 @@ class LiveSession:
         return {name: level for name, (_, level) in live.items()}
 
 
-def _closing_part(intent: OrderIntent, held: float) -> OrderIntent | None:
+def closing_part(intent: OrderIntent, held: float) -> OrderIntent | None:
     """The part of an order that reduces exposure, or ``None`` if it only adds."""
     closing, opening = split_legs(held, intent.side, intent.quantity)
     if closing <= 0:

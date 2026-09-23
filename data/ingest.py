@@ -97,11 +97,29 @@ def bar_close(
                 f"intraday bar label {label!r} has no timezone; intraday data must "
                 f"arrive with explicit UTC timestamps"
             )
-        return (stamp + kind.duration).to_pydatetime().astimezone(timezone.utc)
+        close = (stamp + kind.duration).to_pydatetime().astimezone(timezone.utc)
+        return _within_session(stamp.to_pydatetime(), close)
     day = pd.Timestamp(label).date()
     if kind is BarInterval.WEEK:
         day = day + timedelta(days=4 - day.weekday())
     return datetime.combine(day, US_SESSION_CLOSE.replace(tzinfo=None), tzinfo=timezone.utc)
+
+
+def _within_session(start: datetime, close: datetime) -> datetime:
+    """An intraday bar ends at the session close if that comes first.
+
+    The last hourly bar of a session runs 15:30-16:00, and every bar on a half
+    day ends by 13:00. Without the exchange calendar the nominal close is kept:
+    later than the truth, so never a look-ahead, only a later decision.
+    """
+    from data import calendar
+
+    if not calendar.is_available():
+        return close
+    bounds = calendar.session_bounds(pd.Timestamp(start).tz_convert("America/New_York").date())
+    if bounds is None:
+        return close
+    return min(close, bounds[1])
 
 
 def to_observations(

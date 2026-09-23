@@ -205,3 +205,111 @@ def test_a_daily_long_short_strategy_is_monitored_in_days(tmp_path):
     assert report.assessment.periods == len(report.returns) >= 3
     assert report.process.stop_coverage == 1.0, "longs and shorts are both protected"
     assert report.health.last_reconciliation == "ok"
+
+
+# -- the session calendar and intraday readiness ----------------------------------------------
+
+calendar = pytest.importorskip("data.calendar")
+needs_calendar = pytest.mark.skipif(not calendar.is_available(), reason="exchange_calendars")
+
+
+@needs_calendar
+def test_the_calendar_knows_holidays_and_half_days():
+    from datetime import date
+
+    assert calendar.session_bounds(date(2026, 11, 26)) is None, "Thanksgiving"
+    opened, closed = calendar.session_bounds(date(2026, 11, 27))
+    assert calendar.is_early_close(date(2026, 11, 27)) and closed.hour == 18, "13:00 New York"
+    assert calendar.in_regular_session(datetime(2026, 9, 22, 14, 30, tzinfo=UTC))
+    assert not calendar.in_regular_session(datetime(2026, 9, 22, 12, 0, tzinfo=UTC)), "pre-market"
+
+
+@needs_calendar
+def test_the_last_closed_bar_skips_nights_weekends_and_holidays():
+    hour = timedelta(hours=1)
+    assert calendar.last_closed_bar(datetime(2026, 9, 22, 16, 10, tzinfo=UTC), hour) == datetime(
+        2026, 9, 22, 15, 30, tzinfo=UTC)
+    assert calendar.last_closed_bar(datetime(2026, 11, 26, 15, 0, tzinfo=UTC), hour) == datetime(
+        2026, 11, 25, 21, 0, tzinfo=UTC), "Thanksgiving: the previous session's close"
+
+
+@needs_calendar
+def test_an_hourly_bar_ends_at_the_session_close_if_that_comes_first():
+    last = datetime(2026, 9, 22, 19, 30, tzinfo=UTC)  # 15:30 New York
+    assert bar_close(last, interval=BarInterval.HOUR) == datetime(2026, 9, 22, 20, 0, tzinfo=UTC)
+    half_day = datetime(2026, 11, 27, 17, 30, tzinfo=UTC)  # 12:30 on a 13:00 close
+    assert bar_close(half_day, interval=BarInterval.HOUR) == datetime(2026, 11, 27, 18, 0, tzinfo=UTC)
+
+
+def hourly_frame(start: str, end: str, price: float = 100.0) -> pd.DataFrame:
+    """Hourly regular-session bars between two dates, plus one pre-market bar a day."""
+    rows = {}
+    for day in pd.bdate_range(start, end):
+        bounds = calendar.session_bounds(day.date())
+        if bounds is None:
+            continue
+        opened, closed = bounds
+        rows[pd.Timestamp(opened) - pd.Timedelta(hours=2)] = price  # pre-market
+        t = pd.Timestamp(opened)
+        while t < pd.Timestamp(closed):
+            rows[t] = price
+            t += pd.Timedelta(hours=1)
+            price *= 1.0001
+    frame = pd.DataFrame({"close": pd.Series(rows)})
+    frame["open"] = frame["close"]
+    frame["high"] = frame["close"] * 1.001
+    frame["low"] = frame["close"] * 0.999
+    frame["volume"] = 1e5
+    return frame[["open", "high", "low", "close", "volume"]]
+
+
+@needs_calendar
+def test_backfill_pages_back_paced_resumable_and_regular_hours_only(tmp_path):
+    pytest.importorskip("ib_async")
+    from contracts.live import TradingMode
+    from execution.ibkr import IBKRBroker
+    from runtime.refresh import backfill
+    from tests.fake_gateway import FakeGateway
+
+    gateway = FakeGateway()
+    gateway.serve_intraday("AAA", hourly_frame("2024-06-03", "2026-09-18"))
+    broker = IBKRBroker(gateway, "DU1234567", TradingMode.PAPER, settle_seconds=0)
+    now = datetime(2026, 9, 19, 12, tzinfo=UTC)
+    waits = []
+    (result,) = backfill(broker, tmp_path, BarInterval.HOUR, now, years=3, symbols=["AAA"],
+                         chunk="1 Y", sleep=waits.append)
+    assert result.exhausted, "the broker ran out of history before three years"
+    assert result.first_bar.startswith("2024-06-03T13:30"), "the first regular bar, not pre-market"
+    assert result.requests == 4 and len(waits) == 3 and all(w >= 10 for w in waits)
+    cached = pd.read_csv(tmp_path / "hourly" / "AAA.csv", parse_dates=["timestamp"])
+    assert len(cached) == result.bars_added
+    again = backfill(broker, tmp_path, BarInterval.HOUR, now, years=3, symbols=["AAA"],
+                     chunk="1 Y", sleep=waits.append)[0]
+    assert again.bars_added == 0, "resumes from the earliest cached bar"
+
+
+def test_an_intraday_strategy_is_not_ready_without_years_of_history(tmp_path):
+    from types import SimpleNamespace
+
+    from contracts.live import TradingMode
+    from runtime.config import LiveConfig
+    from runtime.live import LiveSession
+    from tests.toy_strategies import DailyLongShort
+
+    class Hourly(DailyLongShort):
+        @property
+        def filtration_spec(self):
+            from contracts.temporal import FiltrationSpec
+
+            return FiltrationSpec(interval=BarInterval.HOUR, observation_lag_bars=0)
+
+    config = LiveConfig(strategy_id="hourly", mode=TradingMode.PAPER, account="DU1234567",
+                        sleeve_capital=1.0, state_dir=tmp_path)
+    session = LiveSession(config, None, tmp_path, strategy_factory=lambda _: Hourly())
+    one_year = SimpleNamespace(schedule=[datetime(2025, 9, 19, tzinfo=UTC),
+                                         datetime(2026, 9, 18, tzinfo=UTC)])
+    problems = session.readiness(one_year)
+    assert any("1.0 years of hourly history" in p for p in problems)
+    five = SimpleNamespace(schedule=[datetime(2021, 9, 17, tzinfo=UTC),
+                                     datetime(2026, 9, 18, tzinfo=UTC)])
+    assert session.readiness(five) == () or not calendar.is_available()

@@ -30,6 +30,8 @@ from typing import Any
 
 from contracts.errors import ContractViolation, StateIntegrityError
 from contracts.execution import (
+    Charge,
+    ChargeKind,
     Fill,
     OrderIntent,
     OrderType,
@@ -222,10 +224,11 @@ def fill_from_dict(row: Mapping[str, Any]) -> Fill:
 def sleeve_book(journal: Journal, portfolio: PortfolioId) -> Book:
     """The sleeve's cash and positions, rebuilt from the journal alone.
 
-    Only three kinds of event move it: the opening balance, fills, and recorded
-    adjustments. Everything else — proposals, approvals, statuses — is context.
-    That is what makes the book explainable: every share can be traced to one of
-    those three.
+    Only four kinds of event move it: the opening balance, fills, recorded
+    adjustments, and financing charges (interest on borrowed cash, borrow fees).
+    Everything else — proposals, approvals, statuses — is context. That is what
+    makes the book explainable: every share and every dollar can be traced to
+    one of those four.
 
     Raises:
         StateIntegrityError: If there is no opening balance, or more than one.
@@ -257,6 +260,12 @@ def sleeve_book(journal: Journal, portfolio: PortfolioId) -> Book:
             book = book.apply(fill)
         elif event.kind is EventKind.ADJUSTMENT:
             book = _adjusted(book, event)
+        elif event.kind is EventKind.FINANCING:
+            at = max(event.at, book.as_of)
+            book = book.charge(Charge(
+                at=at, amount=float(event.payload["amount"]),
+                kind=ChargeKind(event.payload["kind"]), detail=event.payload.get("detail", ""),
+            ))
     assert book is not None
     return book
 

@@ -362,6 +362,41 @@ class Fill:
         return gross - self.commission
 
 
+class ChargeKind(str, Enum):
+    """Why cash left the account without shares changing hands."""
+
+    MARGIN_INTEREST = "margin_interest"  # interest on a debit balance (borrowed cash)
+    BORROW_FEE = "borrow_fee"            # the lender's fee on stock borrowed for a short
+
+
+@dataclass(frozen=True, slots=True)
+class Charge:
+    """A cost of carrying the book: interest on borrowed cash, a borrow fee.
+
+    Like a fill, a charge is an event, and applying the same charges in the same
+    order always gives the same cash. It exists because leverage and shorts cost
+    money every day they are held, not only when they trade: a backtest that
+    charges only at the fill makes a levered or short book look cheaper than it
+    is, by exactly the amount the broker bills at month end.
+
+    Attributes:
+        at: When the charge accrued up to.
+        amount: What it cost, positive. Refunds are not modelled.
+        kind: What it is for.
+        detail: The basis, for the record (balance, rate, days).
+    """
+
+    at: datetime
+    amount: float
+    kind: ChargeKind
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "at", utc(self.at))
+        if not self.amount >= 0:
+            raise ContractViolation(f"a charge is a cost and cannot be negative; got {self.amount}")
+
+
 @dataclass(frozen=True, slots=True)
 class PositionLedgerEntry:
     """What the ledger holds after reconciling fills. The only source of truth.

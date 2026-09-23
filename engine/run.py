@@ -20,18 +20,19 @@ Two ordering rules are load-bearing:
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
 
 from contracts.errors import ContractViolation
 from contracts.execution import Fill, OrderIntent, Side
 from contracts.identifiers import InstrumentId, PortfolioId, RunId
-from contracts.risk import PositionRisk, RiskReview
+from contracts.risk import LeveragePolicy, LeverageState, PositionRisk, RiskReview
 from contracts.strategy import Strategy
 from contracts.temporal import Filtration, utc
 from engine.accounting import Book
 from engine.decide import DEFAULT_SIZING, Decision, SizingPolicy, decide
+from engine.financing import FinancingModel, gross_leverage
 
 #: Builds the view of the world pinned at one decision time.
 FiltrationAt = Callable[[datetime], Filtration]
@@ -85,6 +86,14 @@ class Step:
     marked_at: datetime
     stopped_out: tuple[str, ...] = ()
     risk_findings: tuple[str, ...] = ()
+    #: The leverage this decision was sized to, and the modelled margin
+    #: cushion when it was taken (``None`` without a financing model).
+    leverage: float = 1.0
+    cushion: float | None = None
+    #: What carrying the book through the bar cost: interest and borrow fees.
+    financing: float = 0.0
+    #: Gross exposure of ``book_after``, longs plus shorts over equity.
+    gross_after: float = 0.0
 
     @property
     def intents(self) -> tuple[OrderIntent, ...]:
@@ -122,6 +131,58 @@ class RunResult:
     def decisions(self) -> tuple[Decision, ...]:
         return tuple(step.decision for step in self.steps)
 
+    @property
+    def financing_paid(self) -> float:
+        """Interest on borrowed cash and borrow fees, over the whole run."""
+        return sum(step.financing for step in self.steps)
+
+    def base_returns(self) -> list[float]:
+        """Per-bar returns per unit of gross exposure held through the bar.
+
+        The strategy's own risk with leverage divided out: what a tail-risk
+        leverage rule measures. Bars that began (nearly) in cash say nothing
+        about it and are left out.
+        """
+        out = []
+        previous_equity, previous_gross = self.opening_equity, 0.0
+        for step in self.steps:
+            if previous_equity > 0 and previous_gross > 0.05:
+                out.append((step.equity_after / previous_equity - 1.0) / previous_gross)
+            previous_equity, previous_gross = step.equity_after, step.gross_after
+        return out
+
+    def turnover(self) -> list[float]:
+        """Per step with non-stop fills: value traded over equity before it."""
+        out = []
+        previous_equity = self.opening_equity
+        for step in self.steps:
+            traded = sum(
+                f.quantity * f.price for f in step.fills if not f.client_order_id.endswith("-stop")
+            )
+            if traded > 0 and previous_equity > 0:
+                out.append(traded / previous_equity)
+            previous_equity = step.equity_after
+        return out
+
+    def order_shares(self) -> list[float]:
+        """Each non-stop fill's value over the equity before its step."""
+        out = []
+        previous_equity = self.opening_equity
+        for step in self.steps:
+            if previous_equity > 0:
+                out.extend(
+                    f.quantity * f.price / previous_equity for f in step.fills
+                    if not f.client_order_id.endswith("-stop")
+                )
+            previous_equity = step.equity_after
+        return out
+
+    @property
+    def min_cushion(self) -> float | None:
+        """The thinnest modelled margin cushion any decision saw."""
+        seen = [s.cushion for s in self.steps if s.cushion is not None]
+        return min(seen) if seen else None
+
 
 def run_backtest(
     *,
@@ -138,6 +199,9 @@ def run_backtest(
     supervisor: RiskSupervision | None = None,
     policy: SizingPolicy = DEFAULT_SIZING,
     highs_at: PricesAt | None = None,
+    leverage: LeveragePolicy | None = None,
+    financing: FinancingModel | None = None,
+    bars_per_week: float = 1.0,
 ) -> RunResult:
     """Run ``strategy`` over ``schedule``, one decision per entry.
 
@@ -159,6 +223,14 @@ def run_backtest(
         supervisor: Optional risk layer. It sees each decision before the orders
             are sent and may only reduce exposure; the contract enforces that.
         policy: Sizing rules.
+        leverage: Sets the gross exposure of each decision from the history so
+            far (``risk.leverage.LeverageSchedule``). Without one, the policy's
+            own ``leverage`` applies throughout.
+        financing: Charges interest on borrowed cash and fees on borrowed
+            stock for every bar the book carries them, and models the margin
+            cushion. Without one, carrying a levered or short book is free --
+            which only a long-only, fully paid book can honestly assume.
+        bars_per_week: For the leverage policy's per-week speeds.
 
     Returns:
         Every step in order, with the books before and after.
@@ -191,10 +263,29 @@ def run_backtest(
     opening_equity = opening.equity(
         {i: marks_at(opening.as_of)[i] for i in opening.positions}
     )
+    # The history a leverage policy may look at: equity per bar, and returns
+    # per unit of gross exposure (the strategy's own risk, leverage divided out).
+    equity_history: list[float] = [opening_equity]
+    gross_history: list[float] = [0.0]
+    base_returns: list[float] = []
+    applied_leverage = policy.leverage
 
     for index, moment in enumerate(moments):
         filtration = filtration_at(moment)
         marks = marks_at(moment)
+        cushion = (
+            financing.cushion(book, {**marks, **_held_marks(book, marks)})
+            if financing is not None else None
+        )
+        previous_leverage = applied_leverage
+        if leverage is not None:
+            applied_leverage = leverage(LeverageState(
+                equity=tuple(equity_history), base_returns=tuple(base_returns),
+                previous=previous_leverage, cushion=cushion, bars_per_week=bars_per_week,
+            ))
+        sizing = policy if leverage is None else replace(
+            policy, leverage=applied_leverage, previous_leverage=previous_leverage
+        )
         decision = decide(
             run=run,
             book=book.at(moment),
@@ -203,7 +294,7 @@ def run_backtest(
             marks=marks,
             constraints_for=broker.constraints,
             tradable=_tradable(tradable_at, moment, marks, stopped_since_rotation),
-            policy=policy,
+            policy=sizing,
         )
 
         # Orders decided on this close reach the market at the next one. The last
@@ -235,13 +326,26 @@ def run_backtest(
                 resting_stops.pop(oid, None)
 
         fills: tuple[Fill, ...] = ()
+        carried = 0.0
         for intent in intents:
             broker.submit(intent)
         if has_next:
             lows = None if lows_at is None else lows_at(execution_time)
             highs = None if highs_at is None else highs_at(execution_time)
             fills = broker.advance(execution_time, execution_at(execution_time), lows, highs)
+            if financing is not None:
+                # The book as it stood through the bar pays for being carried,
+                # priced where the bar ended.
+                prices_then = {**marks, **execution_at(execution_time)}
+                charges = financing.charges(
+                    book, _held_marks(book, prices_then), moment, execution_time
+                )
+            else:
+                charges = ()
             book = book.at(execution_time).apply_all(fills)
+            for charge in charges:
+                book = book.charge(charge)
+                carried += charge.amount
 
         stopped = tuple(
             str(f.instrument) for f in fills if f.client_order_id.endswith("-stop")
@@ -283,24 +387,42 @@ def run_backtest(
 
         marked_at = execution_time if has_next else moment
         prices = execution_at(marked_at) if has_next else marks
+        valued = {i: prices.get(i, marks[i]) for i in book.positions}
+        equity_after = book.equity(valued)
+        gross_after = gross_leverage(book, valued) if book.positions else 0.0
         steps.append(
             Step(
                 decision=decision,
                 fills=fills,
                 book_before=before,
                 book_after=book,
-                equity_after=book.equity(
-                    {i: prices.get(i, marks[i]) for i in book.positions}
-                ),
+                equity_after=equity_after,
                 marked_at=marked_at,
                 stopped_out=stopped,
                 risk_findings=findings,
+                leverage=applied_leverage,
+                cushion=cushion,
+                financing=carried,
+                gross_after=gross_after,
             )
         )
+        previous_equity, previous_gross = equity_history[-1], gross_history[-1]
+        if previous_equity > 0 and previous_gross > 0.05:
+            base_returns.append((equity_after / previous_equity - 1.0) / previous_gross)
+        equity_history.append(equity_after)
+        gross_history.append(gross_after)
 
     return RunResult(
         run=run, portfolio=opening.portfolio, steps=tuple(steps), opening_equity=opening_equity
     )
+
+
+def _held_marks(book: Book, prices: Mapping[InstrumentId, float]) -> dict[InstrumentId, float]:
+    """Prices for every held instrument, or a clear error naming the missing one."""
+    missing = sorted(str(i) for i in book.positions if i not in prices)
+    if missing:
+        raise ContractViolation(f"no price to carry the book for {missing}")
+    return {i: prices[i] for i in book.positions}
 
 
 def _tradable(

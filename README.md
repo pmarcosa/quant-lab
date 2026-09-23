@@ -13,8 +13,9 @@ object (a `Filtration`) instead of a convention people remember to follow.
 Status: **phases 0–5 complete** — contracts and data, the engine, the
 falsification funnel and research ledger, a risk layer that may only reduce
 exposure, and live trading through IBKR with monitoring and reports. Execution
-is proposal-plus-typed-approval: the system computes orders, and only a person
-typing the proposal's code sends them.
+is proposal-plus-typed-approval by default: the system computes orders, and a
+person typing the proposal's code sends them. An automatic mode exists, off
+unless the config allows it *and* a person arms it; a halt disarms it.
 
 **To use it, read [docs/MANUAL.md](docs/MANUAL.md).** Everything runs through
 one command, `ql` (`pip install -e ".[dev]"`, then `ql --help`).
@@ -31,7 +32,7 @@ python scripts/reconcile_conventions.py   # prices the execution conventions
 python scripts/run_funnel.py              # five gates, on the real data
 python scripts/compare_stops.py           # what a protective stop actually buys
 python scripts/backtest_momentum.py --freq weekly --rebalance-weeks 4 --start 2009-02-24
-pytest -q                                 # 583 tests
+pytest -q                                 # 630 tests
 ```
 
 `demo_causality.py` proves three things against 17 years of real IBKR bars:
@@ -280,6 +281,22 @@ statement says which strategy sent what. Two strategies in one account are
 refused by configuration: the broker would net their orders, and splitting fills
 between virtual sub-accounts is machinery deliberately not built.
 
+**Leverage.** Off by default. When on, the expert's rule sets it: a hard cap
+(`risk.max_gross`), a fixed or tail-risk-targeted level, convex de-leveraging
+past a 10% drawdown, instant cuts and slow rebuilds, and IBKR's margin cushion
+overriding everything. Borrowed cash and stock are charged every bar in
+backtests and accrued in the live sleeve. On the momentum strategy, 1.3x
+raised the 2009-2026 CAGR from 20% to 25% and the drawdown from 24% to 31%,
+at the same Sharpe ratio.
+
+**Automation.** `ql live cycle` runs refresh, sync, monitor and propose in one
+idempotent command, and a Mac launch job can run it on a schedule. Armed for
+`exits`, it sends exposure-reducing orders on its own; armed for `full`, it sends
+everything its gates pass (a clean recent reconciliation, the ladder, the margin
+cushion, order size and turnover within the backtest's own extremes). A bar
+below the backtest's 0.5% quantile halts. Live `full` needs eight weeks of clean
+automatic exits first.
+
 **Any bar size, either side.** The deployed strategy is weekly and long-only;
 the system is neither. The bar size comes from the strategy and drives the data
 refresh, the order type (opening auction for daily and weekly bars, day orders
@@ -308,11 +325,14 @@ from a versioned JSON document.
 
 - **Delisted instruments.** The universe carries survivorship bias until
   point-in-time data is bought.
-- **Borrow costs in backtests.** Shorts are backtested without borrow fees,
-  margin interest or recalls, so a short strategy's backtest is optimistic.
-- **Intraday readiness.** No exchange calendar (holidays, half days) and only
-  IBKR's short intraday history. The plumbing handles hourly and minute bars;
-  validating a strategy on them needs data this project does not have.
+- **Hard-to-borrow costs in backtests.** Shorts pay a flat borrow fee; the
+  higher fees of hard-to-borrow names, and recalls, are not modelled.
+- **An intraday strategy.** The session calendar, a paced backfill of years of
+  intraday history, the readiness checks and an hourly schedule are built. What
+  is not: an intraday strategy validated through the funnel with an intraday
+  cost model (spread and square-root impact), and a continuous runner for
+  minute bars.
 - **Borrow fees live.** The TWS API rarely reports them; the fee limit applies
   only when it does.
-- **Automatic execution.** Not planned: approval stays manual by design.
+- **A remote runner.** Automation runs on the Mac that runs IB Gateway; a machine that is
+  off misses its runs. A server would remove that dependency and is not set up.

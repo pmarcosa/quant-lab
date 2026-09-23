@@ -20,6 +20,12 @@ wrong order. The checks that matter most:
   one account need virtual sub-portfolios with netting and pro-rata fills,
   which are not built; separate linked accounts are the chosen design.
 - **the sleeve is bounded.** The strategy trades a declared amount of capital.
+- **leverage is capped twice.** ``leverage.target`` may not exceed
+  ``risk.max_gross``, and the gross-exposure rule enforces the cap on every
+  decision whatever the leverage schedule asks for.
+- **automation is opt-in, twice.** ``automation.mode`` is the most the system
+  may do without a person; nothing is automatic until a person also *arms* it
+  with a typed phrase (``ql live auto arm``).
 """
 
 from __future__ import annotations
@@ -106,10 +112,16 @@ class ExecutionSettings:
 class RiskSettings:
     stop_distance: float = 0.12
     max_gross: float = 1.0
-    #: Net exposure band, longs minus shorts over equity. Binds only for
-    #: strategies that can be short; for long-only ones the top equals gross.
-    max_net: float = 1.0
+    #: Net exposure band, longs minus shorts over equity. ``max_net`` empty
+    #: means "the same as ``max_gross``": for a long-only book net *is* gross,
+    #: so a separate, lower cap would silently forbid the leverage the gross
+    #: cap allows.
+    max_net: float | None = None
     min_net: float = -1.0
+
+    @property
+    def net_cap(self) -> float:
+        return self.max_gross if self.max_net is None else self.max_net
     #: Short sales are refused unless this is on. The account must also be a
     #: margin account; IBKR refuses shorts in a cash account.
     allow_short: bool = False
@@ -120,6 +132,98 @@ class RiskSettings:
     #: far above what the strategy ever asks for; it exists to stop a unit error
     #: from becoming an order.
     max_order_fraction: float = 0.6
+
+
+@dataclass(frozen=True, slots=True)
+class LeverageSettings:
+    """How much of the strategy's intent to hold, above or at 100% gross.
+
+    Defaults hold exactly the strategy's weights: no borrowing. See
+    ``risk.leverage.LeverageSchedule`` for each setting and where it comes from.
+    The hard cap is ``risk.max_gross``, not a setting here.
+    """
+
+    target: float = 1.0
+    cvar_target: float | None = None
+    drawdown_start: float = 0.10
+    drawdown_full: float = 0.35
+    convexity: float = 2.0
+    step_up_per_week: float = 0.05
+    floor: float = 1.0
+    cushion_warning: float = 0.35
+    cushion_critical: float = 0.25
+
+    def schedule(self, maximum: float):
+        from risk.leverage import LeverageSchedule
+
+        return LeverageSchedule(
+            target=self.target, maximum=maximum, cvar_target=self.cvar_target,
+            drawdown_start=self.drawdown_start, drawdown_full=self.drawdown_full,
+            convexity=self.convexity, step_up_per_week=self.step_up_per_week,
+            floor=min(self.floor, maximum), cushion_warning=self.cushion_warning,
+            cushion_critical=self.cushion_critical,
+        )
+
+    @property
+    def borrows(self) -> bool:
+        """Whether this can ever ask for more than 100% gross."""
+        return self.target > 1.0 or self.cvar_target is not None
+
+
+@dataclass(frozen=True, slots=True)
+class FinancingSettings:
+    """Annual carrying costs, charged in backtests and accrued in the live sleeve.
+
+    ``margin_rate``: interest on borrowed cash. IBKR Pro, USD, first tier, was
+    5.38% (benchmark + 1.5%) in September 2026; check the current rate and
+    your tier. ``borrow_fee``: the fee on shorted stock, a general-collateral
+    assumption -- hard-to-borrow names cost far more.
+    """
+
+    margin_rate: float = 0.055
+    borrow_fee: float = 0.005
+
+    def model(self):
+        from engine.financing import FinancingModel
+
+        return FinancingModel(margin_rate=self.margin_rate, borrow_fee=self.borrow_fee)
+
+
+#: What automation may do, in increasing order. The project's expert: automate
+#: exits first, then everything, and only on evidence from the first stage.
+AUTOMATION_MODES = ("manual", "exits", "full")
+
+
+@dataclass(frozen=True, slots=True)
+class AutomationSettings:
+    """The most the system may do without a person, and the gates it must pass.
+
+    ``mode`` is a ceiling, not a switch: nothing runs unattended until a person
+    arms it (``ql live auto arm``), and a halt disarms it. Every threshold here
+    is from the project's expert, adapted where noted in ``runtime/automation.py``.
+    """
+
+    mode: str = "manual"
+    #: No automatic order may open more than this share of equity. Empty: 10%
+    #: more than the largest order the baseline backtest ever sent. The expert
+    #: suggests 5% for strategies that slice orders; a concentrated book opens
+    #: 25-50% positions by design, so the bound follows what the strategy does.
+    max_order_fraction: float | None = None
+    #: A cycle whose turnover exceeds this percentile of the backtest's
+    #: rotations is held for a person rather than sent.
+    turnover_percentile: float = 0.99
+    #: At most this many orders in one automatic cycle.
+    max_orders: int = 20
+    #: A bar whose sleeve return is below this percentile of the backtest's
+    #: per-bar returns halts the system -- the loss circuit breaker.
+    loss_breaker_percentile: float = 0.005
+    #: No automatic entries below this margin cushion.
+    min_cushion: float = 0.35
+    #: Evidence required in live mode before arming ``full``: this many weeks
+    #: armed for ``exits``, with no reconciliation mismatch, and exit
+    #: shortfall at most this multiple of the modelled cost.
+    graduation_weeks: float = 8.0
+    graduation_shortfall_multiple: float = 1.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,6 +292,9 @@ class LiveConfig:
     execution: ExecutionSettings = field(default_factory=ExecutionSettings)
     risk: RiskSettings = field(default_factory=RiskSettings)
     monitoring: MonitoringSettings = field(default_factory=MonitoringSettings)
+    leverage: LeverageSettings = field(default_factory=LeverageSettings)
+    financing: FinancingSettings = field(default_factory=FinancingSettings)
+    automation: AutomationSettings = field(default_factory=AutomationSettings)
     #: Hours a proposal stays approvable. Orders go to the opening auction, so a
     #: proposal made on Saturday must still be valid on Monday morning. Approval
     #: is also refused as soon as a newer bar exists, whatever this says.
@@ -256,8 +363,40 @@ class LiveConfig:
             raise ContractViolation("config: risk.max_order_fraction must be in (0, 1]")
         if r.max_gross <= 0:
             raise ContractViolation("config: risk.max_gross must be positive")
-        if not r.min_net <= r.max_net:
+        if not r.min_net <= r.net_cap:
             raise ContractViolation("config: risk.min_net must not exceed risk.max_net")
+        lv = self.leverage
+        if lv.target > r.max_gross:
+            raise ContractViolation(
+                f"config: leverage.target {lv.target} is above risk.max_gross {r.max_gross}, "
+                f"the hard cap; raise the cap deliberately or lower the target"
+            )
+        if lv.borrows and r.max_gross <= 1.0:
+            raise ContractViolation(
+                "config: leverage asks to borrow but risk.max_gross is 1.0, which forbids it"
+            )
+        if lv.borrows and not r.allow_short and r.net_cap < r.max_gross:
+            raise ContractViolation(
+                f"config: risk.max_net {r.net_cap} is below risk.max_gross {r.max_gross}; for a "
+                f"long-only book net equals gross, so the lower cap would forbid the leverage. "
+                f"Remove risk.max_net or raise it."
+            )
+        try:
+            lv.schedule(r.max_gross)
+            self.financing.model()
+        except ContractViolation as error:
+            raise ContractViolation(f"config: {error}") from error
+        a = self.automation
+        if a.mode not in AUTOMATION_MODES:
+            raise ContractViolation(
+                f"config: automation.mode must be one of {', '.join(AUTOMATION_MODES)}"
+            )
+        if a.max_order_fraction is not None and not 0 < a.max_order_fraction <= r.max_order_fraction:
+            raise ContractViolation(
+                "config: automation.max_order_fraction must be in (0, risk.max_order_fraction]"
+            )
+        if not 0.5 < a.turnover_percentile <= 1.0 or not 0 < a.loss_breaker_percentile < 0.5:
+            raise ContractViolation("config: automation percentiles are out of range")
         m = self.monitoring
         if not 0.5 < m.reduce_percentile < m.halt_percentile < 1:
             raise ContractViolation(
@@ -310,6 +449,9 @@ def load_config(path: Path | None = None) -> LiveConfig:
             execution=ExecutionSettings(**(raw.get("execution") or {})),
             risk=RiskSettings(**(raw.get("risk") or {})),
             monitoring=MonitoringSettings(**_monitoring(raw.get("monitoring") or {})),
+            leverage=LeverageSettings(**(raw.get("leverage") or {})),
+            financing=FinancingSettings(**(raw.get("financing") or {})),
+            automation=AutomationSettings(**(raw.get("automation") or {})),
             proposal_ttl_hours=float(raw.get("proposal_ttl_hours", 60.0)),
             account_scope=str(raw.get("account_scope", "dedicated")).lower(),
             unmanaged=frozenset(s.upper() for s in raw.get("unmanaged") or ()),

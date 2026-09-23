@@ -59,9 +59,11 @@ or minute bars, and can hold short positions when its config allows it.
 Section 7.6 says what changes.
 
 **How it trades.** The system *proposes*, and you *approve* by typing a code.
-Nothing reaches the market any other way: no automatic mode exists, and no flag
-creates one. Orders are market-on-open orders (MOO), so they fill in Monday's
-opening auction. That is exactly how the backtest assumes they fill, so live
+That is the default, and nothing changes it but you, twice: the strategy's config
+must allow automation (`automation.mode`), *and* you must arm it with a typed
+phrase (`ql live auto arm`, step 9.9). Armed, `ql live cycle` sends what its
+safety gates allow; a halt disarms it. Orders are market-on-open orders (MOO), so
+they fill in Monday's opening auction. That is exactly how the backtest assumes they fill, so live
 fills and simulated fills can be compared honestly.
 
 **The sleeve.** The strategy manages a fixed amount of capital inside its IBKR
@@ -129,7 +131,8 @@ pip install -e ".[dev]"
 ```
 
 This installs the project and its dependencies (numpy, pandas, scipy, pyyaml,
-and `ib_async` for talking to IB Gateway). It also installs the **`ql`**
+`ib_async` for talking to IB Gateway, and `exchange_calendars`, the NYSE session
+calendar that intraday strategies need). It also installs the **`ql`**
 command. The `-e` (editable) flag means `ql` always runs the code in this folder,
 so a `git pull` needs no reinstall.
 
@@ -557,10 +560,14 @@ Edit `configs/strategies/momentum.yaml`. Name the file after the strategy's id.
 | `execution.time_in_force` | `auto` | `auto` sends orders to the opening auction (`opg`) for daily and weekly strategies, and as day orders for intraday ones. |
 | `risk.stop_distance` | 0.12 | The protective stop: below a long, above a short. `0` disables it (not recommended). |
 | `risk.max_gross` | 1.0 | Longs plus shorts, as a share of sleeve equity. |
-| `risk.max_net` / `risk.min_net` | 1.0 / −1.0 | Longs minus shorts. Only binds for a strategy that can be short. |
+| `risk.max_net` / `risk.min_net` | empty / −1.0 | Longs minus shorts. Empty `max_net` means "same as `max_gross`": for a long-only book net *is* gross, so a lower value would forbid leverage. |
 | `risk.allow_short` | `false` | Section 7.6. Off, a strategy that asks for a short fails loudly instead of borrowing stock. |
 | `risk.max_borrow_fee` | empty | Refuse a short whose annual borrow fee is above this, when IBKR reports a fee. |
 | `risk.max_order_fraction` | 0.6 | No single order may *open* more than this share of the sleeve. It is a guard against unit errors, not a sizing rule. |
+| `leverage.*` | the defaults (no borrowing) | Step 7.7. `leverage.target` above 1.0 borrows; it may not exceed `risk.max_gross`, the hard cap. |
+| `financing.margin_rate` / `financing.borrow_fee` | 0.055 / 0.005 | Annual interest on borrowed cash and fee on borrowed stock, charged in backtests and accrued in the live sleeve. Check IBKR's current rate for your balance tier. |
+| `automation.mode` | `manual` | The most the system may do without you: `manual`, `exits` or `full`. Nothing is automatic until you also arm it (step 9.9). |
+| `automation.*` (other) | the defaults | The safety gates of the automatic mode, step 9.9. |
 | `monitoring.*` | the defaults | Durations are in **calendar weeks** whatever the bar size. Section 10.3 explains each one and when to change it. |
 | `monitoring.max_data_age_hours` | empty | Empty means by bar size: 240 hours for weekly bars, 100 for daily, 72 for intraday. |
 | `proposal_ttl_hours` | 60 | A Saturday proposal must still be approvable on Monday morning. A proposal is also dead as soon as a newer bar has closed. |
@@ -691,10 +698,28 @@ Everything periodic follows it:
 | data age | `propose` refuses bars older than 240 hours (weekly), 100 hours (daily, so Friday's bar still serves on Monday) or 72 hours (intraday), unless `monitoring.max_data_age_hours` says otherwise. |
 | monitoring | Its durations are calendar weeks and are converted into bars: a 6-week bootstrap block is 6 weekly bars or about 29 daily bars. The expert's rule: how long the market remembers, and how long a regime lasts, are properties of calendar time, not of how often you sample it. |
 
-**Intraday is not ready for money.** The system has no exchange calendar yet, so
-it does not know holidays or half days, and IBKR serves only a short intraday
-history, too short to validate a strategy on. Both need solving before an
-intraday strategy trades.
+**Intraday: what it takes, and what is already done.** The project's expert
+lists five prerequisites before an intraday strategy trades real money. Where
+each stands:
+
+| prerequisite | status | how |
+|---|---|---|
+| the exchange's session calendar: holidays, 13:00 half days, the regular session apart from pre- and after-market | **done** | `data/calendar.py`, from the maintained `exchange_calendars` package. Intraday bars outside the regular session are dropped; a bar ends at the session close if that comes first; `propose` refuses unless the last bar that should have closed is in the data. |
+| 3-5 years of intraday history (the market's regimes are counted in years, not bars), cleaned: split-adjusted, no impossible bars, regular session only | **tooling done; the data is yours to fetch** | `ql data backfill --interval hour --years 5` pages back through IBKR's history at IBKR's pacing limit (60 requests per 10 minutes), resumably, and says where the broker's history ends. Hourly bars for the whole universe take roughly an hour; minute bars about half a day. Then `ql data ingest --rebuild`. `propose` refuses an intraday strategy with less than 3 years in the store. |
+| a strategy validated on that data, with an intraday cost model (spread paid, square-root market impact, per-share commission) and the funnel's purge and embargo set by the trade's lifetime and the longest feature memory | **not started** | This is research, not plumbing: no intraday strategy exists yet. The funnel runs on any bar size; the cost model needs the spread and impact terms added before its results mean anything. |
+| a process running through the session | **hourly: done; minute: not built** | `ql live auto schedule` writes a Mac launch job that runs `ql live cycle` every hour of the US session. Minute bars need a program that runs continuously; that is not built. |
+| automation | **done** | A person cannot approve every hour. Step 9.9. |
+
+Two things outside the code. **The pattern-day-trader rule** (at least $25,000
+to day-trade a US margin account) was scrapped by FINRA with effect from
+4 June 2026, but brokers may keep applying it until October 2027 while they
+implement the replacement: check what IBKR shows for your account before
+counting on it. **The Mac and IB Gateway** must be on through the US session
+(15:30-22:00 in Spain) every trading day.
+
+So the earliest date is set by the research, not the code: when an intraday
+strategy has passed the funnel on 3-5 years of backfilled data with intraday
+costs. Then paper, as for any strategy (section 12).
 
 **Shorts** are off unless `risk.allow_short: true`. With them on:
 
@@ -717,9 +742,68 @@ intraday strategy trades.
    would reverse a short into a long stops at flat. A liquidation buys to cover.
 6. **Reconciliation compares signed positions.** A long where the sleeve holds a
    short is a mismatch.
-7. **Backtests** charge no borrow fees, no margin interest and no recalls.
+7. **Backtests** charge a flat borrow fee (`financing.borrow_fee`) but not the
+   higher fees of hard-to-borrow names, and do not model recalls.
 8. **`ql live adjust`** takes negative quantities for shorts, and only for a
    strategy that allows them.
+
+### Step 7.7 — Leverage
+
+The system can hold more than 100% of the sleeve's equity, on a margin account.
+It is off by default (`leverage.target: 1.0`). The rules, from the project's
+expert:
+
+1. **A hard cap: `risk.max_gross`.** The expert's range for a concentrated,
+   four-name book with a 30-40% drawdown tolerance is 1.3x-1.5x. Nothing the
+   rules below compute can exceed it.
+2. **The level: fixed, or set by tail risk.** `leverage.target` is a fixed
+   leverage. Alternatively `leverage.cvar_target` sets it so that the book's
+   expected shortfall per bar (the average of its worst 5% of bars) matches the
+   target, measured on the strategy's own history with the leverage divided
+   out. Kelly-style sizing is not used: it assumes a return distribution known
+   exactly, and with fat tails it overshoots any drawdown tolerance.
+3. **Cut in drawdown, convexly.** Past a 10% drawdown, the borrowed part shrinks
+   with the square of how far the drawdown has gone towards 35%; at 35% it is
+   gone and the unlevered strategy is left. The expert scales the whole book
+   towards zero; here only the borrowing is removed, because below 1x the
+   strategy is no longer the one that was validated, and the unlevered
+   strategy's drawdowns are governed by monitoring (`leverage.floor` below 1
+   restores the expert's version).
+4. **Cut at once, rebuild slowly.** A lower level applies at the next decision;
+   a higher one rises at most 0.05x per calendar week, and only while equity is
+   improving. Between rotations the book is only ever cut, never topped up.
+5. **The margin cushion.** IBKR does not make margin calls: when the cushion
+   (1 − maintenance margin ÷ net liquidation) reaches zero it sells, at market,
+   without notice. Below a 25% cushion the system goes reduce-only and sizes
+   the next decision back to 1x; below 35% it adds nothing. It lifts its own
+   reduce-only when the cushion is back above 35%.
+6. **It costs money every day.** Backtests charge interest on the debit balance
+   and a fee on borrowed stock (`financing.*`); the live sleeve accrues the same
+   estimate at each sync. Before a proposal that borrows, IBKR's what-if check
+   confirms the account can margin it.
+
+To use it: set `leverage.target` (and `risk.max_gross` at least as high), make
+sure the account is a margin account, rebuild the baseline, and backtest first:
+
+```bash
+ql backtest --leverage 1.3 --start 2009-01-01
+```
+
+What it bought on the momentum strategy (September 2026, 5.5% interest, each
+run recorded in the ledger):
+
+| window | leverage | CAGR | Sharpe | max drawdown | interest paid |
+|---|---|---|---|---|---|
+| 2009-2026 | 1.0x | 20.3% | 0.95 | −24.0% | — |
+| 2009-2026 | 1.3x | 24.9% | 0.93 | −30.6% | 148k |
+| 2009-2026 | 1.5x | 27.3% | 0.89 | −42.4% | 294k |
+| 2000-2026 | 1.0x | 12.1% | 0.60 | −69.8% | — |
+| 2000-2026 | 1.3x | 13.8% | 0.60 | −74.1% | 108k |
+
+Leverage buys return, not quality: the Sharpe ratio does not improve, and the
+drawdown grows with it. At 1.5x the 2009-2026 drawdown is past a 40% tolerance.
+The 2000-2009 years, with a thin early universe, show the base strategy's
+drawdown is already beyond it unlevered.
 
 ---
 
@@ -939,6 +1023,107 @@ position should show a stop.
 Nothing is required. Stops rest at IBKR and work without the system running.
 If one fires, the next `ql live sync` records it as a fill. The system does
 not rebuy that name until the next rotation.
+
+### Step 9.8 — The whole cycle in one command, or on a schedule
+
+```bash
+ql live cycle
+```
+
+Runs steps 9.1 to 9.4 in order -- refresh, sync, monitor, propose -- and then,
+only if automation is armed (step 9.9), sends what its gates allow. Disarmed, it
+stops at the proposal and prints the command to approve it. It is safe to run as
+often as you like: a bar is proposed on once, an order is sent once, and a run
+with nothing new does nothing. `--no-refresh` and `--no-monitor` skip those
+steps.
+
+To have the Mac run it for you:
+
+```bash
+ql live auto schedule
+```
+
+This writes a macOS launch job (in the strategy's state folder) and prints the
+two commands to install and to remove it. For a weekly strategy it runs on
+Saturday at 10:00 (refresh, propose, and send if armed), on Monday at 16:05
+(after the US open: record the fills, place the stops) and every weekday at
+22:45 (record any stop that fired). Times are the Mac's local time. Run the
+command on your Mac, not elsewhere: the job uses the Python it was written with.
+
+What it depends on:
+
+- **The Mac must be awake or asleep, not off.** A job missed during sleep runs
+  when the Mac wakes; a Mac that is shut down misses it. *System Settings →
+  Battery → Options* can keep a plugged-in Mac from sleeping, or
+  `sudo pmset repeat wakeorpoweron MTWRFS 09:55:00` wakes it before the
+  Saturday run.
+- **IB Gateway must be running and logged in.** Set *Auto restart* in the
+  gateway's settings; IBKR still requires a full login with two-factor
+  authentication **once a week, from Monday**. Log in each Monday before the
+  open. A run that cannot connect sends nothing and says so in the log
+  (`state/live/<id>/cycle.log`).
+
+### Step 9.9 — Automatic sending (off until you arm it)
+
+The system can send orders without your typed approval, within limits, if you
+allow it twice: in the config, and with a typed phrase.
+
+**1. Allow it in the config** (the most it may ever do):
+
+```yaml
+automation:
+  mode: exits    # manual | exits | full
+```
+
+**2. Arm it:**
+
+```bash
+ql live auto arm --scope exits     # type: AUTO EXITS momentum
+ql live auto status                # what is armed, and the evidence so far
+ql live auto disarm --reason "..."  # back to manual
+```
+
+In live mode the phrase starts with `LIVE`.
+
+**The two scopes**, in the order the project's expert prescribes:
+
+- **`exits`**: orders that reduce exposure -- selling a long, covering a short,
+  cutting leverage -- are sent automatically. Orders that add exposure stay
+  pending for your `ql live approve`, which then sends only what is left. This
+  automates first what people do worst: the record shows skipped exits, not
+  skipped buys.
+- **`full`**: everything the gates pass. On paper you may arm it at once. With
+  live money it needs evidence from the `exits` stage, from the live or the
+  paper journal: at least 8 weeks armed for exits, no reconciliation mismatch,
+  and automatic exits filling within 1.2x the modelled cost. `--override
+  "reason"` proceeds without it; the reason is recorded.
+
+**The gates** every automatic send passes. A gate that fails holds the orders
+for you and says why; nothing is retried blindly.
+
+| gate | holds | rule |
+|---|---|---|
+| proposal | everything | The same checks as your approval: latest, unexpired, no newer bar, sleeve unchanged, not halted. A liquidation is never automatic. |
+| reconciliation | everything | A clean reconciliation within the last hour. |
+| order count | everything | At most `automation.max_orders` (20). |
+| ladder | entries | Reduce-only lets exits through, nothing else. |
+| margin cushion | entries | At least `automation.min_cushion` (35%). |
+| order size | entries | No order opening more than 10% above the largest order the backtest ever sent (or `automation.max_order_fraction`). |
+| turnover | entries | No cycle trading more than both the backtest's 99th-percentile rotation and one whole book. |
+
+And one breaker: **a bar whose return is below the backtest's 0.5% quantile
+halts the system**, which disarms automation. It judges each bar once, so after
+you have looked and cleared the halt it does not fire again for the same bar.
+
+**What never happens automatically:** lifting a halt, re-arming after one,
+trading on a book that did not reconcile, liquidating, or changing a limit.
+
+**Why these numbers are not the expert's.** The expert's example caps are 5% of
+equity per order and 30-40% turnover per cycle, and a 4% daily loss breaker.
+They describe a strategy that slices its orders and seldom replaces its book. A
+four-name momentum book opens 25% positions and replaces most of itself at a
+rotation, and a 4% weekly loss is an ordinary week. So each limit is set from
+the strategy's own backtest instead: what it has never done is what gets held.
 
 ---
 ## 10. Monitoring live performance
@@ -1244,6 +1429,9 @@ before anything is recorded or sent.
    the live one.
 5. `ql live init`, or `ql live init --adopt …`.
 6. From now on, `approve` asks you to type `LIVE <id>`.
+7. Automation, if you want it, starts again at `exits` (step 9.9): arming
+   `full` with live money needs the exits-stage evidence, which the paper
+   journal of the same strategy can supply.
 
 The paper journal stays in `state/live/<id>/paper-journal.jsonl`. To keep paper
 running alongside live, keep the paper config as a second file with the same id,
@@ -1301,7 +1489,14 @@ Downloaded**.
   by it; an edited one becomes a stranger's order.
 - **A short strategy's backtest is optimistic.** No borrow fees, no margin
   interest, no recalls.
-- **The system does not send orders on its own**, and no flag makes it.
+- **Automation needs the Mac and the gateway.** A shut-down Mac misses its
+  scheduled runs, and IB Gateway needs a full login every Monday. An armed
+  system that cannot connect sends nothing; check `state/live/<id>/cycle.log`.
+- **Leverage costs every day, and drawdowns grow with it.** It does not
+  improve the Sharpe ratio (step 7.7).
+- **The system sends orders on its own only when you have allowed it in the
+  config *and* armed it**, and never after a halt until you clear the halt and
+  arm it again.
 
 ---
 
@@ -1345,7 +1540,8 @@ fail.
 | `ql data fetch --symbols A,B --freq weekly` 🔌 | add instruments to the universe |
 | `ql data import A=a.json … \| --from-dir DIR` | add instruments from saved payloads |
 | `ql data ingest --rebuild` | rebuild the store from the cache |
-| `ql backtest [options] [--report]` | backtest; recorded in the ledger |
+| `ql data backfill --interval hour [--years 5] [--symbols A,B]` 🔌 | page back through intraday history into the cache |
+| `ql backtest [options] [--leverage X] [--margin-rate R] [--report]` | backtest; recorded in the ledger |
 | `ql funnel [--controls N]` | the five research gates |
 | `ql live init [--adopt A,B]` 🔌 | open the sleeve (once per strategy and mode) |
 | `ql live sync` 🔌 | fills, statuses, stops, snapshot, reconciliation |
@@ -1360,6 +1556,11 @@ fail.
 | `ql live halt --reason "…"` | no rotations until you clear it |
 | `ql live clear [--to normal\|reduce_only] --reason "…"` 🔌 | lift a pause or halt (reconciles first) |
 | `ql live journal [--tail N] [--kind K] [--full]` | read the event journal |
+| `ql live cycle [--no-refresh] [--no-monitor]` 🔌 | refresh, sync, monitor, propose; sends only if armed |
+| `ql live auto status` | what automation may do, what is armed, the evidence |
+| `ql live auto arm --scope exits\|full [--override "…"]` | allow automatic sending (typed phrase) |
+| `ql live auto disarm --reason "…"` | back to manual approval |
+| `ql live auto schedule` | write the Mac launch job for `ql live cycle` |
 | `ql monitor baseline` | build the monitoring reference |
 | `ql monitor run [--dry-run] [--no-report] [--benchmark SPY]` | every check, the state, the dashboard |
 | `ql report list` | recent report pages |

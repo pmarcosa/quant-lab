@@ -67,12 +67,21 @@ class SizingPolicy:
             auction -- is the default because it is the live counterpart of the
             backtest's fill: a decision on Friday's close fills at Monday's open
             in both, so live and simulated results are measured at one price.
+        leverage: Gross exposure the strategy's weights are scaled to, set per
+            decision by a ``LeveragePolicy``. The strategy states its intent
+            unlevered; how much of it to hold is the framework's decision, never
+            the strategy's. 1.0 is no borrowing. See :func:`leverage_scale` for
+            how a decision that only restates the book is treated.
+        previous_leverage: The leverage set at the previous decision, so a
+            decision that lowers it can cut a book it would otherwise hold.
     """
 
     cash_buffer: float = 0.01
     min_trade_fraction: float = 0.005
     allow_short: bool = False
     time_in_force: TimeInForce = TimeInForce.OPG
+    leverage: float = 1.0
+    previous_leverage: float | None = None
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.cash_buffer < 1.0:
@@ -81,6 +90,8 @@ class SizingPolicy:
             raise ContractViolation(
                 f"min_trade_fraction cannot be negative; got {self.min_trade_fraction}"
             )
+        if not 0.0 < self.leverage <= 10.0:
+            raise ContractViolation(f"leverage must be in (0, 10]; got {self.leverage}")
 
 
 #: The default sizing rules. Frozen, so sharing one instance is safe.
@@ -107,6 +118,8 @@ class Decision:
     intents: tuple[OrderIntent, ...]
     strategy_state: Mapping[str, Any] = field(default_factory=dict)
     skipped: Mapping[InstrumentId, str] = field(default_factory=dict)
+    #: The factor the strategy's weights were scaled by (see ``leverage_scale``).
+    leverage_scale: float = 1.0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "decision_time", utc(self.decision_time))
@@ -183,7 +196,8 @@ def decide(
         shorts = sorted(str(i) for i, w in target.weights.items() if w < 0)
         raise ContractViolation(f"short targets are not permitted: {shorts}")
 
-    wanted = {i: w for i, w in target.weights.items() if w != 0.0}
+    scale = leverage_scale(target, policy.leverage, policy.previous_leverage)
+    wanted = {i: w * scale for i, w in target.weights.items() if w != 0.0}
     touched = sorted(set(book.positions) | set(wanted), key=str)
 
     missing = [str(i) for i in touched if i not in marks or not _usable(marks[i])]
@@ -284,7 +298,32 @@ def decide(
         intents=tuple(intents),
         strategy_state=strategy.state(),
         skipped=skipped,
+        leverage_scale=scale,
     )
+
+
+def leverage_scale(
+    target: TargetIntent, leverage: float, previous: float | None = None
+) -> float:
+    """The factor a target's weights are multiplied by, given the leverage.
+
+    A rotation states the strategy's intent afresh and unlevered, so it is
+    scaled to the leverage in full. A decision that is not a rotation restates
+    the book as it stands -- already levered by the last rotation -- so scaling
+    it again would compound the leverage every bar. Such a decision is only
+    ever *cut*, and only when the leverage was just lowered (a drawdown or a
+    thin margin cushion): the book is then scaled down to the new level if its
+    gross is above it. Otherwise it is left alone -- prices drift a book's
+    gross between rotations, and trimming that drift would add trades the
+    validated strategy never made -- and any increase waits for the rotation.
+    """
+    if bool(target.diagnostics.get("rotated", 1.0)):
+        return leverage
+    lowered = previous is not None and leverage < previous - 1e-9
+    gross = target.gross
+    if lowered and gross > leverage > 0.0:
+        return leverage / gross
+    return 1.0
 
 
 def _usable(price: float) -> bool:

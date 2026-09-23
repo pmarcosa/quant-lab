@@ -108,6 +108,8 @@ class EventKind(str, Enum):
     ADJUSTMENT = "adjustment"          # a recorded correction, always with a reason
     STATE_CHANGE = "state_change"      # a move on the degradation ladder
     NOTE = "note"                      # free text for the human record
+    FINANCING = "financing"            # interest or borrow fee accrued; moves cash
+    AUTOMATION = "automation"          # armed, disarmed, or an automatic decision and why
 
 
 @dataclass(frozen=True, slots=True)

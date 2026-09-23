@@ -24,9 +24,10 @@ their close is one bar length later (``data.ingest.bar_close``).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -181,6 +182,8 @@ def refresh(
             continue
         if interval is BarInterval.WEEK:
             fresh = merge_split_weeks(fresh)
+        if interval.is_intraday:
+            fresh = _regular(fresh)
         fresh = complete_bars(fresh, now, interval=interval)
         if fresh.empty:
             results.append(RefreshResult(symbol, 0, 0, "", error="no complete bars returned"))
@@ -212,3 +215,109 @@ def refresh_weekly(
 ) -> tuple[RefreshResult, ...]:
     """:func:`refresh` for weekly bars. Kept for callers written before intervals."""
     return refresh(broker, cache_root, store, now, BarInterval.WEEK, symbols, duration)
+
+
+# -- backfilling long intraday history --------------------------------------------------------
+
+#: How much each request asks for when paging back through history. IBKR's
+#: documented maximum per request is larger; these keep each response to a few
+#: thousand bars, which returns promptly.
+BACKFILL_CHUNKS = {
+    BarInterval.WEEK: "20 Y", BarInterval.DAY: "10 Y",
+    BarInterval.HOUR: "1 Y", BarInterval.MINUTE: "1 M",
+}
+#: IBKR allows at most 60 historical-data requests in any ten minutes. Ten and a
+#: half seconds apart never trips it, whatever else is running.
+PACING_SECONDS = 10.5
+
+
+@dataclass(frozen=True, slots=True)
+class BackfillResult:
+    instrument: str
+    bars_added: int
+    first_bar: str
+    requests: int
+    exhausted: bool
+    error: str = ""
+
+
+def backfill(
+    broker,
+    cache_root: Path,
+    interval: BarInterval,
+    now: datetime,
+    years: float,
+    symbols: Sequence[str],
+    chunk: str | None = None,
+    pace: float = PACING_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[BackfillResult, ...]:
+    """Page backwards through the broker's history until ``years`` are cached.
+
+    Resumable: it starts from the earliest bar already in each symbol's cache
+    and writes every page as it arrives, so an interruption loses one request.
+    Stops early, and says so, when the broker has nothing older. Writes the
+    cache only; ``ql data ingest --rebuild`` then loads it into the store, as
+    for any other cache change.
+
+    For intraday bars only regular-session bars are kept (``data.calendar``).
+    """
+    bar_size, _ = IBKR_BAR_SIZES[interval]
+    step = chunk or BACKFILL_CHUNKS[interval]
+    target = now - timedelta(days=365.25 * years)
+    frequency = interval.frequency
+    results: list[BackfillResult] = []
+    first_request = True
+    for symbol in [s.upper() for s in symbols]:
+        instrument = InstrumentId(symbol)
+        path = cache_root / frequency / f"{symbol}.csv"
+        existing = pd.DataFrame(columns=list(CACHE_COLUMNS))
+        if path.exists():
+            existing = pd.read_csv(path, parse_dates=["timestamp"]).set_index("timestamp")
+            if interval.is_intraday and existing.index.tz is None:
+                existing.index = existing.index.tz_localize("UTC")
+        end = _as_utc(existing.index.min()) if not existing.empty else now
+        requests, added, exhausted, error = 0, 0, False, ""
+        while end > target:
+            if not first_request:
+                sleep(pace)
+            first_request = False
+            try:
+                page = bars_from_broker(
+                    broker.historical_bars(instrument, bar_size, step, end=end), interval
+                )
+            except Exception as failure:  # one symbol's failure must not stop the rest
+                error = str(failure)
+                break
+            requests += 1
+            if interval.is_intraday:
+                page = _regular(page)
+            page = page[[_as_utc(t) < end for t in page.index]] if not page.empty else page
+            if page.empty:
+                exhausted = True
+                break
+            existing = merge_into_cache(existing, page, interval)
+            write_cache_csv(symbol, existing, cache_root, frequency)
+            added += len(page)
+            end = _as_utc(page.index.min())
+        first = "" if existing.empty else _label(existing.index.min(), interval)
+        results.append(BackfillResult(symbol, added, first, requests, exhausted, error))
+    return tuple(results)
+
+
+def _as_utc(stamp) -> datetime:
+    value = pd.Timestamp(stamp)
+    value = value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+    return value.to_pydatetime()
+
+
+def _label(stamp, interval: BarInterval) -> str:
+    value = pd.Timestamp(stamp)
+    return value.isoformat() if interval.is_intraday else value.date().isoformat()
+
+
+def _regular(frame: pd.DataFrame) -> pd.DataFrame:
+    """Regular-session bars only, when the calendar is installed."""
+    from data import calendar
+
+    return calendar.regular_bars(frame) if calendar.is_available() else frame

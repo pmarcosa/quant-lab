@@ -124,8 +124,15 @@ def run_once(
     costs: CostModel,
     policy: SizingPolicy,
     supervisor=None,
+    leverage=None,
+    financing=None,
 ) -> RunResult:
-    """One backtest. The only way research runs anything."""
+    """One backtest. The only way research runs anything.
+
+    ``leverage`` (a ``LeveragePolicy``) and ``financing`` (a
+    ``FinancingModel``) are needed only for books that borrow cash or stock;
+    see ``engine.run.run_backtest``.
+    """
     portfolio = PortfolioId(TenantId("user"), "research")
     broker = SimulatedBroker(costs=costs)
     return run_backtest(
@@ -142,6 +149,9 @@ def run_once(
         highs_at=market.window.highs_at,
         supervisor=supervisor,
         policy=policy,
+        leverage=leverage,
+        financing=financing,
+        bars_per_week=market.interval.bars_per_week,
     )
 
 

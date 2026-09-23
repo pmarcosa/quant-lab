@@ -10,3 +10,18 @@ reports/out/
 state/
 configs/live.yaml
 configs/strategies/
+
+# Market data from IBKR. Its licence forbids redistribution, so it is never
+# committed: each user fetches their own (docs/MANUAL.md, step 2.2).
+data/ibkr_cache/
+
+# Strategy configs name real brokerage accounts and personal settings. Only the
+# template is published.
+configs/*
+!configs/live.example.yaml
+configs/strategies/
+implementation.yaml
+**/implementation.yaml
+
+# Backups and bundles made outside git.
+*.bundle

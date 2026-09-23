@@ -26,7 +26,8 @@ Run it yourself:
 
 ```bash
 pip install -e ".[dev]"
-python scripts/ingest_ibkr_cache.py       # builds var/store from the committed CSVs
+ql data fetch --symbols "$(paste -sd, data/universe.txt)" --freq weekly   # your own IBKR data
+python scripts/ingest_ibkr_cache.py       # builds var/store from the fetched CSVs
 python scripts/demo_causality.py          # asserts the guarantees on that real data
 python scripts/reconcile_conventions.py   # prices the execution conventions
 python scripts/run_funnel.py              # five gates, on the real data
@@ -161,9 +162,13 @@ strength of being uppercase) and was closed.
 
 ## Data
 
-`data/ibkr_cache/` holds the raw CSVs and is committed: it is the reproducible
-input. `var/store/` is derived, bitemporal and gitignored — rebuild it in about a
-second with the ingest script.
+`data/ibkr_cache/` holds the raw CSVs and is **not** in the repository: IBKR's
+market-data agreement forbids redistributing the data, so each user fetches
+their own (`ql data fetch`, with the symbols in `data/universe.txt`). The tests
+that need it, and the CI steps that run the ingest, the causality demo, a
+backtest and the funnel on it, skip when it is absent. `var/store/` is derived,
+bitemporal and gitignored — rebuild it in about a second with the ingest
+script.
 
 The store is append-only. There is no `update` and no `delete`; a correction is a
 new row with a later `available_time`, and `revise()` is deliberately identical

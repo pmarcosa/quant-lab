@@ -3,9 +3,10 @@
 
     python scripts/ingest_ibkr_cache.py
 
-Raw CSVs are committed under ``data/ibkr_cache`` because they are the
-reproducible input. The bitemporal store under ``var/store`` is derived and is
-not committed: anyone can rebuild it by running this.
+Raw CSVs live under ``data/ibkr_cache``: the input, fetched from IBKR by each
+user and never committed (the market-data licence forbids redistribution). The
+bitemporal store under ``var/store`` is derived: anyone with the CSVs can
+rebuild it by running this.
 """
 
 from __future__ import annotations

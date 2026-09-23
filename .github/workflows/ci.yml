@@ -15,16 +15,21 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: pytest -q
-      # The causality guarantees are checked against the committed IBKR cache,
-      # not only against fixtures: a synthetic test can pass on a store the real
-      # ingest never produces.
-      - run: python scripts/ingest_ibkr_cache.py
-      - run: python scripts/demo_causality.py
-      - run: python scripts/reconcile_conventions.py
-      # The command a person uses, on the real store: status, and a backtest
-      # with its report, recorded to a throwaway ledger.
-      - run: ql data status
-      - run: ql backtest --report --ledger /tmp/ci-ledger.jsonl
-      # The funnel is slow (seventy-five backtests); CI runs a reduced
-      # control set so the gates themselves stay exercised on every push.
-      - run: python scripts/run_funnel.py --controls 20
+      # The steps below need the IBKR price cache, which is not in the
+      # repository: its licence forbids redistribution. They run wherever the
+      # cache is present (a fork with its own data, or a private data
+      # checkout) and are skipped otherwise. Locally, run them by hand: the
+      # causality guarantees must be checked against the real ingest, not only
+      # against fixtures.
+      - if: hashFiles('data/ibkr_cache/weekly/*.csv') != ''
+        run: python scripts/ingest_ibkr_cache.py
+      - if: hashFiles('data/ibkr_cache/weekly/*.csv') != ''
+        run: python scripts/demo_causality.py
+      - if: hashFiles('data/ibkr_cache/weekly/*.csv') != ''
+        run: python scripts/reconcile_conventions.py
+      - if: hashFiles('data/ibkr_cache/weekly/*.csv') != ''
+        run: ql data status
+      - if: hashFiles('data/ibkr_cache/weekly/*.csv') != ''
+        run: ql backtest --report --ledger /tmp/ci-ledger.jsonl
+      - if: hashFiles('data/ibkr_cache/weekly/*.csv') != ''
+        run: python scripts/run_funnel.py --controls 20

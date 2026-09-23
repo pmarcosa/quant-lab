@@ -24,6 +24,13 @@ from data.vendor import (
 
 REAL_CACHE = Path(__file__).resolve().parent.parent / "data" / "ibkr_cache"
 
+#: The IBKR cache is not in the repository (its licence forbids redistribution);
+#: these tests run where a user has fetched it.
+needs_cache = pytest.mark.skipif(
+    not (REAL_CACHE / "weekly").is_dir(),
+    reason="needs the IBKR cache; fetch it with `ql data fetch` (manual, step 2.2)",
+)
+
 
 def payload(n=5, **overrides):
     weeks = pd.date_range("2026-01-05", periods=n, freq="W-MON", tz="UTC")
@@ -115,7 +122,8 @@ def test_writing_produces_the_format_the_ingest_reads(tmp_path):
     assert "T00:00:00" not in text[1], "dates only, so the file stays diffable"
 
 
-def test_the_written_file_matches_the_shape_of_the_committed_cache():
+@needs_cache
+def test_the_written_file_matches_the_shape_of_the_cache():
     """A new instrument has to look exactly like the ones already there."""
     existing = (REAL_CACHE / "weekly" / "AAPL.csv").read_text().splitlines()
     assert existing[0] == "timestamp,open,high,low,close,volume"
@@ -162,6 +170,7 @@ def test_thin_coverage_is_named_rather_than_failed(tmp_path):
     assert check_coverage(pd.DataFrame()) == ()
 
 
+@needs_cache
 def test_the_real_cache_has_no_thin_series_that_should_not_be_thin():
     inventory = cache_inventory(REAL_CACHE, "weekly")
     assert len(inventory) >= 39

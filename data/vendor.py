@@ -92,7 +92,7 @@ def bars_from_connector(payload: Mapping[str, Any]) -> pd.DataFrame:
 def write_cache_csv(
     symbol: str, bars: pd.DataFrame, root: Path, frequency: str = "weekly"
 ) -> Path:
-    """Write one instrument's bars into the committed cache.
+    """Write one instrument's bars into the local cache.
 
     Overwrites. The cache is a snapshot of what the vendor currently says, and
     the bitemporal store — not this file — is where the history of what was said

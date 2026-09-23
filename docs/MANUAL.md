@@ -103,7 +103,9 @@ runtime/      Wiring. cli.py is the `ql` command; live.py the live session;
               strategies.py the registry of deployable strategies.
 scripts/      The research scripts `ql` delegates to.
 configs/      live.example.yaml (committed); strategies/<id>.yaml (yours, gitignored).
-data/ibkr_cache/   Raw weekly and daily CSVs, committed: the reproducible input.
+data/ibkr_cache/   Raw weekly and daily CSVs from IBKR: the input. Yours, never committed
+                   (IBKR's licence forbids redistributing market data).
+data/universe.txt  The symbols the momentum strategy trades: what to fetch.
 var/store/    The bitemporal store, derived from the cache. Safe to delete and rebuild.
 state/        Irreplaceable: journals, baselines, the research ledger, reports. Gitignored.
 ```
@@ -140,13 +142,27 @@ If `ql` is not found afterwards, your Python's scripts folder is not on your
 `PATH`. Use `python -m runtime.cli` instead: it is the same program, and every
 `ql …` in this manual can be typed as `python -m runtime.cli …`.
 
-### Step 2.2 — Build the store
+### Step 2.2 — Get the price data, then build the store
+
+The price data is not in the repository. It comes from IBKR, whose market-data
+agreement forbids redistributing it, so each user fetches their own with their
+own account. With IB Gateway running (step 7.1):
+
+```bash
+ql data fetch --symbols "$(paste -sd, data/universe.txt)" --freq weekly
+ql data fetch --symbols "$(paste -sd, data/universe.txt)" --freq daily   # optional
+```
+
+This writes one CSV per symbol under `data/ibkr_cache/`, which git ignores.
+Without the gateway, import saved payloads instead (step 4.2b). Keep the folder
+backed up with `state/` (section 13): it is the input every result was computed
+from. Then:
 
 ```bash
 ql data ingest --rebuild
 ```
 
-This reads the committed CSVs in `data/ibkr_cache/` and writes the bitemporal
+This reads the CSVs in `data/ibkr_cache/` and writes the bitemporal
 store in `var/store/`. It is derived data: the CSVs are the input, and the store
 is how the engine reads them without looking into the future. `--rebuild`
 deletes `var/store` first, and nothing else.
@@ -286,7 +302,7 @@ ql data import NFLX=nflx.json ORCL=orcl.json --freq weekly
 
 Both paths validate before they write anything. Mismatched array lengths,
 non-positive prices, bars whose high is below their low, and duplicate
-timestamps are refused. A bad file that writes cleanly would become a committed
+timestamps are refused. A bad file that writes cleanly would become a cached
 CSV, then a store, then a result, and by that point nothing would look wrong.
 
 ### Step 4.3 — Rebuild and check
@@ -310,8 +326,9 @@ most common failure, and it is silent.
    live strategy trades whatever is in the store, so from the next proposal it
    trades the new universe. Monitoring must compare it against a backtest of
    the same universe.
-4. **Commit the new CSVs** (`git add data/ibkr_cache && git commit`), so the
-   result can be reproduced from the repository alone.
+4. **Record the new universe.** Add the symbols to `data/universe.txt` and
+   commit that list, so anyone with IBKR data can rebuild the same universe. The
+   CSVs themselves stay out of git (step 2.2); back them up with `state/`.
 
 ### What expanding will not fix
 
@@ -1444,7 +1461,7 @@ for example `configs/strategies/momentum-paper.yaml`, and select it with
 
 | path | what | if lost |
 |---|---|---|
-| `data/ibkr_cache/` | raw CSVs, committed | Recoverable from git. |
+| `data/ibkr_cache/` | raw CSVs from IBKR, not in git | Re-fetch with `ql data fetch` (step 2.2); the store's recorded revisions go with `var/store`. Back it up. |
 | `var/store/` | derived store | Rebuild: `ql data ingest --rebuild`. |
 | `state/live/<id>/<mode>-journal.jsonl` | **every live event of one strategy; its sleeve is replayed from it** | **Not recoverable.** The sleeve's history, costs and overrides are gone. |
 | `state/live/<id>/<mode>-baseline.json` | the monitoring reference | Rebuild with `ql monitor baseline`. |

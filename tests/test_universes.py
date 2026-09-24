@@ -255,3 +255,40 @@ def test_a_setting_the_loader_does_not_read_is_refused(tmp_path):
     placed = tmp_path / "placed.yaml"
     placed.write_text(example.replace("  # universe: sector-etfs", "  universe: sector-etfs", 1))
     assert load_config(placed).strategy.universe == "sector-etfs"
+
+
+# -- re-runs: counted once when identical, anew when the code or data changed -------------
+
+
+def test_the_code_fingerprint_follows_the_code_that_makes_the_numbers(tmp_path):
+    from runtime.research import code_fingerprint
+
+    for name in ("strategies/a.py", "engine/b.py", "runtime/research.py", "runtime/cli.py"):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x = 1\n")
+    before = code_fingerprint(tmp_path)
+    (tmp_path / "runtime" / "cli.py").write_text("x = 2\n")
+    code_fingerprint.cache_clear()
+    assert code_fingerprint(tmp_path) == before, "the CLI does not change a result"
+    (tmp_path / "strategies" / "a.py").write_text("x = 2\n")
+    code_fingerprint.cache_clear()
+    assert code_fingerprint(tmp_path) != before, "a strategy fix does"
+    code_fingerprint.cache_clear()
+
+
+def test_the_stop_sweep_records_an_identical_rerun_once(tmp_path):
+    import importlib.util
+    from pathlib import Path
+
+    random_walk_store(tmp_path / "store")
+    path = Path(__file__).resolve().parent.parent / "scripts" / "compare_stops.py"
+    spec = importlib.util.spec_from_file_location("compare_stops", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    ledger = tmp_path / "ledger.jsonl"
+    argv = ["--store", str(tmp_path / "store"), "--ledger", str(ledger)]
+    assert module.main(argv) == 0 and module.main(argv) == 0
+    rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert len(rows) == 6, "six distances, each recorded once"
+    assert all("code=" in r["window"] and "data=" in r["window"] for r in rows)

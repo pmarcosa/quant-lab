@@ -7,9 +7,12 @@ count is only honest if it was written down as the trials happened.
 
 from __future__ import annotations
 
+import functools
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -26,6 +29,41 @@ from strategies.momentum import MomentumParams, WeeklyMomentum, indicators
 from validation.ledger import Study
 
 STARTING_CAPITAL = 100_000.0
+
+#: The code that decides a backtest's numbers. A change in any of it makes
+#: earlier results stale; a change elsewhere (the CLI, the docs, the tests, the
+#: live broker) does not.
+RESULT_PACKAGES = ("contracts", "data", "engine", "risk", "strategies")
+RESULT_FILES = ("execution/simulated.py", "runtime/research.py", "runtime/wiring.py")
+_REPO = Path(__file__).resolve().parent.parent
+
+
+@functools.cache
+def code_fingerprint(root: Path = _REPO) -> str:
+    """Ten hex characters that change when the code behind a result changes.
+
+    Part of every trial's label, with the data's fingerprint, so a run after a
+    bug fix is a new trial and the funnel never reuses a result the old code
+    produced.
+    """
+    digest = hashlib.sha256()
+    paths = sorted(p for package in RESULT_PACKAGES for p in (root / package).rglob("*.py"))
+    paths += [root / name for name in RESULT_FILES if (root / name).exists()]
+    for path in paths:
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:10]
+
+
+def trial_label(market: Market) -> str:
+    """What a trial saw: its dates, the prices (``Market.fingerprint``) and the code.
+
+    Two runs share a label only if they would produce the same numbers, so an
+    identical re-run is recognised and recorded once, and anything else is not.
+    """
+    schedule = market.schedule
+    return (f"{schedule[0].date()}..{schedule[-1].date()} "
+            f"data={market.fingerprint()} code={code_fingerprint()}")
 
 
 def precompute_indicators(

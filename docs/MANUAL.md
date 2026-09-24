@@ -490,8 +490,19 @@ recalls**, so its short side is optimistic; the output says so.
 should be of the strategy you are actually going to trade.
 
 **Every backtest is recorded.** Each run is written to the research ledger
-(`state/research.jsonl`, study `manual`) before its result is shown. Running
-the identical backtest twice is recorded once.
+(`state/research.jsonl`, study `manual`) before its result is shown.
+
+**Re-running.** A trial's label holds its dates, a fingerprint of the prices
+and a fingerprint of the code that produces the numbers (`engine/`, `risk/`,
+`strategies/`, `data/`, `contracts/`, the simulated broker). So:
+
+- the identical run again is recognised and recorded once;
+- a run after a bug fix, a re-fetch or on another universe is a new trial. It
+  should be: its numbers are different, and you saw them. If it is nearly the
+  same series as the old one, it adds almost nothing to N_eff, because
+  near-copies are de-correlated away;
+- a run on another window (another `--start`) cannot be de-correlated with the
+  rest and counts as one full trial. Keep the window fixed.
 
 Why record at all? The Deflated Sharpe Ratio discounts a result by the number of
 things tried to find it. Twenty quick backtests while you "just look around"

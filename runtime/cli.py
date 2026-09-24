@@ -359,7 +359,7 @@ def cmd_backtest(ctx: Context, args) -> int:
     )
     from runtime.config import FinancingSettings, LeverageSettings, RiskSettings, StrategySettings
     from runtime.reporting import backtest_report
-    from runtime.research import STARTING_CAPITAL, periodic_returns, run_once
+    from runtime.research import STARTING_CAPITAL, periodic_returns, run_once, trial_label
     from runtime.strategies import build_strategy
     from runtime.wiring import load_market, universe_list
     from validation.ledger import ResearchLedger, Study
@@ -427,7 +427,7 @@ def cmd_backtest(ctx: Context, args) -> int:
     # Every backtest is a trial. Recording it keeps the Deflated Sharpe honest.
     returns = periodic_returns(result)
     window = f"{schedule[0].date()}..{schedule[-1].date()}"
-    label = f"{window} data={market.fingerprint()}"
+    label = trial_label(market)
     note = f"stop={stop} cost={args.cost_bps} slip={args.slippage_bps}"
     note += f" universe={universe.name}:{universe.fingerprint}" if universe else ""
     note += f" capital={args.capital:g}" if args.capital != STARTING_CAPITAL else ""

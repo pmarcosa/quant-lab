@@ -28,7 +28,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from contracts.temporal import BarInterval  # noqa: E402
 from engine.decide import SizingPolicy  # noqa: E402
 from execution.simulated import CostModel  # noqa: E402
-from runtime.research import STARTING_CAPITAL, RandomSelection, evaluate  # noqa: E402
+from runtime.research import (  # noqa: E402
+    STARTING_CAPITAL,
+    RandomSelection,
+    evaluate,
+    trial_label,
+)
 from runtime.wiring import load_market, universe_list  # noqa: E402
 from strategies.momentum import MomentumParams, WeeklyMomentum  # noqa: E402
 from validation.cpcv import block_sharpes, purged_splits  # noqa: E402
@@ -97,9 +102,10 @@ def main(argv: list[str] | None = None) -> int:
     costs = CostModel(commission_bps=10.0, slippage_bps=10.0)
     policy = SizingPolicy(cash_buffer=0.01, min_trade_fraction=0.005)
     ledger = ResearchLedger(Path(args.ledger))
-    # What the data was: dates, prices (a re-fetch or another universe changes
-    # it) and the capital. A result recorded under another label is never reused.
-    label = f"{schedule[0].date()}..{schedule[-1].date()} data={market.fingerprint()}"
+    # What the trial saw: dates, prices (a re-fetch or another universe changes
+    # them) and code (a bug fix changes it). A result is reused only under the
+    # same label, so an identical re-run is recorded once and anything else anew.
+    label = trial_label(market)
     context = (f"universe={universe.name}:{universe.fingerprint}" if universe else "universe=store")
     if args.capital != STARTING_CAPITAL:
         context += f" capital={args.capital:g}"

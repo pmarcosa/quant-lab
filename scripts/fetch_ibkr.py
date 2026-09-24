@@ -85,6 +85,9 @@ def fetch(symbols: list[str], frequency: str, host: str, port: int, client_id: i
                 continue
 
             frame = util.df(bars)
+            if frame is None or frame.empty:
+                print(f"{symbol:<8} SKIPPED  no bars returned", file=sys.stderr)
+                continue
             frame = frame.rename(columns={"date": "timestamp"})
             frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
             frame = frame.set_index("timestamp").sort_index()

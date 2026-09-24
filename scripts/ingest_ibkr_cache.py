@@ -19,8 +19,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from contracts.temporal import BarInterval  # noqa: E402
+from data.adjustments import FACTOR_DIR, factors_path, read_factors, uncovered  # noqa: E402
 from data.bitemporal import BitemporalStore  # noqa: E402
-from data.ingest import ingest_directory, universe_from_store  # noqa: E402
+from data.ingest import ingest_directory, load_price_csv, universe_from_store  # noqa: E402
 from data.vendor import FREQUENCIES  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -71,9 +72,24 @@ def main(argv: list[str] | None = None) -> int:
         # Weekly bars are stamped at their week's close; any bar whose session
         # has not closed yet is left out rather than stored half-finished.
         written = ingest_directory(
-            CACHE / frequency, store, interval=interval
+            CACHE / frequency, store, interval=interval, factors=CACHE / FACTOR_DIR
         )
         print(f"{dataset}: {len(written)} instruments, {sum(written.values()):,} observations")
+        price_only = sorted(s for s in written if not factors_path(CACHE, s).exists())
+        if price_only:
+            print(f"  no dividend factors (price-only, run `ql data fetch` for them): "
+                  f"{', '.join(price_only)}")
+        thin = []
+        for symbol in written:
+            factors = read_factors(CACHE, symbol)
+            if factors is None:
+                continue
+            frame = load_price_csv(CACHE / frequency / f"{symbol}.csv")
+            if uncovered(frame.index, factors):
+                thin.append(f"{symbol} (from {factors.index.min().date()})")
+        if thin:
+            print(f"  factors start after the first bar (earlier bars price-only): "
+                  f"{', '.join(sorted(thin))}")
 
         universe = universe_from_store(store, still_trading_after=cutoff)
         universe.to_csv(STORE / f"universe_{frequency}.csv", derived=True)

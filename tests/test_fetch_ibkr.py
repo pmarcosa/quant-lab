@@ -6,6 +6,7 @@ import importlib.util
 from datetime import date, timedelta
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 ib_async = pytest.importorskip("ib_async")
@@ -20,13 +21,20 @@ def load_script():
     return module
 
 
-def weekly_bars(n: int = 60):
-    start = date(2020, 1, 6)
-    return [
-        ib_async.BarData(date=start + timedelta(weeks=i), open=10 + i, high=11 + i,
-                         low=9 + i, close=10.5 + i, volume=1000)
-        for i in range(n)
-    ]
+def daily_bars(days: int = 400, dividend_on: date | None = None, factor: float = 1.0):
+    """Weekday bars from Monday 1 January 2024. Before ``dividend_on`` the prices
+    are multiplied by ``factor``: that is ADJUSTED_LAST for a dividend going ex
+    that day."""
+    start = date(2024, 1, 1)
+    out = []
+    for i in range(days):
+        day = start + timedelta(days=i)
+        if day.weekday() >= 5:
+            continue
+        f = factor if dividend_on is not None and day < dividend_on else 1.0
+        out.append(ib_async.BarData(date=day, open=(100 + i) * f, high=(101 + i) * f,
+                                    low=(99 + i) * f, close=(100.5 + i) * f, volume=10))
+    return out
 
 
 class FakeIB:
@@ -64,17 +72,41 @@ def script(monkeypatch, tmp_path):
     return module
 
 
-def test_retries_and_passes_the_options(script, capsys):
-    FakeIB.replies = [([(366, "No historical data query found")], []), ([], weekly_bars())]
+def test_asks_for_daily_trades_then_adjusted_last_and_retries(script, capsys):
+    FakeIB.replies = [
+        ([(366, "No historical data query found")], []),  # TRADES, first try
+        ([], daily_bars()),                                # TRADES, second try
+        ([], daily_bars()),                                # ADJUSTED_LAST
+    ]
     written = script.fetch(["NFLX"], "weekly", "127.0.0.1", 4002, 1,
                            duration="5 Y", timeout=30, attempts=2)
     assert written == 1
+    kinds = [(r["whatToShow"], r["barSizeSetting"], r["endDateTime"]) for r in FakeIB.requests]
+    assert kinds == [("TRADES", "1 day", "")] * 2 + [("ADJUSTED_LAST", "1 day", "")]
+    assert (FakeIB.requests[0]["durationStr"], FakeIB.requests[0]["timeout"]) == ("5 Y", 30)
     assert (script.CACHE / "weekly" / "NFLX.csv").exists()
-    first = FakeIB.requests[0]
-    assert (first["durationStr"], first["timeout"], first["endDateTime"]) == ("5 Y", 30, "")
+    assert (script.CACHE / "factors" / "NFLX.csv").exists()
     out = capsys.readouterr()
     assert "HMDS data farm connection is OK" in out.out
     assert "IBKR 366" in out.err and "cancelled" in out.err
+
+
+def test_the_cache_keeps_trades_and_the_factors_keep_the_dividend(script):
+    ex = date(2024, 3, 13)  # a Wednesday: the dividend goes ex inside a week
+    FakeIB.replies = [([], daily_bars()), ([], daily_bars(dividend_on=ex, factor=0.98))]
+    assert script.fetch(["XOM"], "weekly", "127.0.0.1", 4002, 1) == 1
+    factors = pd.read_csv(script.CACHE / "factors" / "XOM.csv", parse_dates=["date"])
+    before = factors[factors["date"] < pd.Timestamp(ex)]["factor"]
+    after = factors[factors["date"] >= pd.Timestamp(ex)]["factor"]
+    assert before.round(10).eq(0.98).all() and after.round(10).eq(1.0).all()
+    weeks = pd.read_csv(script.CACHE / "weekly" / "XOM.csv", parse_dates=["timestamp"])
+    week = weeks[weeks["timestamp"] == pd.Timestamp("2024-03-11")].iloc[0]
+    # Close: Friday's TRADES close, as traded. Open: Monday's, at the week-end
+    # scale (x0.98), fixed once the week is over.
+    assert week["close"] == pytest.approx(100.5 + 74)
+    assert week["open"] == pytest.approx((100 + 70) * 0.98)
+    plain = weeks[weeks["timestamp"] == pd.Timestamp("2024-03-04")].iloc[0]
+    assert plain["open"] == pytest.approx(100 + 63), "weeks without an ex-date are as traded"
 
 
 def test_explains_a_permissions_refusal(script, capsys):
@@ -84,6 +116,7 @@ def test_explains_a_permissions_refusal(script, capsys):
     err = capsys.readouterr().err
     assert err.count("IBKR 162") == 2
     assert "permissions" in err and "SKIPPED" in err
+    assert len(FakeIB.requests) == 2, "no ADJUSTED_LAST request once TRADES has failed"
 
 
 def test_silence_is_reported_as_a_timeout(script, capsys):
@@ -92,24 +125,9 @@ def test_silence_is_reported_as_a_timeout(script, capsys):
     assert "no reply from IBKR within 7s" in capsys.readouterr().err
 
 
-def daily_bars(days: int = 400):
-    start = date(2024, 1, 1)  # a Monday
-    out = []
-    for i in range(days):
-        day = start + timedelta(days=i)
-        if day.weekday() < 5:
-            out.append(ib_async.BarData(date=day, open=100 + i, high=101 + i, low=99 + i,
-                                        close=100.5 + i, volume=10))
-    return out
-
-
-def test_weekly_asks_for_daily_bars_and_groups_them_into_weeks(script):
-    FakeIB.replies = [([], daily_bars())]
+def test_weekly_bars_are_grouped_from_daily_ones(script):
+    FakeIB.replies = [([], daily_bars()), ([], daily_bars())]
     assert script.fetch(["NFLX"], "weekly", "127.0.0.1", 4002, 1) == 1
-    assert FakeIB.requests[0]["barSizeSetting"] == "1 day"
-    assert FakeIB.requests[0]["whatToShow"] == "ADJUSTED_LAST"
-    import pandas as pd
-
     frame = pd.read_csv(script.CACHE / "weekly" / "NFLX.csv", parse_dates=["timestamp"])
     first = frame.iloc[0]
     # The window's first week is dropped (a window almost always opens mid-week);
@@ -130,8 +148,6 @@ def test_a_rejected_request_is_not_retried(script, capsys):
 
 
 def test_a_window_opening_mid_week_does_not_leave_a_short_first_week():
-    import pandas as pd
-
     from data.ingest import weeks_from_days
 
     days = pd.bdate_range("2024-01-03", "2024-01-26")  # opens on a Wednesday

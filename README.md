@@ -164,7 +164,10 @@ strength of being uppercase) and was closed.
 
 `data/ibkr_cache/` holds the raw CSVs and is **not** in the repository: IBKR's
 market-data agreement forbids redistributing the data, so each user fetches
-their own (`ql data fetch`, with the symbols in `data/universe.txt`). The tests
+their own (`ql data fetch`, with the symbols in `data/universe.txt`). The CSVs
+are prices as traded (IBKR's TRADES, split-adjusted); dividends live in a
+separate factor table, `data/ibkr_cache/factors/`, applied when the store is
+built (`data/adjustments.py`). The tests
 that need it, and the CI steps that run the ingest, the causality demo, a
 backtest and the funnel on it, skip when it is absent. `var/store/` is derived,
 bitemporal and gitignored — rebuild it in about a second with the ingest

@@ -153,8 +153,10 @@ ql data fetch --symbols "$(paste -sd, data/universe.txt)" --freq weekly
 ql data fetch --symbols "$(paste -sd, data/universe.txt)" --freq daily   # optional
 ```
 
-This writes one CSV per symbol under `data/ibkr_cache/`, which git ignores.
-Without the gateway, import saved payloads instead (step 4.2b). Keep the folder
+This writes one CSV per symbol under `data/ibkr_cache/`, which git ignores,
+with the prices as traded (split-adjusted), and one file of dividend factors
+per symbol under `data/ibkr_cache/factors/` (section 3, "Splits and
+dividends"). Without the gateway, import saved payloads instead (step 4.2b). Keep the folder
 backed up with `state/` (section 13): it is the input every result was computed
 from. Then:
 
@@ -162,8 +164,9 @@ from. Then:
 ql data ingest --rebuild
 ```
 
-This reads the CSVs in `data/ibkr_cache/` and writes the bitemporal
-store in `var/store/`. It is derived data: the CSVs are the input, and the store
+This reads the CSVs in `data/ibkr_cache/`, multiplies each bar by its
+dividend factor, and writes the bitemporal store in `var/store/`. It names
+any symbol without factors (price-only). It is derived data: the CSVs are the input, and the store
 is how the engine reads them without looking into the future. `--rebuild`
 deletes `var/store` first, and nothing else.
 
@@ -210,6 +213,43 @@ decision it had not finished forming for. Each bar size has its own store
 (`bars_1week`, `bars_1day`, …) and its own cache folder
 (`data/ibkr_cache/weekly`, `daily`, …).
 
+### Splits and dividends
+
+IBKR serves two price series. **TRADES** is adjusted for splits but not
+dividends; it exists for every bar size and can be paged backwards. **ADJUSTED_LAST**
+is adjusted for both, but only up to today and only for bars of a day or less.
+Following the expert's rule (the primary copy is the series as traded; the
+adjustment lives in a separate table and is applied when the data is read;
+a pre-adjusted series is never the primary copy, because every dividend
+rewrites all of its history):
+
+| layer | holds | written by |
+|---|---|---|
+| `data/ibkr_cache/<frequency>/` | TRADES bars, as traded | `fetch`, `refresh`, `backfill` |
+| `data/ibkr_cache/factors/` | one factor per session: ADJUSTED_LAST ÷ TRADES on its close, i.e. the product of (1 − dividend ÷ price) over every later ex-date; 1.0 on the day of the download | the same commands, from two daily requests |
+| `var/store/` | TRADES × factor: the total-return series the engine reads | `ingest`, `refresh` |
+
+Volume is not adjusted (splits are already in TRADES; a cash dividend does not
+change the share count). A weekly bar is grouped from daily TRADES; in a week
+with an ex-date, the sessions before it are put at the week-end scale, a ratio
+that never changes once the week is over, and the store applies the factor of
+the week's last session. Live stops need no conversion: they are anchored on
+fills, or on the latest bar, whose factor is 1 right after a refresh.
+
+Two checks join downloads made on different days:
+
+- **A new dividend** since the last download multiplies every earlier factor by
+  one constant. The stored factors are rescaled by it, and every stored bar is
+  revised (the old values stay, as of before).
+- **A split** since the last download shows as one constant ratio between the
+  new and the cached closes. The symbol's whole history is downloaded again,
+  never patched.
+
+A ratio that is not one constant means the two downloads disagree about more
+than a split or a dividend; the symbol is refused and its cache left as it was.
+
+### The store
+
 The store is **bitemporal**: every row carries both the week it describes and
 the moment it was recorded. When IBKR restates history, for example after a
 split, the new values are added as a revision and nothing is overwritten. A
@@ -224,20 +264,27 @@ ql data refresh
 It works on the configured strategy's bar size (`--interval` chooses another).
 For every instrument in the universe, it does four things:
 
-1. Asks the gateway for recent bars: the last two years of weekly bars, one year
-   of daily bars, ten days of hourly or two days of minute bars.
-2. Merges any week split across a holiday into one bar. IBKR sometimes returns
-   two bars for one week.
-3. Drops the current bar while it is still incomplete.
-4. Updates the CSV cache and appends only what is new or restated to the store,
-   stamped with the moment of the fetch.
+1. Asks the gateway for recent TRADES bars: two years of daily bars grouped into
+   weeks (IBKR cannot adjust bars longer than a day), one year of daily bars,
+   ten days of hourly or two days of minute bars. Plus daily ADJUSTED_LAST over
+   the same window, for the dividend factors. A symbol with no factors yet gets
+   its whole history, once.
+2. Drops the first, partial week of the window and the current bar while it is
+   still incomplete.
+3. Checks the new download against the cache: a new dividend rescales the
+   factors, a split downloads the whole history again, anything else is refused
+   (section 3, "Splits and dividends").
+4. Updates the cache and the factors, and appends to the store only what is new
+   or restated (TRADES × factor), stamped with the moment of the fetch. After a
+   new dividend or a split, that is every bar.
 
-The output lists new weeks and revisions per instrument. An instrument that
-failed is shown with its error; the others still update.
+The output lists new weeks, revisions and a note per instrument ("dividend
+since the last refresh", "split … full history downloaded again"). An instrument
+that failed is shown with its error; the others still update.
 
-**Why two years and not one week.** A split restates the whole history of the
-stock. Re-fetching two years picks up a recent restatement, and the store keeps
-both versions.
+**Why two years and not one week.** The overlap with the cache is what the two
+checks compare; a longer window also picks up a vendor's correction of recent
+bars. The store keeps every version.
 
 **Options:** `--symbols AAPL,MSFT` refreshes only those symbols. `--duration "5 Y"`
 reaches further back. `-v` lists every instrument, including unchanged ones.
@@ -284,11 +331,12 @@ seeing which one backtests better is selection bias with extra steps.
 ql data fetch --symbols NFLX,ORCL,ADBE,CRM,NOW --freq weekly
 ```
 
-This asks the gateway for the full weekly history of each symbol, converts it,
-validates it, and writes one CSV per symbol to `data/ibkr_cache/weekly/`. The
-host, port and client id come from the strategy's config (with several
-configured, put `--strategy <name>` before `data`); `--port` overrides them. IBKR caps one request at roughly 1,000 bars, which is about 20 years of
-weekly bars.
+This asks the gateway for 22 years of daily TRADES and daily ADJUSTED_LAST for
+each symbol (4 years with `--freq daily`), derives the dividend factors,
+validates both, and writes the bars to `data/ibkr_cache/weekly/` (grouped into
+weeks) and the factors to `data/ibkr_cache/factors/`. It replaces the symbol's
+file. The host, port and client id come from the strategy's config (with several
+configured, put `--strategy <name>` before `data`); `--port` overrides them.
 
 **When a symbol comes back empty**, the output prints what IBKR said, with a
 plain-language hint, and the gateway's data-farm status at connection:
@@ -298,12 +346,11 @@ plain-language hint, and the gateway's data-farm status at connection:
 | no reply within Ns, or 366 | the request timed out and was cancelled | check the HMDS farm line; retry with `--timeout 300` or a shorter `--duration "10 Y"` |
 | 162 … no market data permissions | the login has no data for it | paper accounts: turn on market-data sharing with the live account (Client Portal → Settings → Paper Trading Account); the live account needs a US stock subscription |
 | 354 / 10168 | no subscription / no market data | as above |
-| 321 … Multi day bar size not supported with adjusted last | fixed in the code: weekly now asks for daily bars and groups them into weeks | update the repo |
+| 321 … Multi day bar size not supported with adjusted last | an adjusted request for bars longer than a day | fixed in the code (weekly bars are grouped from daily); update the repo |
 | 2105 / 2107 HMDS … broken / inactive | the historical data farm is down | wait and retry; `inactive` usually connects on the first request |
 
 Options: `--duration` (IBKR syntax), `--timeout` seconds per request (default
-120), `--attempts` per symbol (default 2), `--what TRADES` for raw instead of
-split- and dividend-adjusted prices (do not mix the two in one cache).
+120), `--attempts` per request (default 2).
 
 ### Step 4.2b — Or import saved payloads (no gateway needed)
 
@@ -314,6 +361,10 @@ Ask for the instruments, and the payloads are saved as JSON. Then import them:
 ql data import --from-dir var/incoming --freq weekly
 ql data import NFLX=nflx.json ORCL=orcl.json --freq weekly
 ```
+
+The connector serves prices as traded but not the adjusted series, so imported
+symbols have no dividend factors: `ingest` lists them as price-only until they
+are fetched through the gateway.
 
 Both paths validate before they write anything. Mismatched array lengths,
 non-positive prices, bars whose high is below their low, and duplicate
@@ -737,7 +788,7 @@ each stands:
 | prerequisite | status | how |
 |---|---|---|
 | the exchange's session calendar: holidays, 13:00 half days, the regular session apart from pre- and after-market | **done** | `data/calendar.py`, from the maintained `exchange_calendars` package. Intraday bars outside the regular session are dropped; a bar ends at the session close if that comes first; `propose` refuses unless the last bar that should have closed is in the data. |
-| 3-5 years of intraday history (the market's regimes are counted in years, not bars), cleaned: split-adjusted, no impossible bars, regular session only | **tooling done; the data is yours to fetch** | `ql data backfill --interval hour --years 5` pages back through IBKR's history at IBKR's pacing limit (60 requests per 10 minutes), resumably, and says where the broker's history ends. Hourly bars for the whole universe take roughly an hour; minute bars about half a day. Then `ql data ingest --rebuild`. `propose` refuses an intraday strategy with less than 3 years in the store. |
+| 3-5 years of intraday history (the market's regimes are counted in years, not bars), cleaned: split-adjusted, no impossible bars, regular session only | **tooling done; the data is yours to fetch** | `ql data backfill --interval hour --years 5` pages back through IBKR's TRADES history at IBKR's pacing limit (60 requests per 10 minutes), resumably, and says where the broker's history ends. Two daily requests per symbol first give the dividend factors for the span (IBKR cannot page adjusted data); the first page reaches one day into the cache, and a split since the cache was written starts the symbol again from now. Hourly bars for the whole universe take roughly an hour; minute bars about half a day. Then `ql data ingest --rebuild`. `propose` refuses an intraday strategy with less than 3 years in the store. |
 | a strategy validated on that data, with an intraday cost model (spread paid, square-root market impact, per-share commission) and the funnel's purge and embargo set by the trade's lifetime and the longest feature memory | **not started** | This is research, not plumbing: no intraday strategy exists yet. The funnel runs on any bar size; the cost model needs the spread and impact terms added before its results mean anything. |
 | a process running through the session | **hourly: done; minute: not built** | `ql live auto schedule` writes a Mac launch job that runs `ql live cycle` every hour of the US session. Minute bars need a program that runs continuously; that is not built. |
 | automation | **done** | A person cannot approve every hour. Step 9.9. |
@@ -1477,6 +1528,7 @@ for example `configs/strategies/momentum-paper.yaml`, and select it with
 | path | what | if lost |
 |---|---|---|
 | `data/ibkr_cache/` | raw CSVs from IBKR, not in git | Re-fetch with `ql data fetch` (step 2.2); the store's recorded revisions go with `var/store`. Back it up. |
+| `data/ibkr_cache/factors/` | dividend factors, one file per symbol, not in git | Re-fetch with `ql data fetch`; without them the store is price-only. Back it up with the cache. |
 | `var/store/` | derived store | Rebuild: `ql data ingest --rebuild`. |
 | `state/live/<id>/<mode>-journal.jsonl` | **every live event of one strategy; its sleeve is replayed from it** | **Not recoverable.** The sleeve's history, costs and overrides are gone. |
 | `state/live/<id>/<mode>-baseline.json` | the monitoring reference | Rebuild with `ql monitor baseline`. |

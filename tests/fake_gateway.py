@@ -28,6 +28,9 @@ class FakeGateway:
         self._exec = 1
         self.placed = 0
         self.history: dict[str, list] = {}
+        self.adjusted_history: dict[str, list] = {}  # ADJUSTED_LAST; TRADES when absent
+        self.history_kinds: list[str] = []
+        self.rejected: list[tuple[str, str]] = []
         #: Shortable shares per symbol; a symbol not listed reports nothing.
         self.shortable: dict[str, float] = {}
         #: Initial margin per unit of short notional, for what-if orders.
@@ -117,23 +120,38 @@ class FakeGateway:
         return rows
 
     def reqHistoricalData(self, contract, **kwargs):
-        bars = list(self.history.get(contract.symbol, []))
         end = kwargs.get("endDateTime")
+        what = kwargs.get("whatToShow", "TRADES")
+        size = str(kwargs.get("barSizeSetting", ""))
         self.history_requests.append((contract.symbol, kwargs.get("durationStr"), end))
+        self.history_kinds.append(what)
+        if what == "ADJUSTED_LAST":
+            unit = size.split()[-1].lower() if size else ""
+            if end or unit.startswith(("week", "month")) or (
+                unit.startswith("day") and not size.startswith("1 ")
+            ):
+                # IBKR: error 321, then nothing until the request times out.
+                self.rejected.append((contract.symbol, size))
+                return []
+            if contract.symbol in self.adjusted_history:
+                return list(self.adjusted_history[contract.symbol])
+        bars = list(self.history.get(contract.symbol, []))
         if end:
             span = _duration(kwargs.get("durationStr") or "1 Y")
             bars = [b for b in bars if _utc(b.date) < end and _utc(b.date) >= end - span]
         return bars
 
-    def serve_history(self, symbol, frame):
-        """Make ``reqHistoricalData`` return this OHLCV frame as ib_async bars."""
-        self.history[symbol] = [
-            ib_async.BarData(
-                date=label.date(), open=float(r["open"]), high=float(r["high"]),
-                low=float(r["low"]), close=float(r["close"]), volume=float(r["volume"]),
-            )
-            for label, r in frame.iterrows()
-        ]
+    def serve_history(self, symbol, frame, adjusted=None):
+        """Make ``reqHistoricalData`` return this OHLCV frame as ib_async bars.
+
+        ``frame`` is the TRADES series; ``adjusted``, if given, is what an
+        ADJUSTED_LAST request returns (otherwise the same bars: no dividends).
+        """
+        self.history[symbol] = _bars(frame)
+        if adjusted is not None:
+            self.adjusted_history[symbol] = _bars(adjusted)
+        else:
+            self.adjusted_history.pop(symbol, None)
 
     def serve_intraday(self, symbol, frame):
         """Make ``reqHistoricalData`` return this frame's bars, labelled by UTC start."""
@@ -262,3 +280,13 @@ def _duration(text):
     number, unit = text.split()
     days = {"S": 1 / 86400, "D": 1, "W": 7, "M": 30.5, "Y": 365.25}[unit.upper()]
     return timedelta(days=float(number) * days)
+
+
+def _bars(frame):
+    return [
+        ib_async.BarData(
+            date=label.date(), open=float(r["open"]), high=float(r["high"]),
+            low=float(r["low"]), close=float(r["close"]), volume=float(r["volume"]),
+        )
+        for label, r in frame.iterrows()
+    ]

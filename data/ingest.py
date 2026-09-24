@@ -226,8 +226,15 @@ def ingest_directory(
     symbols: Sequence[str] | None = None,
     now: datetime | None = None,
     interval: BarInterval | None = None,
+    factors: Path | None = None,
 ) -> dict[str, int]:
     """Load every price CSV in a directory into the store.
+
+    The CSVs are IBKR's TRADES series (adjusted for splits only). When
+    ``factors`` names the cache's factor directory, each bar is multiplied by
+    its dividend factor on the way in (``data.adjustments``), so the store holds
+    the total-return series and the cache stays as traded. A symbol without a
+    factor file goes in unadjusted (price-only).
 
     Args:
         source: Directory of ``<SYMBOL>.csv`` files.
@@ -238,6 +245,7 @@ def ingest_directory(
             a partial bar's high, low and close are not final, and a partial bar
             is a live-versus-backtest discrepancy waiting to happen.
         interval: The bar size of the files.
+        factors: The directory of ``<SYMBOL>.csv`` dividend factors, if any.
 
     Returns:
         Symbol to number of observations written.
@@ -257,6 +265,10 @@ def ingest_directory(
         bars = complete_bars(bars, now or datetime.now(timezone.utc), interval=kind)
         if bars.empty:
             continue
+        if factors is not None:
+            from data.adjustments import adjust, read_factors
+
+            bars = adjust(bars, read_factors(factors.parent, symbol), kind)
         written[symbol] = store.append(
             InstrumentId(symbol), to_observations(bars, interval=kind)
         )

@@ -292,9 +292,10 @@ def cmd_data_refresh(ctx: Context, args) -> int:
                       symbols=symbols, duration=args.duration)
     failed = [r for r in results if r.error]
     noun = interval.noun
-    _table(ctx, ("instrument", f"new {noun}s", "revised", f"last {noun}", "error"),
-           [(r.instrument, r.new_bars, r.revised_bars, r.last_bar, r.error or "")
-            for r in results if r.error or r.new_bars or r.revised_bars or args.verbose])
+    _table(ctx, ("instrument", f"new {noun}s", "revised", f"last {noun}", "error / note"),
+           [(r.instrument, r.new_bars, r.revised_bars, r.last_bar, r.error or r.note)
+            for r in results
+            if r.error or r.note or r.new_bars or r.revised_bars or args.verbose])
     ctx.out(f"\n{len(results)} instruments, {sum(r.new_bars for r in results)} new {noun}s, "
             f"{sum(r.revised_bars for r in results)} revisions, {len(failed)} failed")
     if any(r.revised_bars for r in results):
@@ -321,7 +322,7 @@ def cmd_data_backfill(ctx: Context, args) -> int:
                        chunk=chunk)
     _table(ctx, ("instrument", "bars added", "first bar", "requests", "note"), [
         (r.instrument, r.bars_added, r.first_bar or "—", r.requests,
-         r.error or ("the broker has nothing older" if r.exhausted else ""))
+         r.error or r.note or ("the broker has nothing older" if r.exhausted else ""))
         for r in results
     ])
     ctx.out("\nnext: `ql data ingest --rebuild` to load the cache into the store")

@@ -31,6 +31,7 @@ CACHE_COLUMNS = ("open", "high", "low", "close", "volume")
 
 #: What the ingest reads. Anything else is a different dataset, not a variant.
 FREQUENCIES = ("weekly", "daily", "hourly", "minute")
+INTRADAY_FREQUENCIES = ("hourly", "minute")
 
 
 def bars_from_connector(payload: Mapping[str, Any]) -> pd.DataFrame:
@@ -116,7 +117,14 @@ def write_cache_csv(
     target = root / frequency / f"{symbol}.csv"
     target.parent.mkdir(parents=True, exist_ok=True)
     out = bars.copy()
-    out.index = out.index.strftime("%Y-%m-%d")
+    stamps = pd.DatetimeIndex(out.index)
+    if frequency in INTRADAY_FREQUENCIES:
+        # Intraday labels keep their time, in UTC: a date alone would give every
+        # bar of a session the same label.
+        stamps = stamps.tz_localize("UTC") if stamps.tz is None else stamps.tz_convert("UTC")
+        out.index = [t.isoformat() for t in stamps]
+    else:
+        out.index = stamps.strftime("%Y-%m-%d")
     out.index.name = "timestamp"
     out[list(CACHE_COLUMNS)].to_csv(target)
     return target

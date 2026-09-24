@@ -475,19 +475,35 @@ class IBKRBroker:
         return MarginVerdict(True, f"initial margin {after:,.0f} of {equity:,.0f}", after, equity)
 
     def historical_bars(
-        self, instrument: InstrumentId, bar_size: str, duration: str, end: datetime | None = None
+        self,
+        instrument: InstrumentId,
+        bar_size: str,
+        duration: str,
+        end: datetime | None = None,
+        what: str = "TRADES",
     ):
         """Price history through the same connection, as an ib_async bar list.
 
         ``end``: the last moment to fetch up to, for paging backwards through
         long histories; now when omitted. Regular trading hours only.
+
+        ``what``: ``TRADES`` (adjusted for splits, not dividends: the primary
+        series, see ``data.adjustments``) or ``ADJUSTED_LAST`` (also dividends).
+        IBKR accepts ADJUSTED_LAST only without an end date and for bars of a day
+        or less; anything else it rejects and then lets time out, so it is
+        refused here instead.
         """
+        if what == "ADJUSTED_LAST" and (end is not None or not _at_most_a_day(bar_size)):
+            raise ContractViolation(
+                f"IBKR serves ADJUSTED_LAST only up to now and for bars of a day or less; "
+                f"asked for {bar_size!r}{' with an end date' if end is not None else ''}"
+            )
         return self._ib.reqHistoricalData(
             self._stock(instrument),
             endDateTime="" if end is None else end.astimezone(timezone.utc),
             durationStr=duration,
             barSizeSetting=bar_size,
-            whatToShow="ADJUSTED_LAST",
+            whatToShow=what,
             useRTH=True,
             formatDate=2,
         )
@@ -546,3 +562,11 @@ def _number(value) -> float:
     """IBKR reports margin figures as strings, with a huge sentinel for 'unset'."""
     number = float(value)
     return 0.0 if number > 1e300 else number
+
+
+def _at_most_a_day(bar_size: str) -> bool:
+    """Whether an IBKR bar size is one day or shorter ("1 day", "1 hour", "5 mins"...)."""
+    unit = bar_size.split()[-1].lower()
+    if unit.startswith(("sec", "min", "hour")):
+        return True
+    return unit.startswith("day") and bar_size.split()[0] == "1"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -11,6 +12,7 @@ pytest.importorskip("ib_async")
 
 from contracts.identifiers import InstrumentId  # noqa: E402
 from contracts.live import TradingMode  # noqa: E402
+from contracts.temporal import BarInterval  # noqa: E402
 from data.bitemporal import BitemporalStore  # noqa: E402
 from data.vendor import write_cache_csv  # noqa: E402
 from execution.ibkr import IBKRBroker  # noqa: E402
@@ -122,3 +124,120 @@ def test_the_live_market_schedules_the_decision_after_the_fetch(setup, tmp_path)
     market = load_market(tmp_path / "store", interval=BarInterval.WEEK)
     assert market.schedule[-1] == SATURDAY
     assert market.schedule[-2].weekday() == 4, "historical weeks are decided on Friday evening"
+
+
+# -- TRADES in the cache, dividend factors beside it (data.adjustments) ------------------
+
+NEXT_SATURDAY = datetime(2026, 10, 3, 10, 0, tzinfo=timezone.utc)
+
+
+def with_dividend(frame, before, factor):
+    """What ADJUSTED_LAST returns when a dividend goes ex on ``before``."""
+    out = frame.copy()
+    for column in ("open", "high", "low", "close"):
+        out.loc[out.index < before, column] *= factor
+    return out
+
+
+def test_every_request_is_one_ibkr_accepts(setup):
+    frames, cache, gateway, broker, store = setup
+    gateway.serve_history("AAA", served(frames["AAA"]))
+    refresh_weekly(broker, cache, store, SATURDAY, symbols=["AAA"])
+    assert not gateway.rejected
+    assert set(gateway.history_kinds) == {"TRADES", "ADJUSTED_LAST"}
+    from contracts.errors import ContractViolation
+
+    with pytest.raises(ContractViolation):
+        broker.historical_bars(AAA, "1 week", "2 Y", what="ADJUSTED_LAST")
+    with pytest.raises(ContractViolation):
+        broker.historical_bars(AAA, "1 hour", "1 M", end=SATURDAY, what="ADJUSTED_LAST")
+
+
+def test_the_first_refresh_without_factors_takes_the_whole_history(setup):
+    frames, cache, gateway, broker, store = setup
+    gateway.serve_history("AAA", served(frames["AAA"]))
+    (result,) = refresh_weekly(broker, cache, store, SATURDAY, symbols=["AAA"])
+    assert "full history" in result.note
+    assert (cache / "factors" / "AAA.csv").exists()
+    assert gateway.history_requests[0][1] != "2 Y", "a span covering the cache, not the window"
+
+
+def test_a_dividend_since_the_last_refresh_revises_the_whole_history(setup):
+    frames, cache, gateway, broker, store = setup
+    gateway.serve_history("AAA", served(frames["AAA"]))
+    refresh_weekly(broker, cache, store, SATURDAY, symbols=["AAA"])
+
+    history = served(frames["AAA"], extra_weeks=2)
+    ex = history.index[-1]  # went ex in the newest week
+    gateway.serve_history("AAA", history, adjusted=with_dividend(history, ex, 0.99))
+    (result,) = refresh_weekly(broker, cache, store, NEXT_SATURDAY, symbols=["AAA"])
+
+    assert "dividend" in result.note and result.new_weeks == 1
+    assert result.revised_weeks >= len(frames["AAA"]) - 2, "every earlier week, not the window"
+    cached = pd.read_csv(cache / "weekly" / "AAA.csv", parse_dates=["timestamp"])
+    assert cached["close"].iloc[-3] == pytest.approx(history["close"].iloc[-3]), \
+        "the cache keeps the price as traded"
+    known = store.as_of(AAA, NEXT_SATURDAY)
+    assert known["close"].iloc[-3] == pytest.approx(history["close"].iloc[-3] * 0.99)
+    assert known["close"].iloc[-1] == pytest.approx(history["close"].iloc[-1])
+    pinned = store.as_of(AAA, datetime(2026, 9, 30, tzinfo=timezone.utc))
+    assert pinned["close"].iloc[-1] == pytest.approx(history["close"].iloc[-2]), \
+        "a query pinned before the refresh still sees the old scale"
+    assert known["close"].iloc[-2] == pytest.approx(history["close"].iloc[-2] * 0.99)
+
+
+def test_a_split_since_the_last_download_downloads_the_history_again(setup):
+    frames, cache, gateway, broker, store = setup
+    gateway.serve_history("AAA", served(frames["AAA"]))
+    refresh_weekly(broker, cache, store, SATURDAY, symbols=["AAA"])
+
+    split = served(frames["AAA"], extra_weeks=2)
+    for column in ("open", "high", "low", "close"):
+        split[column] = split[column] / 2
+    gateway.serve_history("AAA", split)
+    before = len(gateway.history_requests)
+    (result,) = refresh_weekly(broker, cache, store, NEXT_SATURDAY, symbols=["AAA"])
+
+    assert "split" in result.note and "x0.5" in result.note
+    spans = [r[1] for r in gateway.history_requests[before:]]
+    assert spans[0] == "2 Y" and spans[-1] != "2 Y", "the window first, then the whole history"
+    cached = pd.read_csv(cache / "weekly" / "AAA.csv")
+    assert cached["close"].iloc[-3] == pytest.approx(split["close"].iloc[-3])
+    assert store.as_of(AAA, NEXT_SATURDAY)["close"].iloc[-3] == pytest.approx(
+        split["close"].iloc[-3])
+
+
+def test_a_download_that_disagrees_with_the_cache_is_refused(setup):
+    frames, cache, gateway, broker, store = setup
+    gateway.serve_history("AAA", served(frames["AAA"]))
+    refresh_weekly(broker, cache, store, SATURDAY, symbols=["AAA"])
+    before = (cache / "weekly" / "AAA.csv").read_text()
+
+    noisy = served(frames["AAA"], extra_weeks=2)
+    noisy.iloc[-30:-20, noisy.columns.get_loc("close")] *= 1.04
+    gateway.serve_history("AAA", noisy)
+    (result,) = refresh_weekly(broker, cache, store, NEXT_SATURDAY, symbols=["AAA"])
+
+    assert "more than one constant" in result.error
+    assert (cache / "weekly" / "AAA.csv").read_text() == before, "the cache is left untouched"
+
+
+def test_ingest_multiplies_the_cache_by_its_factors(tmp_path):
+    from data.adjustments import write_factors
+    from data.ingest import ingest_directory
+
+    frames = build_market(tmp_path / "unused")
+    cache = tmp_path / "cache"
+    for symbol in ("AAA", "BBB"):
+        write_cache_csv(symbol, frames[symbol], cache, "weekly")
+    days = pd.bdate_range(frames["AAA"].index[0], frames["AAA"].index[-1] + pd.Timedelta(days=4))
+    factors = pd.Series(np.where(days < frames["AAA"].index[40], 0.97, 1.0), index=days)
+    write_factors(cache, "AAA", factors)
+    store = BitemporalStore(tmp_path / "store", "bars_1week")
+    ingest_directory(cache / "weekly", store, interval=BarInterval.WEEK,
+                     factors=cache / "factors", now=SATURDAY)
+    aaa = store.as_of(AAA, SATURDAY)["close"].to_numpy()
+    assert np.allclose(aaa[:40], frames["AAA"]["close"].to_numpy()[:40] * 0.97)
+    assert np.allclose(aaa[40:], frames["AAA"]["close"].to_numpy()[40:])
+    bbb = store.as_of(InstrumentId("BBB"), SATURDAY)["close"].to_numpy()
+    assert np.allclose(bbb, frames["BBB"]["close"].to_numpy()), "no factors: price-only"

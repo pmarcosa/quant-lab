@@ -280,12 +280,47 @@ def test_backfill_pages_back_paced_resumable_and_regular_hours_only(tmp_path):
                          chunk="1 Y", sleep=waits.append)
     assert result.exhausted, "the broker ran out of history before three years"
     assert result.first_bar.startswith("2024-06-03T13:30"), "the first regular bar, not pre-market"
-    assert result.requests == 4 and len(waits) == 3 and all(w >= 10 for w in waits)
+    # Two daily requests for the dividend factors, then four pages of TRADES.
+    assert result.requests == 6 and len(waits) == 5 and all(w >= 10 for w in waits)
+    assert gateway.history_kinds[:2] == ["TRADES", "ADJUSTED_LAST"]
+    assert set(gateway.history_kinds[2:]) == {"TRADES"}, "pages are TRADES: IBKR pages nothing else"
+    assert not gateway.rejected
     cached = pd.read_csv(tmp_path / "hourly" / "AAA.csv", parse_dates=["timestamp"])
     assert len(cached) == result.bars_added
+    assert cached["timestamp"].is_unique, "intraday labels keep their time"
+    assert str(cached["timestamp"].iloc[0]).startswith("2024-06-03 13:30:00+00:00")
+    assert (tmp_path / "factors" / "AAA.csv").exists()
     again = backfill(broker, tmp_path, BarInterval.HOUR, now, years=3, symbols=["AAA"],
                      chunk="1 Y", sleep=waits.append)[0]
     assert again.bars_added == 0, "resumes from the earliest cached bar"
+
+
+@needs_calendar
+def test_backfill_starts_again_when_a_split_rescaled_the_history(tmp_path):
+    pytest.importorskip("ib_async")
+    from contracts.live import TradingMode
+    from execution.ibkr import IBKRBroker
+    from runtime.refresh import backfill
+    from tests.fake_gateway import FakeGateway
+
+    history = hourly_frame("2025-06-02", "2026-09-18")
+    gateway = FakeGateway()
+    gateway.serve_intraday("AAA", history)
+    broker = IBKRBroker(gateway, "DU1234567", TradingMode.PAPER, settle_seconds=0)
+    now = datetime(2026, 9, 19, 12, tzinfo=UTC)
+    backfill(broker, tmp_path, BarInterval.HOUR, datetime(2026, 3, 2, tzinfo=UTC), years=0.5,
+             symbols=["AAA"], chunk="1 M", sleep=lambda _: None)  # a cache written in March
+    split = history.copy()
+    for column in ("open", "high", "low", "close"):
+        split[column] = split[column] / 4
+    gateway.serve_intraday("AAA", split)
+    (result,) = backfill(broker, tmp_path, BarInterval.HOUR, now, years=2, symbols=["AAA"],
+                         chunk="1 Y", sleep=lambda _: None)  # reaches past the cache
+    assert "split" in result.note and "x0.25" in result.note
+    cached = pd.read_csv(tmp_path / "hourly" / "AAA.csv", parse_dates=["timestamp"])
+    assert cached["close"].iloc[0] == pytest.approx(split["close"].iloc[0]), \
+        "the whole cache is at the new scale"
+    assert cached["timestamp"].is_unique
 
 
 def test_an_intraday_strategy_is_not_ready_without_years_of_history(tmp_path):

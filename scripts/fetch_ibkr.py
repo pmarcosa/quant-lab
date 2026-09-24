@@ -12,8 +12,16 @@ network: a run that silently re-fetched would give different answers depending
 on whether the market was open, and the point of committing the raw CSVs is that
 a result can be reproduced years later from the repository alone.
 
+Each symbol takes two daily requests: TRADES (adjusted for splits, not
+dividends), which is what the cache keeps, and ADJUSTED_LAST, whose ratio to
+TRADES is the day's dividend factor, kept in ``data/ibkr_cache/factors/``. The
+store applies the factors when it is built (``data.adjustments``, the expert's
+rule: the primary copy is the series as traded, never a pre-adjusted one).
+Weekly bars are grouped from the daily ones.
+
 If IB Gateway is not available, use ``scripts/import_ibkr_json.py`` instead —
-it takes the same payloads from any source that can talk to IBKR.
+it takes the same payloads from any source that can talk to IBKR (without
+dividend factors: those symbols stay price-only until fetched here).
 """
 
 from __future__ import annotations
@@ -25,16 +33,22 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from contracts.errors import ContractViolation  # noqa: E402
-from data.ingest import weeks_from_days  # noqa: E402
+from data.adjustments import (  # noqa: E402
+    factors_from,
+    merge_factors,
+    read_factors,
+    weeks_from_trades,
+    write_factors,
+)
 from data.vendor import cache_inventory, check_coverage, write_cache_csv  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / "data" / "ibkr_cache"
 
-#: What each frequency asks IBKR for. Weekly asks for *daily* bars and groups
-#: them into ISO weeks here: IBKR refuses adjusted prices for any bar longer
-#: than a day ("Multi day bar size not supported with adjusted last", 321).
-BAR_SIZE = {"weekly": "1 day", "daily": "1 day"}
+#: Both frequencies ask for daily bars: IBKR serves ADJUSTED_LAST only for bars
+#: of a day or less (321, "Multi day bar size not supported with adjusted
+#: last"), and the factors are daily. Weekly bars are grouped here.
+BAR_SIZE = "1 day"
 DURATION = {"weekly": "22 Y", "daily": "4 Y"}
 
 
@@ -65,25 +79,23 @@ def fetch(
     port: int,
     client_id: int,
     duration: str | None = None,
-    what: str = "ADJUSTED_LAST",
     timeout: float = 120.0,
     attempts: int = 2,
 ) -> int:
-    """Connect, fetch each symbol, write the cache. Returns how many were written.
+    """Connect, fetch each symbol, write the cache and its factors.
 
-    Every message IBKR sends about a request is printed with the symbol, so a
-    failure says why rather than only that nothing came back.
+    Returns how many symbols were written. Every message IBKR sends about a
+    request is printed with the symbol, so a failure says why rather than only
+    that nothing came back.
     """
     try:
-        from ib_async import IB, Stock, util
+        from ib_async import IB, Stock
     except ImportError:  # pragma: no cover - depends on the optional extra
         print(
             'ib_async is not installed. Run: pip install -e ".[ibkr]"',
             file=sys.stderr,
         )
         return 0
-
-    import pandas as pd
 
     ib = IB()
     messages: list[tuple[int, str]] = []
@@ -109,59 +121,75 @@ def fetch(
     if any(code in FARM_CODES for code, _ in messages):
         print()
 
+    span = duration or DURATION[frequency]
     written = 0
     try:
         for symbol in symbols:
             contract = Stock(symbol, "SMART", "USD")
-            bars = []
             try:
                 if not ib.qualifyContracts(contract):
                     print(f"{symbol:<8} SKIPPED  IBKR does not recognise it as a US stock",
                           file=sys.stderr)
                     continue
-                for attempt in range(1, attempts + 1):
-                    del messages[:]
-                    bars = ib.reqHistoricalData(
-                        contract,
-                        endDateTime="",  # must be empty for ADJUSTED_LAST
-                        durationStr=duration or DURATION[frequency],
-                        barSizeSetting=BAR_SIZE[frequency],
-                        whatToShow=what,
-                        useRTH=True,
-                        formatDate=1,
-                        timeout=timeout,
-                    )
-                    if bars:
-                        break
-                    _explain(symbol, attempt, attempts, timeout, messages)
-                    if any(code in REJECTIONS for code, _ in messages):
-                        break  # the same request would be refused again
+                request = (ib, contract, symbol, span, messages, timeout, attempts)
+                trades = _history(*request, what="TRADES")
+                adjusted = _history(*request, what="ADJUSTED_LAST") if trades is not None else None
             except Exception as error:  # pragma: no cover - needs a live gateway
                 print(f"{symbol:<8} SKIPPED  {error}", file=sys.stderr)
                 continue
-
-            frame = util.df(bars) if bars else None
-            if frame is None or frame.empty:
+            if trades is None or adjusted is None:
                 print(f"{symbol:<8} SKIPPED  no bars returned", file=sys.stderr)
                 continue
-            frame = frame.rename(columns={"date": "timestamp"})
-            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-            frame = frame.set_index("timestamp").sort_index()
-            if frequency == "weekly":
-                frame = weeks_from_days(frame[["open", "high", "low", "close", "volume"]])
             try:
-                write_cache_csv(symbol, frame, CACHE, frequency=frequency)
+                factors = factors_from(trades, adjusted)
+                merged, _ = merge_factors(read_factors(CACHE, symbol), factors)
+                bars = weeks_from_trades(trades, factors) if frequency == "weekly" else trades
+                write_cache_csv(symbol, bars, CACHE, frequency=frequency)
+                write_factors(CACHE, symbol, merged)
             except ContractViolation as error:
                 print(f"{symbol:<8} SKIPPED  {error}", file=sys.stderr)
                 continue
             written += 1
             print(
-                f"{symbol:<8} {len(frame):>5} bars  "
-                f"{frame.index[0].date()} to {frame.index[-1].date()}"
+                f"{symbol:<8} {len(bars):>5} bars  "
+                f"{bars.index[0].date()} to {bars.index[-1].date()}  "
+                f"dividend factor {float(factors.iloc[0]):.3f} at the start"
             )
     finally:
         ib.disconnect()
     return written
+
+
+def _history(ib, contract, symbol, span, messages, timeout, attempts, what):
+    """One daily series, retried; the frame, or None after explaining why not."""
+    import pandas as pd
+    from ib_async import util
+
+    bars = []
+    for attempt in range(1, attempts + 1):
+        del messages[:]
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime="",  # must be empty for ADJUSTED_LAST
+            durationStr=span,
+            barSizeSetting=BAR_SIZE,
+            whatToShow=what,
+            useRTH=True,
+            formatDate=1,
+            timeout=timeout,
+        )
+        if bars:
+            break
+        _explain(f"{symbol} {what}", attempt, attempts, timeout, messages)
+        if any(code in REJECTIONS for code, _ in messages):
+            break  # the same request would be refused again
+    frame = util.df(bars) if bars else None
+    if frame is None or frame.empty:
+        return None
+    frame = frame.rename(columns={"date": "timestamp"})
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    frame = frame.set_index("timestamp").sort_index()
+    return frame[["open", "high", "low", "close", "volume"]]
 
 
 def _explain(
@@ -197,10 +225,6 @@ def main(argv: list[str] | None = None) -> int:
              'A shorter span answers faster.',
     )
     parser.add_argument(
-        "--what", choices=("ADJUSTED_LAST", "TRADES"), default="ADJUSTED_LAST",
-        help="ADJUSTED_LAST (split- and dividend-adjusted, the default) or TRADES (raw)",
-    )
-    parser.add_argument(
         "--timeout", type=float, default=120.0,
         help="Seconds to wait for each request before giving up (default 120)",
     )
@@ -222,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"fetching {len(symbols)} {args.freq} series from {args.host}:{args.port}\n")
     written = fetch(
         symbols, args.freq, args.host, args.port, args.client_id,
-        duration=args.duration, what=args.what, timeout=args.timeout, attempts=args.attempts,
+        duration=args.duration, timeout=args.timeout, attempts=args.attempts,
     )
     if not written:
         return 1

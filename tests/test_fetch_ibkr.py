@@ -112,9 +112,11 @@ def test_weekly_asks_for_daily_bars_and_groups_them_into_weeks(script):
 
     frame = pd.read_csv(script.CACHE / "weekly" / "NFLX.csv", parse_dates=["timestamp"])
     first = frame.iloc[0]
-    assert str(first["timestamp"].date()) == "2024-01-01"
-    assert (first["open"], first["close"], first["volume"]) == (100, 104.5, 50)
-    assert (first["high"], first["low"]) == (105, 99)
+    # The window's first week is dropped (a window almost always opens mid-week);
+    # the first bar kept is the complete week of 8 January.
+    assert str(first["timestamp"].date()) == "2024-01-08"
+    assert (first["open"], first["close"], first["volume"]) == (107, 111.5, 50)
+    assert (first["high"], first["low"]) == (112, 106)
     iso = frame["timestamp"].dt.isocalendar()
     assert not iso.duplicated(subset=["year", "week"]).any()
 
@@ -125,3 +127,16 @@ def test_a_rejected_request_is_not_retried(script, capsys):
     assert script.fetch(["NFLX"], "weekly", "127.0.0.1", 4002, 1, attempts=3) == 0
     assert len(FakeIB.requests) == 1
     assert "IBKR 321" in capsys.readouterr().err
+
+
+def test_a_window_opening_mid_week_does_not_leave_a_short_first_week():
+    import pandas as pd
+
+    from data.ingest import weeks_from_days
+
+    days = pd.bdate_range("2024-01-03", "2024-01-26")  # opens on a Wednesday
+    daily = pd.DataFrame({"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 1.0},
+                         index=days)
+    weeks = weeks_from_days(daily)
+    assert [d.date().isoformat() for d in weeks.index] == ["2024-01-08", "2024-01-15", "2024-01-22"]
+    assert (weeks["volume"] == 5).all()

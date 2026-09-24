@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from contracts.errors import ContractViolation  # noqa: E402
-from data.ingest import merge_split_weeks  # noqa: E402
+from data.ingest import weeks_from_days  # noqa: E402
 from data.vendor import cache_inventory, check_coverage, write_cache_csv  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -148,7 +148,7 @@ def fetch(
             frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
             frame = frame.set_index("timestamp").sort_index()
             if frequency == "weekly":
-                frame = merge_split_weeks(frame[["open", "high", "low", "close", "volume"]])
+                frame = weeks_from_days(frame[["open", "high", "low", "close", "volume"]])
             try:
                 write_cache_csv(symbol, frame, CACHE, frequency=frequency)
             except ContractViolation as error:

@@ -182,6 +182,23 @@ def merge_split_weeks(bars: pd.DataFrame) -> pd.DataFrame:
     return merged.sort_index()
 
 
+def weeks_from_days(daily: pd.DataFrame) -> pd.DataFrame:
+    """Weekly bars from daily ones, without the window's first, partial week.
+
+    IBKR gives split- and dividend-adjusted prices only for bars of a day or
+    less, so weekly bars are built here from daily ones (:func:`merge_split_weeks`).
+    A window of daily bars ("2 Y" back from now) almost always opens mid-week:
+    its first ISO week holds only that week's last few sessions. Kept, it is a
+    short bar with the wrong open, and merged into a cache where fresh bars win
+    it would overwrite the complete week already there. Dropping it costs one
+    week at the far end of the window (for a name that listed inside the
+    window, its listing week).
+    """
+    if daily.empty:
+        return daily
+    return merge_split_weeks(daily).iloc[1:]
+
+
 def complete_bars(
     bars: pd.DataFrame,
     now: datetime,

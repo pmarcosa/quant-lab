@@ -36,7 +36,7 @@ import pandas as pd
 from contracts.identifiers import InstrumentId
 from contracts.temporal import BarInterval
 from data.bitemporal import BitemporalStore
-from data.ingest import complete_bars, merge_split_weeks, to_observations
+from data.ingest import complete_bars, merge_split_weeks, to_observations, weeks_from_days
 from data.vendor import CACHE_COLUMNS, cache_inventory, write_cache_csv
 
 PRICE_COLUMNS = ("open", "high", "low", "close")
@@ -183,7 +183,7 @@ def refresh(
             results.append(RefreshResult(symbol, 0, 0, "", error=str(error)))
             continue
         if interval is BarInterval.WEEK:
-            fresh = merge_split_weeks(fresh)
+            fresh = weeks_from_days(fresh)
         if interval.is_intraday:
             fresh = _regular(fresh)
         fresh = complete_bars(fresh, now, interval=interval)

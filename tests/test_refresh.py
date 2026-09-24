@@ -74,7 +74,9 @@ def test_a_restatement_arrives_as_a_revision_without_rewriting_the_past(setup):
         split[column] = split[column] / 2
     gateway.serve_history("AAA", split)
     (result,) = refresh_weekly(broker, cache, store, SATURDAY, symbols=["AAA"])
-    assert result.revised_weeks == len(split)
+    # Every served week but the first: a refresh window's first week is
+    # dropped as possibly partial (data.ingest.weeks_from_days).
+    assert result.revised_weeks == len(split) - 1
     before = datetime(2026, 9, 20, tzinfo=timezone.utc)
     assert store.as_of(AAA, before)["close"].iloc[-1] == pytest.approx(
         frames["AAA"]["close"].iloc[-1]

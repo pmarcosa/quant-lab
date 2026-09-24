@@ -439,6 +439,7 @@ def load_config(path: Path | None = None) -> LiveConfig:
             f"configs/strategies/<strategy_id>.yaml and fill in the account."
         )
     raw: dict[str, Any] = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    _refuse_unknown_keys(raw, source)
     try:
         strategy_id = str(raw.get("strategy_id") or "").strip()
         if not strategy_id:
@@ -470,6 +471,43 @@ def load_config(path: Path | None = None) -> LiveConfig:
     except (TypeError, ValueError) as error:
         raise ContractViolation(f"config: {error}") from error
     return config.validate()
+
+
+#: Every top-level key a config may have, and the dataclass behind each section.
+_SECTIONS = {
+    "gateway": GatewaySettings, "strategy": StrategySettings, "execution": ExecutionSettings,
+    "risk": RiskSettings, "monitoring": MonitoringSettings, "leverage": LeverageSettings,
+    "financing": FinancingSettings, "automation": AutomationSettings,
+}
+_TOP_LEVEL = frozenset({
+    "strategy_id", "mode", "account", "sleeve_capital", "proposal_ttl_hours",
+    "account_scope", "unmanaged", "state_dir", *_SECTIONS,
+})
+
+
+def _refuse_unknown_keys(raw: Mapping[str, Any], source: Path) -> None:
+    """A key the loader does not read is refused, never ignored.
+
+    An ignored key is a setting the user believes is in force and is not: a
+    universe written at the top level instead of under ``strategy:`` once let a
+    backtest choose from the whole store while its config said otherwise.
+    """
+    from dataclasses import fields
+
+    unknown = sorted(set(raw) - _TOP_LEVEL)
+    if not unknown:
+        return
+    hints = []
+    for key in unknown:
+        homes = [name for name, cls in _SECTIONS.items()
+                 if key in {f.name for f in fields(cls)}]
+        hints.append(f"{key!r} (did you mean it under {homes[0]}:?)" if homes else repr(key))
+    raise ContractViolation(
+        f"config {source.name}: unknown setting(s) {', '.join(hints)}. A setting the "
+        f"loader does not read would be silently ignored, so it is refused. Section "
+        f"settings are indented under their section, e.g.\n"
+        f"  strategy:\n    name: weekly-momentum\n    universe: <name>"
+    )
 
 
 def _strategy_settings(raw: Mapping[str, Any]) -> StrategySettings:

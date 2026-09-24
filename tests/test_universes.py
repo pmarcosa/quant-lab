@@ -236,3 +236,22 @@ def test_the_funnel_counts_the_grid_and_varies_the_capital(tmp_path, capsys):
     assert f"research line           {len(momentum)} trials" in out, \
         "the grid's trials are in the funnel's count"
     assert "(4 backtests" not in out
+
+
+def test_a_setting_the_loader_does_not_read_is_refused(tmp_path):
+    from runtime.config import load_config
+
+    example = (__import__("pathlib").Path(__file__).resolve().parent.parent
+               / "configs" / "live.example.yaml").read_text()
+    misplaced = tmp_path / "momentum.yaml"
+    misplaced.write_text(example.replace("strategy_id: momentum",
+                                         "strategy_id: momentum\nuniverse: sector-etfs", 1))
+    with pytest.raises(ContractViolation, match="'universe' \\(did you mean it under strategy:"):
+        load_config(misplaced)
+    typo = tmp_path / "typo.yaml"
+    typo.write_text(example.replace("mode: paper", "mode: paper\nsleve_capital: 1", 1))
+    with pytest.raises(ContractViolation, match="'sleve_capital'"):
+        load_config(typo)
+    placed = tmp_path / "placed.yaml"
+    placed.write_text(example.replace("  # universe: sector-etfs", "  universe: sector-etfs", 1))
+    assert load_config(placed).strategy.universe == "sector-etfs"

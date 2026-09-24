@@ -234,8 +234,10 @@ def cmd_strategies(ctx: Context, args) -> int:
         journal = Journal(c.journal_path)
         opened = "open" if journal.is_open else "not opened"
         rows.append((c.strategy_id, c.strategy.name, interval_of(c).frequency,
+                     c.strategy.universe or "whole-store",
                      c.mode.value, c.account, f"{c.sleeve_capital:,.0f}", opened))
-    _table(ctx, ("id", "strategy", "bars", "mode", "account", "capital", "sleeve"), rows)
+    _table(ctx, ("id", "strategy", "bars", "universe", "mode", "account", "capital", "sleeve"),
+           rows)
     return 0
 
 
@@ -449,8 +451,13 @@ def cmd_backtest(ctx: Context, args) -> int:
     ctx.out(f"strategy     {strategy.version} ({chosen.name}, {interval.frequency})")
     ctx.out(f"settings     {shown} · stop {stop:.0%} · costs {args.cost_bps}+{args.slippage_bps} bp"
             + (" · shorts allowed" if risk.allow_short else ""))
+    named = f"config {config.source.name}" if config and config.source else "the config"
+    source = ("--universe" if args.universe else
+              named if config and chosen.universe else
+              f"{named} sets no strategy.universe" if config else
+              "no config")
     ctx.out(f"universe     {universe.describe() if universe else 'every instrument in the store'}"
-            f" · {len(market.universe.memberships())} with data")
+            f" · {len(market.universe.memberships())} with data ({source})")
     if market.missing:
         ctx.out(f"             not in the store, left out: {', '.join(market.missing)} "
                 f"(fetch them with `ql data fetch`)")

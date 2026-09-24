@@ -341,5 +341,5 @@ def test_ql_strategies_lists_every_configured_strategy(tmp_path):
     assert code == 0
     rows = {line.split()[0]: line.split() for line in out.splitlines()[2:]}
     assert set(rows) == {"alpha", "beta"}
-    assert rows["alpha"][1:5] == ["weekly-momentum", "weekly", "paper", "DU1111111"]
+    assert rows["alpha"][1:6] == ["weekly-momentum", "weekly", "whole-store", "paper", "DU1111111"]
     assert rows["beta"][-2:] == ["not", "opened"]

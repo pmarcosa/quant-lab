@@ -427,6 +427,11 @@ strategy:
   refuses: another universe is another strategy, so open a new strategy id.
 - Without a universe, a strategy chooses from every instrument in the store.
   That is the behaviour of configs written before universes existed.
+- `universe` goes **under `strategy:`**, indented. A key the loader does not
+  read, anywhere at the top level of a config, is refused with a hint rather
+  than ignored. To check what is in force: `ql strategies` lists each
+  strategy's universe, and `ql backtest` prints the universe it used and where
+  it came from.
 
 ### What expanding will not fix
 

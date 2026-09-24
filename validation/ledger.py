@@ -183,6 +183,34 @@ class ResearchLedger:
             return None
         return max(candidates, key=lambda t: t.metrics[metric])
 
+    def research_line(
+        self, strategy: str
+    ) -> tuple[np.ndarray, tuple[Trial, ...], tuple[Trial, ...]]:
+        """Every trial of one strategy family, whatever study recorded it.
+
+        The expert (2026-09-24): a new universe, other positions or other
+        rotation weeks are the same line of research, not a new hypothesis, so
+        all of its trials count toward one Deflated Sharpe -- manual backtests
+        included. Controls (another strategy family) are not candidates and are
+        left out.
+
+        Returns:
+            The ``T x N`` matrix of the trials sharing the most common series
+            length (for N_eff), those trials, and the others. The others cannot
+            be correlated without aligning dates, so a caller counts them at face
+            value: the conservative choice.
+        """
+        line = [t for t in self if str(t.version.strategy) == strategy]
+        with_returns = [t for t in line if t.returns]
+        if not with_returns:
+            return np.empty((0, 0)), (), tuple(line)
+        lengths = [len(t.returns) for t in with_returns]
+        longest = max(set(lengths), key=lengths.count)
+        kept = tuple(t for t in with_returns if len(t.returns) == longest)
+        others = tuple(t for t in line if t not in kept)
+        matrix = np.column_stack([np.asarray(t.returns, dtype=float) for t in kept])
+        return matrix, kept, others
+
     def returns_matrix(self, study: str) -> tuple[np.ndarray, tuple[Trial, ...]]:
         """Trial returns as a ``T x N`` matrix, for estimating how many were distinct.
 

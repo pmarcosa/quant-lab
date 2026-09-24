@@ -43,14 +43,20 @@ def backtest_report(
     settings: Mapping[str, Any],
     generated_at: datetime,
     benchmark: str = "SPY",
+    benchmark_market: Market | None = None,
 ) -> Report:
-    """A backtest: what it earned, how it fell, against what, and what it held."""
+    """A backtest: what it earned, how it fell, against what, and what it held.
+
+    ``benchmark_market``: where to price the benchmark when the strategy's own
+    market is restricted to a universe that does not include it.
+    """
     curve = result.equity_curve()
     stats = summarise(curve, periods_per_year=market.periods_per_year)
     x = tuple(m.date().isoformat() for m, _ in curve)
     equity = tuple(float(v) for _, v in curve)
 
-    bench_prices = [market.window.marks_at(m).get(InstrumentId(benchmark)) for m, _ in curve]
+    priced = benchmark_market or market
+    bench_prices = [priced.window.marks_at(m).get(InstrumentId(benchmark)) for m, _ in curve]
     # The benchmark starts where the strategy's equity is when the benchmark's
     # own history begins, so the two lines share a starting point even when the
     # benchmark listed (or was added to the data) later.

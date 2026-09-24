@@ -1,0 +1,17 @@
+# The Select Sector SPDR ETFs: one per S&P 500 sector.
+#
+# A universe without survivorship bias: the issuer rebalances each fund as
+# companies enter, leave or fail, so no name here survived by being picked in
+# hindsight. Two are young and join the point-in-time universe when their data
+# starts: XLRE (real estate, Oct 2015) and XLC (communication services, Jun 2018).
+XLB   # materials
+XLC   # communication services
+XLE   # energy
+XLF   # financials
+XLI   # industrials
+XLK   # technology
+XLP   # consumer staples
+XLRE  # real estate
+XLU   # utilities
+XLV   # health care
+XLY   # consumer discretionary

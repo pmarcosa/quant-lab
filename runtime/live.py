@@ -220,6 +220,16 @@ class LiveSession:
                 f"the journal at {self.config.journal_path} belongs to strategy "
                 f"{recorded!r}, not {self.config.strategy_id!r}"
             )
+        if "universe" in opened.payload:  # journals opened before universes lack the key
+            recorded_universe = opened.payload["universe"]
+            current = _universe_record(self.universe())
+            if (recorded_universe or {}).get("fingerprint") != (current or {}).get("fingerprint"):
+                raise StateIntegrityError(
+                    f"the {self.config.strategy_id!r} sleeve was opened on universe "
+                    f"{_universe_label(recorded_universe)}, but the config now gives "
+                    f"{_universe_label(current)}. Another universe is another strategy: "
+                    f"open a new strategy id for it."
+                )
         account = opened.payload.get("account")
         if account is not None and account != self.config.account:
             raise StateIntegrityError(
@@ -255,10 +265,18 @@ class LiveSession:
         """The strategy's bar size. Everything periodic follows it."""
         return self.strategy().filtration_spec.interval
 
+    def universe(self):
+        """The strategy's universe list, or None for every instrument in the store."""
+        from runtime.wiring import universe_list
+
+        return universe_list(self.config.strategy.universe)
+
     def market(self) -> Market:
         if self.market_loader is not None:
             return self.market_loader(self.store_root)
-        return load_market(self.store_root, interval=self.interval)
+        universe = self.universe()
+        return load_market(self.store_root, interval=self.interval,
+                           symbols=universe.symbols if universe else None)
 
     def stop_rule(self) -> ProtectiveStop | None:
         d = self.config.risk.stop_distance
@@ -458,6 +476,7 @@ class LiveSession:
                 "strategy": {"name": self.config.strategy.name,
                              "params": dict(self.config.strategy.params)},
                 "strategy_version": str(self.strategy().version),
+                "universe": _universe_record(self.universe()),
                 "interval": self.interval.value,
                 "account": self.config.account, "mode": self.config.mode.value,
                 "account_net_liquidation": account.net_liquidation,
@@ -1491,3 +1510,16 @@ def closing_part(intent: OrderIntent, held: float) -> OrderIntent | None:
     if closing <= 0:
         return None
     return intent if opening == 0 else replace(intent, quantity=float(closing))
+
+
+def _universe_record(universe) -> dict | None:
+    if universe is None:
+        return None
+    return {"name": universe.name, "symbols": list(universe.symbols),
+            "fingerprint": universe.fingerprint}
+
+
+def _universe_label(record) -> str:
+    if not record:
+        return "every instrument in the store"
+    return f"{record['name']} ({len(record['symbols'])} symbols, {record['fingerprint']})"

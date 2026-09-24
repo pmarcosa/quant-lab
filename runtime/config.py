@@ -88,6 +88,9 @@ class StrategySettings:
     params: Mapping[str, Any] = field(
         default_factory=lambda: {"rebalance_weeks": 4, "top_n": 4, "lookback_weeks": 13}
     )
+    #: A named list of symbols (``data/universes/<name>.txt``) or a path to one.
+    #: Unset: every instrument in the store, so fetching a symbol widens it.
+    universe: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -350,6 +353,10 @@ class LiveConfig:
             )
         if self.sleeve_capital <= 0:
             raise ContractViolation("config: sleeve_capital must be positive")
+        if self.strategy.universe:
+            from runtime.wiring import universe_list
+
+            universe_list(self.strategy.universe)  # refuses a name that resolves to nothing
         if self.account_scope not in ("dedicated", "shared"):
             raise ContractViolation("config: account_scope must be 'dedicated' or 'shared'")
         if self.execution.time_in_force not in ("auto", *(t.value for t in TimeInForce)):
@@ -467,9 +474,14 @@ def load_config(path: Path | None = None) -> LiveConfig:
 
 def _strategy_settings(raw: Mapping[str, Any]) -> StrategySettings:
     """Accept ``{name, params}``, or the older flat momentum keys."""
-    if "name" in raw or "params" in raw:
+    if "name" in raw or "params" in raw or "universe" in raw:
+        unknown = set(raw) - {"name", "params", "universe"}
+        if unknown:
+            raise ContractViolation(f"config: unknown strategy settings {sorted(unknown)}")
+        universe = raw.get("universe")
         return StrategySettings(
-            name=str(raw.get("name", "weekly-momentum")), params=dict(raw.get("params") or {})
+            name=str(raw.get("name", "weekly-momentum")), params=dict(raw.get("params") or {}),
+            universe=str(universe) if universe else None,
         )
     legacy = {k: v for k, v in raw.items() if k in ("rebalance_weeks", "top_n", "lookback_weeks")}
     unknown = set(raw) - set(legacy)

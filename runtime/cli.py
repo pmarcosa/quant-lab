@@ -357,9 +357,9 @@ def cmd_backtest(ctx: Context, args) -> int:
     )
     from runtime.config import FinancingSettings, LeverageSettings, RiskSettings, StrategySettings
     from runtime.reporting import backtest_report
-    from runtime.research import periodic_returns, run_once
+    from runtime.research import STARTING_CAPITAL, periodic_returns, run_once
     from runtime.strategies import build_strategy
-    from runtime.wiring import load_market
+    from runtime.wiring import load_market, universe_list
     from validation.ledger import ResearchLedger, Study
     from validation.metrics import summarise
 
@@ -391,7 +391,11 @@ def cmd_backtest(ctx: Context, args) -> int:
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc) if args.start else None
     interval = build_strategy(chosen.name, params).filtration_spec.interval
-    market = load_market(ctx.store, interval=interval, start=start)
+    universe = universe_list(args.universe or chosen.universe)
+    market = load_market(ctx.store, interval=interval, start=start,
+                         symbols=universe.symbols if universe else None)
+    if args.capital <= 0:
+        raise ContractViolation("--capital must be positive")
     strategy = build_strategy(chosen.name, params, market)
     supervisor = RiskSupervisor(
         rules=(
@@ -416,12 +420,15 @@ def cmd_backtest(ctx: Context, args) -> int:
                                    allow_short=risk.allow_short),
                       supervisor=supervisor,
                       leverage=None if schedule_rule.is_static_unlevered else schedule_rule,
-                      financing=fin.model())
+                      financing=fin.model(), capital=args.capital)
 
     # Every backtest is a trial. Recording it keeps the Deflated Sharpe honest.
     returns = periodic_returns(result)
     window = f"{schedule[0].date()}..{schedule[-1].date()}"
+    label = f"{window} data={market.fingerprint()}"
     note = f"stop={stop} cost={args.cost_bps} slip={args.slippage_bps}"
+    note += f" universe={universe.name}:{universe.fingerprint}" if universe else ""
+    note += f" capital={args.capital:g}" if args.capital != STARTING_CAPITAL else ""
     if risk.allow_short:
         note += f" short gross={risk.max_gross} net=[{risk.min_net},{risk.net_cap}]"
     if not schedule_rule.is_static_unlevered:
@@ -430,9 +437,9 @@ def cmd_backtest(ctx: Context, args) -> int:
                  + f" margin={fin.margin_rate}")
     ledger = ResearchLedger(Path(args.ledger))
     with Study("manual", ledger) as study:
-        if study.existing(strategy.version, window, note) is None:
+        if study.existing(strategy.version, label, note) is None:
             sd = float(returns.std(ddof=1)) if returns.size > 1 else 0.0
-            study.evaluate(strategy.version, window, {
+            study.evaluate(strategy.version, label, {
                 "sharpe": float(returns.mean() / sd) if sd > 0 else 0.0,
                 "final_equity": result.final_equity, "periods": float(returns.size),
             }, returns=returns, note=note)
@@ -442,12 +449,17 @@ def cmd_backtest(ctx: Context, args) -> int:
     ctx.out(f"strategy     {strategy.version} ({chosen.name}, {interval.frequency})")
     ctx.out(f"settings     {shown} · stop {stop:.0%} · costs {args.cost_bps}+{args.slippage_bps} bp"
             + (" · shorts allowed" if risk.allow_short else ""))
+    ctx.out(f"universe     {universe.describe() if universe else 'every instrument in the store'}"
+            f" · {len(market.universe.memberships())} with data")
+    if market.missing:
+        ctx.out(f"             not in the store, left out: {', '.join(market.missing)} "
+                f"(fetch them with `ql data fetch`)")
     ctx.out(f"window       {window} ({len(result.steps)} {interval.frequency} marks)")
     ctx.out(f"CAGR         {stats.cagr:.1%}")
     ctx.out(f"volatility   {stats.volatility:.1%}")
     ctx.out(f"Sharpe       {stats.sharpe:.2f}")
     ctx.out(f"max drawdown {stats.max_drawdown:.1%}")
-    ctx.out(f"final equity {stats.final_equity:,.0f} from 100,000")
+    ctx.out(f"final equity {stats.final_equity:,.0f} from {args.capital:,.0f}")
     ctx.out(f"stops fired  {result.stops_fired()}")
     if not schedule_rule.is_static_unlevered or result.financing_paid > 0:
         levels = [s.leverage for s in result.steps]
@@ -464,9 +476,14 @@ def cmd_backtest(ctx: Context, args) -> int:
     if args.report:
         settings = {**params, "strategy": chosen.name, "interval": interval.frequency,
                     "stop_distance": stop, "commission_bps": args.cost_bps,
-                    "slippage_bps": args.slippage_bps, "window": window}
+                    "slippage_bps": args.slippage_bps, "window": window,
+                    "capital": args.capital,
+                    "universe": universe.describe() if universe else "store"}
+        # A universe may leave the benchmark out; price it from the whole store.
+        whole = (load_market(ctx.store, interval=interval, start=start)
+                 if universe and args.benchmark not in universe.symbols else None)
         report = backtest_report(result, market, f"Backtest — {strategy.version}", settings,
-                                 ctx.clock(), benchmark=args.benchmark)
+                                 ctx.clock(), benchmark=args.benchmark, benchmark_market=whole)
         _write_report(ctx, report, "backtest")
     return 0
 
@@ -931,6 +948,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Research override: a fixed gross leverage (e.g. 1.3)")
     p.add_argument("--margin-rate", type=float, default=None,
                    help="Annual interest on borrowed cash (default: config, 0.055)")
+    p.add_argument("--capital", type=float, default=100_000.0,
+                   help="Starting capital (default 100,000). Fix it before validating; "
+                        "picking the one that backtests best is one more trial")
+    p.add_argument("--universe", default=None,
+                   help="A universe name (data/universes/<name>.txt) or file "
+                        "(default: config, else every instrument in the store)")
     p.set_defaults(func=cmd_backtest)
 
     p = top.add_parser("funnel", help="The five research gates (scripts/run_funnel.py)",

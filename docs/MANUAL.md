@@ -388,20 +388,58 @@ most common failure, and it is silent.
    experiment, and earlier gate results do not carry over.
 2. **Expect the numbers to move.** Adding one instrument (NFLX, in a test on
    2026-09-20) moved the 17-year CAGR by two points.
-3. **If you are trading live, rebuild the monitoring baseline** (step 7.4). The
-   live strategy trades whatever is in the store, so from the next proposal it
-   trades the new universe. Monitoring must compare it against a backtest of
-   the same universe.
+3. **If you are trading live, rebuild the monitoring baseline** (step 7.4). A
+   strategy without a `strategy.universe` in its config trades whatever is in
+   the store, so from the next proposal it trades the new universe. Monitoring
+   must compare it against a backtest of the same universe. To keep a strategy
+   on a fixed list whatever you fetch, give it a universe (step 4.5).
 4. **Record the new universe.** Add the symbols to `data/universe.txt` and
    commit that list, so anyone with IBKR data can rebuild the same universe. The
    CSVs themselves stay out of git (step 2.2); back them up with `state/`.
+
+### Step 4.5 — Name the universe a strategy chooses from
+
+A universe is a file, `data/universes/<name>.txt`: one ticker per line, `#`
+starts a comment. The repository ships `sector-etfs`, the eleven Select Sector
+SPDRs. Use one:
+
+```bash
+ql backtest --universe sector-etfs
+ql funnel --universe sector-etfs --top 3 --rebalance-weeks 2
+```
+
+or put it in a strategy's config, where it becomes part of the strategy:
+
+```yaml
+strategy:
+  name: weekly-momentum
+  params: {rebalance_weeks: 4, top_n: 4, lookback_weeks: 13}
+  universe: sector-etfs        # a name or a path; omit for every instrument in the store
+```
+
+- Symbols on the list with no data are left out and named in the output; fetch
+  them with `ql data fetch`. A symbol joins the point-in-time universe from its
+  first bar (XLC from 2018).
+- The ledger records the universe (name and a fingerprint of its symbols) on
+  every trial.
+- A live sleeve records the universe it was opened on. If the config later gives
+  another one, or the file gains or loses a symbol, every `ql live` command
+  refuses: another universe is another strategy, so open a new strategy id.
+- Without a universe, a strategy chooses from every instrument in the store.
+  That is the behaviour of configs written before universes existed.
 
 ### What expanding will not fix
 
 The cache holds no **delisted** names, because it is built from instruments that
 exist today. More live instruments widen the universe but do not remove
 survivorship bias. Fixing that means buying data from a vendor, not changing the
-code.
+code. IBKR has no history for securities that no longer trade. Today's S&P 500
+members over twenty years is the extreme case: the expert calls the effect on
+momentum "catastrophic", because the backtest keeps "discovering" the names
+that later became the largest. Until there is point-in-time membership data,
+the options are the sector ETFs (the issuer rebalances them, so they carry no
+survivorship bias), a 3-5 year window, or a haircut of 200-400 bp a year on the
+result.
 
 ---
 
@@ -429,6 +467,8 @@ browser (section 6.1).
 | `--cost-bps` / `--slippage-bps` | 10 / 10 | commission and slippage per side, in basis points |
 | `--start` | the first week in the store | earliest week, as an ISO date |
 | `--benchmark` | SPY | the comparison line in the report |
+| `--universe` | from config, else the whole store | a universe name or file (step 4.5) |
+| `--capital` | 100,000 | starting capital; see below |
 | `--report` | off | writes `state/reports/<id>/backtest-<time>.html` and `.json` |
 
 `--top`, `--lookback` and `--rebalance-weeks` are the momentum strategy's
@@ -452,6 +492,16 @@ Why record at all? The Deflated Sharpe Ratio discounts a result by the number of
 things tried to find it. Twenty quick backtests while you "just look around"
 are twenty trials. A ledger that does not see them overstates every later
 result.
+
+**Capital is fixed before validating, not searched.** The expert's rule: the
+starting capital does not change the signal, so it is not a parameter like N or
+K. With whole shares it does change results a little (a 25,000 book of four
+names rounds differently from a 100,000 one). Choose the capital you will
+trade, then validate. Running several capitals and keeping the one that
+backtests best is selection on rounding noise, and those runs are trials. The
+funnel varies it on purpose (half and double) as a friction test: the result
+should not collapse. The ledger records every run anyway; runs that differ only
+in capital are almost perfectly correlated, so they barely move N_eff.
 
 **Note on the start date.** The cache reaches back to 1999 for some names. Early
 years therefore have a thin universe: 6 names in 1999 against 39 today. A
@@ -482,7 +532,44 @@ The funnel puts the strategy through five gates on the real data, then prints
 the verdict whatever it is. Exit code `0` means it passed and `2` means it did
 not. Every backtest it runs is written to the ledger first. It also resumes: if
 you interrupt it, running it again continues from what is already recorded,
-without repeating work or counting a trial twice.
+without repeating work or counting a trial twice. A trial is only reused on the
+same data: its label carries a fingerprint of the prices, so a re-fetch (with
+dividends, say) or another universe runs afresh.
+
+| option | default | what it does |
+|---|---|---|
+| `--top` / `--rebalance-weeks` / `--lookback` | 4 / 4 / 13 | the momentum parameters (N, K, lookback) |
+| `--universe` | the whole store | a universe name or file (step 4.5) |
+| `--start` | 2009-02-24 | first decision |
+| `--capital` | 100,000 | fixed before validating; the funnel also runs half and double |
+| `--controls` | 60 | random-selection controls (at least 20) |
+| `--grid-top`, `--grid-rebalance` | off | grid mode (below) |
+
+**The trial count is the whole research line.** The expert: another universe,
+other N or K, a manual backtest, all belong to the same line of research, so
+the Deflated Sharpe counts every trial of the strategy in the ledger, whatever
+study recorded it (the random controls are not candidates and are left out).
+Trials with the same window are de-correlated (N_eff); trials on other windows,
+and the 40 configurations tried before the ledger existed, are counted at face
+value.
+
+**Choosing N and K: the grid.**
+
+```bash
+ql funnel --universe sector-etfs --grid-top 1,2,3,4,5 --grid-rebalance 1,2,4,6,8
+```
+
+Every combination is backtested and recorded (study `grid`). For each, the 252
+purged CPCV splits give a distribution of out-of-sample Sharpe, and its 10th
+percentile (the worst tenth of splits) is the combination's score. The expert's
+rule is a plateau, not a peak: each combination is judged by the worst score
+among itself and its neighbours (adjacent N and K), and the best of those is the
+plateau's centre. A peak that stands alone is printed separately, with a
+warning. The grid's PBO says how often the in-sample best combination falls
+below the median out of sample. Then validate the centre with the funnel; its
+Deflated Sharpe already counts the grid. The expert suggests k-means clustering
+for the plateau; on a grid of a few dozen points k-means depends on its seed,
+so the neighbourhood rule asks the same question deterministically.
 
 ### Step 5.4 — Compare stop distances
 
@@ -640,6 +727,7 @@ Edit `configs/strategies/momentum.yaml`. Name the file after the strategy's id.
 | `account_scope` | `dedicated` | The account belongs to this strategy: a position the sleeve does not know, or extra shares, stops the system. Use `shared` only if you must keep other holdings in the same account; they are then reported, not treated as an incident. |
 | `strategy.name` | `weekly-momentum` | Which strategy. The deployable ones are registered in `runtime/strategies.py`; an unknown name is refused. |
 | `strategy.params` | the values you researched | Changing any of these changes the strategy's identity and requires a new baseline. |
+| `strategy.universe` | optional: a universe name or file | The list it chooses from (step 4.5). Omitted: every instrument in the store. An open sleeve refuses a different one. |
 | `execution.time_in_force` | `auto` | `auto` sends orders to the opening auction (`opg`) for daily and weekly strategies, and as day orders for intraday ones. |
 | `risk.stop_distance` | 0.12 | The protective stop: below a long, above a short. `0` disables it (not recommended). |
 | `risk.max_gross` | 1.0 | Longs plus shorts, as a share of sleeve equity. |
@@ -1625,8 +1713,9 @@ fail.
 | `ql data import A=a.json … \| --from-dir DIR` | add instruments from saved payloads |
 | `ql data ingest --rebuild` | rebuild the store from the cache |
 | `ql data backfill --interval hour [--years 5] [--symbols A,B]` 🔌 | page back through intraday history into the cache |
-| `ql backtest [options] [--leverage X] [--margin-rate R] [--report]` | backtest; recorded in the ledger |
-| `ql funnel [--controls N]` | the five research gates |
+| `ql backtest [options] [--universe U] [--capital C] [--leverage X] [--margin-rate R] [--report]` | backtest; recorded in the ledger |
+| `ql funnel [--universe U] [--top N] [--rebalance-weeks K] [--capital C] [--controls N]` | the five research gates |
+| `ql funnel --grid-top 1,2,3 --grid-rebalance 1,2,4 [--universe U]` | choose N and K: the plateau, not the peak |
 | `ql live init [--adopt A,B]` 🔌 | open the sleeve (once per strategy and mode) |
 | `ql live sync` 🔌 | fills, statuses, stops, snapshot, reconciliation |
 | `ql live status [--offline]` | state, equity, positions, stops |

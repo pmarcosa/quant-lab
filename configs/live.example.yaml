@@ -40,6 +40,10 @@ strategy:
     rebalance_weeks: 4
     top_n: 4
     lookback_weeks: 13
+  # The list it chooses from: data/universes/<name>.txt, or a path. Omit it and
+  # the strategy chooses from every instrument in the store, so a fetch widens
+  # it. An open sleeve refuses a different universe (docs/MANUAL.md, step 4.5).
+  # universe: sector-etfs
 
 execution:
   time_in_force: auto       # auto: opening auction for daily/weekly bars, day orders intraday

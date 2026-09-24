@@ -126,8 +126,13 @@ def run_once(
     supervisor=None,
     leverage=None,
     financing=None,
+    capital: float = STARTING_CAPITAL,
 ) -> RunResult:
     """One backtest. The only way research runs anything.
+
+    ``capital`` is an implementation condition, fixed before validating (the
+    expert's rule): with whole shares it changes results a little, so choosing
+    the capital that backtests best would be one more trial.
 
     ``leverage`` (a ``LeveragePolicy``) and ``financing`` (a
     ``FinancingModel``) are needed only for books that borrow cash or stock;
@@ -137,7 +142,7 @@ def run_once(
     broker = SimulatedBroker(costs=costs)
     return run_backtest(
         run=run,
-        opening=Book.opening(portfolio, STARTING_CAPITAL, schedule[0]),
+        opening=Book.opening(portfolio, capital, schedule[0]),
         strategy=strategy,
         schedule=list(schedule),
         filtration_at=market.filtration_at,
@@ -173,6 +178,7 @@ def evaluate(
     policy: SizingPolicy,
     note: str = "",
     supervisor=None,
+    capital: float = STARTING_CAPITAL,
 ) -> tuple[RunResult | None, np.ndarray]:
     """Run a backtest and record it. There is no variant that skips the record.
 
@@ -193,6 +199,7 @@ def evaluate(
         costs,
         policy,
         supervisor=supervisor,
+        capital=capital,
     )
     returns = periodic_returns(result)
     deviation = float(returns.std(ddof=1)) if returns.size > 1 else 0.0

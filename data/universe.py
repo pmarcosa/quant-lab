@@ -17,6 +17,8 @@ universe must say so.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -55,6 +57,13 @@ class PointInTimeUniverse(UniverseSource):
     def survivors_only(self) -> tuple[InstrumentId, ...]:
         """Instruments that never left. Useful only to quantify the bias avoided."""
         return tuple(sorted((r.instrument for r in self.records if r.delisted is None), key=str))
+
+    def restricted_to(self, symbols: Iterable[str]) -> PointInTimeUniverse:
+        """The same membership windows, for these instruments only."""
+        wanted = {str(s) for s in symbols}
+        return PointInTimeUniverse(
+            records=tuple(r for r in self.records if str(r.instrument) in wanted)
+        )
 
     @classmethod
     def from_csv(cls, path: Path) -> PointInTimeUniverse:
@@ -130,3 +139,50 @@ def derive_memberships(
         for instrument, first, last in first_and_last
     )
     return PointInTimeUniverse(records=records)
+
+
+_TICKER = re.compile(r"^[A-Z][A-Z0-9.]{0,9}$")
+
+
+@dataclass(frozen=True, slots=True)
+class UniverseList:
+    """A named list of the symbols a strategy may choose from.
+
+    Part of the strategy's definition: the same rule on another list is another
+    experiment (and, live, another strategy). Without one, a strategy chooses
+    from every instrument in the store, so fetching a new symbol would silently
+    widen it. The point-in-time membership still comes from the data: a symbol
+    on the list is only eligible from its first bar.
+
+    Files are ``data/universes/<name>.txt``: one ticker per line, ``#`` starts a
+    comment.
+    """
+
+    name: str
+    symbols: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.symbols:
+            raise ContractViolation(f"universe {self.name!r} lists no symbols")
+        bad = [s for s in self.symbols if not _TICKER.match(s)]
+        if bad:
+            raise ContractViolation(f"universe {self.name!r}: not tickers: {bad}")
+
+    @property
+    def fingerprint(self) -> str:
+        """Twelve hex characters that change whenever a symbol is added or removed."""
+        return hashlib.sha256(",".join(sorted(self.symbols)).encode()).hexdigest()[:12]
+
+    def describe(self) -> str:
+        return f"{self.name} ({len(self.symbols)} symbols, {self.fingerprint})"
+
+    @classmethod
+    def read(cls, path: Path) -> UniverseList:
+        if not path.exists():
+            raise ContractViolation(f"no universe file at {path}")
+        symbols: list[str] = []
+        for line in path.read_text().splitlines():
+            ticker = line.split("#", 1)[0].strip().upper()
+            if ticker and ticker not in symbols:
+                symbols.append(ticker)
+        return cls(name=path.stem, symbols=tuple(sorted(symbols)))

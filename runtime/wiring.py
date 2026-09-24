@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from contracts.errors import ContractViolation
@@ -20,7 +21,7 @@ from contracts.identifiers import InstrumentId
 from contracts.temporal import BarInterval, utc
 from data.bitemporal import BitemporalStore
 from data.filtration import ReplayFiltrations
-from data.universe import PointInTimeUniverse
+from data.universe import PointInTimeUniverse, UniverseList
 
 #: Far enough ahead that every stored row is knowable: used only to find the
 #: last bar, never to answer a question about a decision.
@@ -236,6 +237,8 @@ class Market:
     filtrations: ReplayFiltrations
     window: MarketWindow
     interval: BarInterval
+    #: Symbols the chosen universe lists that the store does not hold.
+    missing: tuple[str, ...] = ()
 
     @property
     def schedule(self) -> Sequence[datetime]:
@@ -249,6 +252,22 @@ class Market:
         """The knowable view at a decision moment."""
         return self.filtrations.at(moment)
 
+    def fingerprint(self) -> str:
+        """Ten hex characters that change when the prices a run sees change.
+
+        Part of a research trial's label, so that a result recorded on other data
+        (another universe, a re-fetch with dividends, a restatement) is never
+        reused as if it were this one.
+        """
+        import hashlib
+
+        digest = hashlib.sha256()
+        for frame in (self.window.opens, self.window.closes, self.window.lows):
+            digest.update(",".join(map(str, frame.columns)).encode())
+            digest.update(np.round(frame.to_numpy(dtype=float), 6).tobytes())
+        digest.update(",".join(t.isoformat() for t in self.schedule).encode())
+        return digest.hexdigest()[:10]
+
 
 def load_market(
     root: Path,
@@ -256,6 +275,7 @@ def load_market(
     horizon: datetime | None = None,
     start: datetime | None = None,
     min_bars: int = 1,
+    symbols: Sequence[str] | None = None,
 ) -> Market:
     """Assemble everything a run needs from a store on disk.
 
@@ -266,11 +286,23 @@ def load_market(
             run is reproducible rather than dependent on the wall clock.
         start: Earliest decision moment.
         min_bars: Default history an instrument needs to count as available.
+        symbols: The strategy's universe (``UniverseList.symbols``); every
+            instrument in the store when omitted.
     """
     frequency = interval.frequency
     dataset = f"bars_{interval.value.lower()}"
     store = BitemporalStore(root, dataset)
     universe = PointInTimeUniverse.from_csv(root / f"universe_{frequency}.csv")
+    missing: tuple[str, ...] = ()
+    if symbols is not None:
+        held = {str(r.instrument) for r in universe.memberships()}
+        missing = tuple(sorted(set(symbols) - held))
+        universe = universe.restricted_to(symbols)
+        if not universe.memberships():
+            raise ContractViolation(
+                f"none of the universe's {len(symbols)} symbols is in the {dataset} store; "
+                f"fetch them first (`ql data fetch`)"
+            )
 
     if horizon is None:
         # Everything the store knows, and no more. Taken from the stored
@@ -294,4 +326,26 @@ def load_market(
         filtrations=ReplayFiltrations(store, universe, horizon, min_bars=min_bars),
         window=MarketWindow.from_store(store, universe, horizon, start=start, interval=interval),
         interval=interval,
+        missing=missing,
     )
+
+
+#: Where named universes live: ``data/universes/<name>.txt``.
+UNIVERSE_DIR = Path(__file__).resolve().parent.parent / "data" / "universes"
+
+
+def universe_list(spec: str | None, directory: Path = UNIVERSE_DIR) -> UniverseList | None:
+    """The universe a name or path refers to; ``None`` for "everything in the store"."""
+    if not spec:
+        return None
+    path = Path(spec).expanduser()
+    if path.suffix == ".txt" or path.exists():
+        return UniverseList.read(path)
+    candidate = directory / f"{spec}.txt"
+    if not candidate.exists():
+        known = sorted(p.stem for p in directory.glob("*.txt")) if directory.is_dir() else []
+        raise ContractViolation(
+            f"no universe named {spec!r}; known: {', '.join(known) or 'none'} "
+            f"(files in {directory})"
+        )
+    return UniverseList.read(candidate)

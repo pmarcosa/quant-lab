@@ -290,6 +290,20 @@ host, port and client id come from the strategy's config (with several
 configured, put `--strategy <name>` before `data`); `--port` overrides them. IBKR caps one request at roughly 1,000 bars, which is about 20 years of
 weekly bars.
 
+**When a symbol comes back empty**, the output prints what IBKR said, with a
+plain-language hint, and the gateway's data-farm status at connection:
+
+| IBKR says | Meaning | What to do |
+|---|---|---|
+| no reply within Ns, or 366 | the request timed out and was cancelled | check the HMDS farm line; retry with `--timeout 300` or a shorter `--duration "10 Y"` |
+| 162 … no market data permissions | the login has no data for it | paper accounts: turn on market-data sharing with the live account (Client Portal → Settings → Paper Trading Account); the live account needs a US stock subscription |
+| 354 / 10168 | no subscription / no market data | as above |
+| 2105 / 2107 HMDS … broken / inactive | the historical data farm is down | wait and retry; `inactive` usually connects on the first request |
+
+Options: `--duration` (IBKR syntax), `--timeout` seconds per request (default
+120), `--attempts` per symbol (default 2), `--what TRADES` for raw instead of
+split- and dividend-adjusted prices (do not mix the two in one cache).
+
 ### Step 4.2b — Or import saved payloads (no gateway needed)
 
 Claude can fetch price history through the IBKR connector without the gateway.

@@ -913,7 +913,7 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         p = data.add_parser(name, help=text, add_help=False)
         p.add_argument("rest", nargs=argparse.REMAINDER)
-        p.set_defaults(func=cmd_data_passthrough(script, gw))
+        p.set_defaults(func=cmd_data_passthrough(script, gw), passthrough=True)
 
     p = top.add_parser("backtest", help="Backtest the configured strategy over history")
     p.add_argument("--top", type=int, default=None, help="Names held (default: config)")
@@ -935,7 +935,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = top.add_parser("funnel", help="The five research gates (scripts/run_funnel.py)",
                        add_help=False)
     p.add_argument("rest", nargs=argparse.REMAINDER)
-    p.set_defaults(func=lambda ctx, args: _run_script("run_funnel", args.rest))
+    p.set_defaults(func=lambda ctx, args: _run_script("run_funnel", args.rest), passthrough=True)
 
     live = top.add_parser("live", help="The live (or paper) sleeve").add_subparsers(
         dest="sub", required=True)
@@ -1022,7 +1022,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None, context: Context | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    # argparse's REMAINDER does not capture a leading option (`fetch --symbols A`),
+    # so the commands that hand their arguments to a script collect the leftovers.
+    args, extra = parser.parse_known_args(argv)
+    if extra:
+        if not getattr(args, "passthrough", False):
+            parser.error(f"unrecognized arguments: {' '.join(extra)}")
+        args.rest = extra + list(args.rest)
     ctx = context or Context()
     if args.config:
         ctx.config_path = Path(args.config)

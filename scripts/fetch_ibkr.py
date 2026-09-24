@@ -25,16 +25,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from contracts.errors import ContractViolation  # noqa: E402
+from data.ingest import merge_split_weeks  # noqa: E402
 from data.vendor import cache_inventory, check_coverage, write_cache_csv  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / "data" / "ibkr_cache"
 
-#: IBKR caps a single request at roughly a thousand bars. Weekly reaches back
-#: about twenty-two years at that limit; daily only about four.
-MAX_BARS = 1000
-
-BAR_SIZE = {"weekly": "1 week", "daily": "1 day"}
+#: What each frequency asks IBKR for. Weekly asks for *daily* bars and groups
+#: them into ISO weeks here: IBKR refuses adjusted prices for any bar longer
+#: than a day ("Multi day bar size not supported with adjusted last", 321).
+BAR_SIZE = {"weekly": "1 day", "daily": "1 day"}
 DURATION = {"weekly": "22 Y", "daily": "4 Y"}
 
 
@@ -50,6 +50,9 @@ HINTS = {
     10167: "only delayed data is available to this login",
     10168: "this login has no market data; paper accounts must share the live account's",
 }
+
+#: Refusals that a retry of the identical request cannot fix.
+REJECTIONS = {200, 321, 354, 10090, 10168}  # not 162: it also reports pacing
 
 #: Connection notices about the data farms. The historical one is "HMDS".
 FARM_CODES = {2103, 2104, 2105, 2106, 2107, 2108, 2157, 2158}
@@ -131,6 +134,8 @@ def fetch(
                     if bars:
                         break
                     _explain(symbol, attempt, attempts, timeout, messages)
+                    if any(code in REJECTIONS for code, _ in messages):
+                        break  # the same request would be refused again
             except Exception as error:  # pragma: no cover - needs a live gateway
                 print(f"{symbol:<8} SKIPPED  {error}", file=sys.stderr)
                 continue
@@ -142,6 +147,8 @@ def fetch(
             frame = frame.rename(columns={"date": "timestamp"})
             frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
             frame = frame.set_index("timestamp").sort_index()
+            if frequency == "weekly":
+                frame = merge_split_weeks(frame[["open", "high", "low", "close", "volume"]])
             try:
                 write_cache_csv(symbol, frame, CACHE, frequency=frequency)
             except ContractViolation as error:

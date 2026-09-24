@@ -90,3 +90,38 @@ def test_silence_is_reported_as_a_timeout(script, capsys):
     FakeIB.replies = [([], [])]
     assert script.fetch(["NFLX"], "weekly", "127.0.0.1", 4002, 1, attempts=1, timeout=7) == 0
     assert "no reply from IBKR within 7s" in capsys.readouterr().err
+
+
+def daily_bars(days: int = 400):
+    start = date(2024, 1, 1)  # a Monday
+    out = []
+    for i in range(days):
+        day = start + timedelta(days=i)
+        if day.weekday() < 5:
+            out.append(ib_async.BarData(date=day, open=100 + i, high=101 + i, low=99 + i,
+                                        close=100.5 + i, volume=10))
+    return out
+
+
+def test_weekly_asks_for_daily_bars_and_groups_them_into_weeks(script):
+    FakeIB.replies = [([], daily_bars())]
+    assert script.fetch(["NFLX"], "weekly", "127.0.0.1", 4002, 1) == 1
+    assert FakeIB.requests[0]["barSizeSetting"] == "1 day"
+    assert FakeIB.requests[0]["whatToShow"] == "ADJUSTED_LAST"
+    import pandas as pd
+
+    frame = pd.read_csv(script.CACHE / "weekly" / "NFLX.csv", parse_dates=["timestamp"])
+    first = frame.iloc[0]
+    assert str(first["timestamp"].date()) == "2024-01-01"
+    assert (first["open"], first["close"], first["volume"]) == (100, 104.5, 50)
+    assert (first["high"], first["low"]) == (105, 99)
+    iso = frame["timestamp"].dt.isocalendar()
+    assert not iso.duplicated(subset=["year", "week"]).any()
+
+
+def test_a_rejected_request_is_not_retried(script, capsys):
+    text = "Multi day bar size not supported with adjusted last"
+    FakeIB.replies = [([(321, text)], [])]
+    assert script.fetch(["NFLX"], "weekly", "127.0.0.1", 4002, 1, attempts=3) == 0
+    assert len(FakeIB.requests) == 1
+    assert "IBKR 321" in capsys.readouterr().err

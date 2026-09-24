@@ -46,7 +46,9 @@ PRICE_COLUMNS = ("open", "high", "low", "close")
 #: Weekly and daily go back far enough to pick up a restatement from a recent
 #: split; intraday history is expensive to request and rarely restated.
 IBKR_BAR_SIZES = {
-    BarInterval.WEEK: ("1 week", "2 Y"),
+    # Weekly asks for daily bars, grouped into ISO weeks by merge_split_weeks:
+    # IBKR refuses ADJUSTED_LAST for any bar longer than a day (error 321).
+    BarInterval.WEEK: ("1 day", "2 Y"),
     BarInterval.DAY: ("1 day", "1 Y"),
     BarInterval.HOUR: ("1 hour", "10 D"),
     BarInterval.MINUTE: ("1 min", "2 D"),
@@ -292,6 +294,8 @@ def backfill(
             requests += 1
             if interval.is_intraday:
                 page = _regular(page)
+            if interval is BarInterval.WEEK:
+                page = merge_split_weeks(page)
             page = page[[_as_utc(t) < end for t in page.index]] if not page.empty else page
             if page.empty:
                 exhausted = True

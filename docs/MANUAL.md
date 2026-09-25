@@ -501,8 +501,11 @@ and a fingerprint of the code that produces the numbers (`engine/`, `risk/`,
   should be: its numbers are different, and you saw them. If it is nearly the
   same series as the old one, it adds almost nothing to N_eff, because
   near-copies are de-correlated away;
-- a run on another window (another `--start`) cannot be de-correlated with the
-  rest and counts as one full trial. Keep the window fixed.
+- every trial stores the date of each of its returns, so runs on different
+  windows (another `--start`) are cut to the weeks they share and
+  de-correlated, rather than each counting as a whole trial. Older trials get
+  their dates from their label's window when it states one exactly; the
+  remaining undated ones count as whole trials.
 
 Why record at all? The Deflated Sharpe Ratio discounts a result by the number of
 things tried to find it. Twenty quick backtests while you "just look around"
@@ -565,9 +568,11 @@ dividends, say) or another universe runs afresh.
 other N or K, a manual backtest, all belong to the same line of research, so
 the Deflated Sharpe counts every trial of the strategy in the ledger, whatever
 study recorded it (the random controls are not candidates and are left out).
-Trials with the same window are de-correlated (N_eff); trials on other windows,
-and the 40 configurations tried before the ledger existed, are counted at face
-value.
+Trials are aligned on their dates: the window most trials cover is chosen,
+every trial covering it is cut to it and de-correlated (N_eff). Trials that
+cannot be dated or do not cover it, and the 40 configurations tried before the
+ledger existed, are counted at face value. The funnel prints how many were
+aligned, on how many weeks, and how many count whole.
 
 **Choosing N and K: the grid.**
 

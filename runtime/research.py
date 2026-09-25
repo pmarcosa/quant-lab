@@ -55,13 +55,15 @@ def code_fingerprint(root: Path = _REPO) -> str:
     return digest.hexdigest()[:10]
 
 
-def trial_label(market: Market) -> str:
+def trial_label(market: Market, schedule: Sequence[datetime] | None = None) -> str:
     """What a trial saw: its dates, the prices (``Market.fingerprint``) and the code.
 
     Two runs share a label only if they would produce the same numbers, so an
     identical re-run is recognised and recorded once, and anything else is not.
+    ``schedule`` is the run's own, when it starts later than the market's (a
+    warm-up): the label's window is the window the returns cover.
     """
-    schedule = market.schedule
+    schedule = list(schedule) if schedule is not None else list(market.schedule)
     return (f"{schedule[0].date()}..{schedule[-1].date()} "
             f"data={market.fingerprint()} code={code_fingerprint()}")
 
@@ -206,6 +208,17 @@ def periodic_returns(result: RunResult) -> np.ndarray:
     return values[1:] / values[:-1] - 1.0
 
 
+def periodic_dates(result: RunResult) -> tuple[str, ...]:
+    """A key for each of :func:`periodic_returns`: the decision that opened its step.
+
+    Return ``i`` runs from step ``i`` to step ``i + 1`` and is keyed by step
+    ``i + 1``'s decision time. Decision times are unique and one per bar; the
+    curve's marks are fill times, and the last step, with no bar after it, is
+    marked at the same moment as the one before.
+    """
+    return tuple(step.decision.decision_time.isoformat() for step in result.steps[1:])
+
+
 def evaluate(
     study: Study,
     market: Market,
@@ -251,5 +264,6 @@ def evaluate(
         },
         returns=returns,
         note=note,
+        dates=periodic_dates(result),
     )
     return result, returns

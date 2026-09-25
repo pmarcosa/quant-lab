@@ -292,3 +292,92 @@ def test_the_stop_sweep_records_an_identical_rerun_once(tmp_path):
     rows = [json.loads(line) for line in ledger.read_text().splitlines()]
     assert len(rows) == 6, "six distances, each recorded once"
     assert all("code=" in r["window"] and "data=" in r["window"] for r in rows)
+
+
+# -- dates on every trial: windows aligned instead of counted whole -----------------------
+
+
+def _weekly(first, weeks):
+    from datetime import date, timedelta
+
+    start = date.fromisoformat(first)
+    return [(start + timedelta(weeks=i + 1)).isoformat() + "T21:15:00+00:00" for i in range(weeks)]
+
+
+def test_trials_on_different_windows_are_aligned_on_the_dates_they_share(tmp_path):
+    from datetime import date, timedelta
+
+    from contracts.identifiers import StrategyVersion
+    from validation.ledger import ResearchLedger, Study
+
+    ledger = ResearchLedger(tmp_path / "ledger.jsonl")
+    rng = np.random.default_rng(1)
+    v = [StrategyVersion.of("weekly-momentum", {"top_n": n}) for n in range(1, 7)]
+    long_returns = rng.normal(0, 0.02, 400)
+    late = (date(2005, 1, 7) + timedelta(weeks=100)).isoformat()  # the last 300 weeks start
+    end = (date(2005, 1, 7) + timedelta(weeks=400)).isoformat()
+    with Study("manual", ledger) as study:
+        # 400 weeks from 2005, dated
+        study.evaluate(v[0], f"2005-01-07..{end}", {"sharpe": 0.1},
+                       returns=long_returns, dates=_weekly("2005-01-07", 400))
+        # the last 300 of those weeks, dated
+        study.evaluate(v[1], "x", {"sharpe": 0.1}, returns=rng.normal(0, 0.02, 300),
+                       dates=_weekly(late, 300))
+        # recorded before dates existed, but its label states the window exactly
+        study.evaluate(v[2], f"{late}..{end} data=abc", {"sharpe": 0.1},
+                       returns=rng.normal(0, 0.02, 300))
+        # an old label that says nothing about dates
+        study.evaluate(v[3], "full", {"sharpe": 0.1}, returns=rng.normal(0, 0.02, 300))
+        # a short run must not shrink everyone's window to itself
+        study.evaluate(v[4], "y", {"sharpe": 0.1}, returns=rng.normal(0, 0.02, 20),
+                       dates=_weekly("2010-01-01", 20))
+    matrix, kept, others = ledger.research_line("weekly-momentum")
+    assert matrix.shape == (300, 4), "four trials on the 300 weeks they share"
+    assert np.allclose(matrix[:, 0], long_returns[100:]), "the long one, cut to its last 300"
+    assert "full" in {t.window for t in kept}, "undated, but only one dated window has 300"
+    assert {t.window for t in others} == {"y"}
+    with Study("manual", ledger) as study:  # a second 300-week window: now ambiguous
+        study.evaluate(v[5], "z", {"sharpe": 0.1}, returns=rng.normal(0, 0.02, 300),
+                       dates=_weekly("2001-01-05", 300))
+    _, kept, others = ledger.research_line("weekly-momentum")
+    assert "full" in {t.window for t in others}
+
+
+def test_dates_must_match_the_returns():
+    from datetime import datetime, timezone
+
+    from contracts.identifiers import StrategyVersion
+    from validation.ledger import Trial
+
+    with pytest.raises(ContractViolation, match="exactly one date"):
+        Trial(study="s", version=StrategyVersion.of("weekly-momentum", {}),
+              recorded_at=datetime.now(timezone.utc), window="w", metrics={},
+              returns=(0.1, 0.2), dates=("2020-01-03",))
+
+
+def test_an_old_row_is_still_read(tmp_path):
+    from validation.ledger import ResearchLedger
+
+    row = {"format": 1, "study": "funnel", "strategy": "weekly-momentum",
+           "params_hash": "0" * 12, "code_version": "dev", "recorded_at":
+           "2026-09-20T10:00:00+00:00", "window": "full", "metrics": {"sharpe": 0.1},
+           "returns": [0.01, 0.02], "note": ""}
+    path = tmp_path / "ledger.jsonl"
+    path.write_text(json.dumps(row) + "\n")
+    (trial,) = ResearchLedger(path).trials()
+    assert trial.dates == () and trial.returns == (0.01, 0.02)
+
+
+def test_dates_inferred_from_a_label_match_the_dates_a_run_stores(tmp_path):
+    """The label's window rule and the stored dates agree, so old and new rows align."""
+    from dataclasses import replace
+
+    from validation.ledger import ResearchLedger, _date_keys
+
+    build_market(tmp_path / "store", weeks=120)
+    ledger = tmp_path / "ledger.jsonl"
+    code, out = run_cli(tmp_path, "backtest", "--top", "2", "--ledger", str(ledger))
+    assert code == 0, out
+    (trial,) = ResearchLedger(ledger).trials()
+    assert trial.dates and len(trial.dates) == len(trial.returns)
+    assert _date_keys(replace(trial, dates=())) == _date_keys(trial)

@@ -207,7 +207,8 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"research line           {len(kept) + len(others)} trials of "
           f"{strategy.version.strategy} in the ledger, every study")
-    print(f"  aligned, de-correlated {len(kept)} -> N_eff {n_effective:.1f}")
+    print(f"  aligned on {matrix.shape[0]} common weeks, de-correlated {len(kept)} "
+          f"-> N_eff {n_effective:.1f}")
     print(f"  other windows         {len(others)} (counted at face value)")
     print(f"  prior undocumented    {PRIOR_TRIALS} (counted at face value)")
     print(f"trial Sharpe dispersion {dispersion:.4f}")

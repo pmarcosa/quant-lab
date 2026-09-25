@@ -26,7 +26,12 @@ from contracts.temporal import BarInterval  # noqa: E402
 from engine.decide import SizingPolicy  # noqa: E402
 from execution.simulated import CostModel  # noqa: E402
 from risk.rules import GrossExposureLimit, ProtectiveStop, RiskSupervisor  # noqa: E402
-from runtime.research import precompute_indicators, run_once, trial_label  # noqa: E402
+from runtime.research import (  # noqa: E402
+    periodic_dates,
+    precompute_indicators,
+    run_once,
+    trial_label,
+)
 from runtime.wiring import load_market  # noqa: E402
 from strategies.momentum import MomentumParams, WeeklyMomentum  # noqa: E402
 from validation.ledger import ResearchLedger, Study  # noqa: E402
@@ -91,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
                              "max_drawdown": stats.max_drawdown},
                     returns=returns,
                     note=note,
+                    dates=periodic_dates(result),
                 )
             label = "none" if distance == 0 else f"fixed {distance:.0%}"
             rows[label] = stats

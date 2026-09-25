@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,8 +36,9 @@ from contracts.identifiers import StrategyVersion
 from contracts.temporal import utc
 
 #: Bumped when the row schema changes, so old studies stay readable and are not
-#: silently mixed with new ones.
-LEDGER_FORMAT = 1
+#: silently mixed with new ones. Format 2 adds the date of every return.
+LEDGER_FORMAT = 2
+READABLE_FORMATS = (1, 2)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +70,10 @@ class Trial:
     metrics: Mapping[str, float]
     returns: tuple[float, ...] = ()
     note: str = ""
+    #: When each return was earned (ISO timestamps, one per return). With them,
+    #: trials run over different windows can be aligned on the dates they share
+    #: and de-correlated, instead of each counting as a whole trial.
+    dates: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "recorded_at", utc(self.recorded_at))
@@ -77,6 +83,11 @@ class Trial:
         for key, value in self.metrics.items():
             if not isinstance(value, (int, float)) or value != value:
                 raise ContractViolation(f"metric {key!r} is not a finite number: {value!r}")
+        if self.dates and len(self.dates) != len(self.returns):
+            raise ContractViolation(
+                f"{len(self.dates)} dates for {len(self.returns)} returns: each return needs "
+                f"exactly one date"
+            )
 
     @property
     def key(self) -> str:
@@ -94,6 +105,7 @@ class Trial:
             "window": self.window,
             "metrics": dict(self.metrics),
             "returns": list(self.returns),
+            "dates": list(self.dates),
             "note": self.note,
         }
 
@@ -101,9 +113,10 @@ class Trial:
     def from_row(cls, row: Mapping[str, Any]) -> Trial:
         from contracts.identifiers import StrategyId
 
-        if row.get("format") != LEDGER_FORMAT:
+        if row.get("format") not in READABLE_FORMATS:
             raise StateIntegrityError(
-                f"ledger row is format {row.get('format')!r}, this code reads {LEDGER_FORMAT}"
+                f"ledger row is format {row.get('format')!r}, this code reads "
+                f"{READABLE_FORMATS}"
             )
         return cls(
             study=row["study"],
@@ -117,6 +130,7 @@ class Trial:
             metrics=row["metrics"],
             returns=tuple(row.get("returns", ())),
             note=row.get("note", ""),
+            dates=tuple(row.get("dates", ())),
         )
 
 
@@ -194,22 +208,57 @@ class ResearchLedger:
         included. Controls (another strategy family) are not candidates and are
         left out.
 
+        Trials are aligned on their dates. The common window is the span of one
+        of the trials that the most trials cover (at least half as long as the
+        typical trial, so a short run cannot shrink everyone's window to itself),
+        and every trial covering it is cut to it and de-correlated with the rest.
+        A trial without dates has them inferred from its label's window when the
+        count matches exactly, one per week; failing that, from the one dated
+        window of its exact length, if there is only one. Otherwise, and for
+        trials that do not cover the window, it is counted at face value by the
+        caller -- the conservative choice.
+
         Returns:
-            The ``T x N`` matrix of the trials sharing the most common series
-            length (for N_eff), those trials, and the others. The others cannot
-            be correlated without aligning dates, so a caller counts them at face
-            value: the conservative choice.
+            The ``T x N`` matrix of the aligned trials (for N_eff), those trials,
+            and the others.
         """
         line = [t for t in self if str(t.version.strategy) == strategy]
         with_returns = [t for t in line if t.returns]
         if not with_returns:
             return np.empty((0, 0)), (), tuple(line)
-        lengths = [len(t.returns) for t in with_returns]
-        longest = max(set(lengths), key=lengths.count)
-        kept = tuple(t for t in with_returns if len(t.returns) == longest)
-        others = tuple(t for t in line if t not in kept)
-        matrix = np.column_stack([np.asarray(t.returns, dtype=float) for t in kept])
-        return matrix, kept, others
+        dated = {}
+        for t in with_returns:
+            keys = _date_keys(t)
+            if keys is not None:
+                dated[id(t)] = keys
+        # A trial with no dates and no window in its label ("full", from before
+        # either existed) is placed on a dated window of the same length -- the
+        # rule the ledger used before dates -- but only when exactly one dated
+        # window has that length. Otherwise it stays at face value.
+        spans_by_length: dict[int, set[tuple[str, ...]]] = {}
+        for keys in dated.values():
+            spans_by_length.setdefault(len(keys), set()).add(keys)
+        for t in with_returns:
+            spans = spans_by_length.get(len(t.returns), set())
+            if id(t) not in dated and len(spans) == 1:
+                dated[id(t)] = next(iter(spans))
+        window = _common_window([dated[id(t)] for t in with_returns if id(t) in dated])
+        columns, kept = [], []
+        for t in with_returns:
+            keys = dated.get(id(t))
+            if window is not None and keys is not None:
+                position = {k: i for i, k in enumerate(keys)}
+                if all(k in position for k in window):
+                    columns.append([t.returns[position[k]] for k in window])
+                    kept.append(t)
+        if window is None:  # nothing dated: the old rule, the most common length
+            lengths = [len(t.returns) for t in with_returns]
+            longest = max(set(lengths), key=lengths.count)
+            kept = [t for t in with_returns if len(t.returns) == longest]
+            columns = [list(t.returns) for t in kept]
+        others = tuple(t for t in line if not any(t is k for k in kept))
+        matrix = np.column_stack([np.asarray(c, dtype=float) for c in columns])
+        return matrix, tuple(kept), others
 
     def returns_matrix(self, study: str) -> tuple[np.ndarray, tuple[Trial, ...]]:
         """Trial returns as a ``T x N`` matrix, for estimating how many were distinct.
@@ -275,6 +324,7 @@ class Study:
         metrics: Mapping[str, float],
         returns: Sequence[float] = (),
         note: str = "",
+        dates: Sequence[str] = (),
     ) -> Trial:
         """Record one evaluation. Returns the trial that was written."""
         trial = Trial(
@@ -285,7 +335,47 @@ class Study:
             metrics=metrics,
             returns=tuple(float(r) for r in returns),
             note=note,
+            dates=tuple(str(d) for d in dates),
         )
         self.ledger.record(trial)
         self.recorded += 1
         return trial
+
+
+_WINDOW = re.compile(r"^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})")
+
+
+def _date_keys(trial: Trial) -> tuple[str, ...] | None:
+    """The trial's returns keyed by date, or None if they cannot be dated.
+
+    Stored dates are used as they are (by session date for daily and weekly
+    bars, by timestamp for intraday ones). A trial recorded before dates were
+    stored gets weekly dates from its label's window ``A..B``, but only when
+    that window holds exactly one week per return; anything else stays undated.
+    """
+    if trial.dates:
+        days = tuple(d[:10] for d in trial.dates)
+        return days if len(set(days)) == len(days) else tuple(trial.dates)
+    match = _WINDOW.match(trial.window)
+    if not match:
+        return None
+    first, last = (datetime.fromisoformat(v) for v in match.groups())
+    weeks = (last - first).days // 7
+    if (last - first).days % 7 or weeks != len(trial.returns):
+        return None
+    return tuple((first + timedelta(weeks=i + 1)).date().isoformat() for i in range(weeks))
+
+
+def _common_window(series: list[tuple[str, ...]]) -> tuple[str, ...] | None:
+    """The span, among the trials' own, that the most trials cover."""
+    if not series:
+        return None
+    typical = float(np.median([len(s) for s in series]))
+    sets = [set(s) for s in series]
+    best, best_score = None, (-1, -1)
+    for candidate in {s for s in series if len(s) >= max(2, typical / 2)}:
+        covering = sum(1 for keys in sets if keys.issuperset(candidate))
+        score = (covering, len(candidate))
+        if score > best_score:
+            best, best_score = candidate, score
+    return best

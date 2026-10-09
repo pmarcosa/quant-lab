@@ -557,6 +557,8 @@ def _document(result: Any) -> str | None:
     if isinstance(content, str) and content.strip():
         return content
     for value in result.values():
-        if isinstance(value, str) and value.endswith(".json") and Path(value).is_file():
-            return Path(value).read_text(encoding="utf-8")
+        # A path, whatever the tool named the file: short, one line, and there.
+        if (isinstance(value, str) and 0 < len(value) < 1024 and "\n" not in value
+                and value.startswith(("/", "~")) and Path(value).expanduser().is_file()):
+            return Path(value).expanduser().read_text(encoding="utf-8")
     return None

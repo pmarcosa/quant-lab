@@ -347,6 +347,17 @@ def test_the_state_document_a_session_read_is_found(tmp_path: Path, universe: st
     found = connector.gather(log)
     assert json.loads(found.state)["ladder"]["reason"] == "kept from last week"
 
+    # A document too large to come back inline is written to a file the answer names.
+    saved = tmp_path / "downloads" / "document-9955e6ee"
+    saved.parent.mkdir()
+    saved.write_text(json.dumps(kept))
+    large = _log(tmp_path / "large.jsonl", [
+        ("2026-10-05T06:00:00Z", "Projects",
+         {"method": "project_read", "path": "claude/quant-lab-review-state.json"},
+         {"method": "project_read", "path": "claude/quant-lab-review-state.json",
+          "local_path": str(saved)})])
+    assert json.loads(connector.gather(large).state)["ladder"]["state"] == "halted"
+
     # From the command line: the kept halt reaches the decision without being typed again.
     answers = payloads()
     answers.state = found.state

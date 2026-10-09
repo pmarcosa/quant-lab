@@ -1,0 +1,70 @@
+# quant-lab: the weekly momentum strategy, as it is traded.
+#
+# This file is what the strategy IS: its rules, how its orders are sized and
+# priced, its risk limits and its monitoring thresholds. It names no account,
+# so it is committed. Two things read it:
+#
+#   - a private config (configs/strategies/<id>.yaml) takes it in with
+#       extends: ../definitions/momentum.yaml
+#     and adds mode, account, sleeve_capital and gateway;
+#   - the weekly review (`ql review`), which runs from the broker connector's
+#     data where no private config exists.
+#
+# Changing a strategy parameter here changes the strategy's version: rebuild the
+# monitoring baseline (`ql monitor baseline`, then `ql review baseline`) and
+# move review.monitor_from to the first rotation traded on the new rules.
+
+strategy_id: momentum
+
+strategy:
+  name: weekly-momentum
+  params:
+    rebalance_weeks: 4
+    # Rules decided 2026-10-09 after the position-count study (53 stocks, 4 calendars).
+    top_n: 5                # the book is split between the best 5 that pass (0: all that pass)
+    freeze_rotations: 2     # a held name that stopped passing is kept at most 2 rotations
+    pace_ratio_min: 0.1231  # pace compared per week: 0.40 x 4/13 of the 13-week return
+    cost_stop_loss: 0.0     # no stop-loss on cost; the price-based exits remain
+    lookback_weeks: 13
+  universe: momentum
+
+execution:
+  time_in_force: auto       # auto: opening auction for daily/weekly bars, day orders intraday
+  cash_buffer: 0.0          # sized on the account's value less frozen positions, no reserve
+  no_trade_band: 0.0        # every position that passes is re-weighted, however little
+  limit_band: null          # the gateway path sends market orders at the open
+  commission: ibkr-tiered   # the plan the backtest and the baseline charge
+  share_price: 100          # typical share price for per-share fees (history is split-adjusted)
+  slippage_bps: 10
+
+risk:
+  stop_distance: 0.12       # protective stop from the rotation price; 0 disables it
+  stop_limit_offset: 0.005  # STP LMT with the limit 0.5% under the stop
+  max_gross: 1.0
+  max_net: 1.0
+  min_net: -1.0
+  allow_short: false
+  max_borrow_fee: null
+  max_order_fraction: 0.6
+
+monitoring:
+  reduce_percentile: 0.80
+  halt_percentile: 0.99
+  reduce_break_probability: 0.20
+  halt_break_probability: 0.50
+  reduce_shortfall_multiple: 1.5
+  halt_shortfall_alpha_share: 0.5
+  halt_shortfall_cycles: 2
+  trend_min_weeks: 26
+  horizon_weeks: 52
+  bootstrap_paths: 5000
+  bootstrap_block_weeks: 6
+  changepoint_hazard_weeks: 250
+  max_data_age_hours: null
+
+review:
+  limit_offset: 0.005       # proposals are day limit orders 0.5% through the reference price
+  monitor_from: 2026-10-19  # first rotation on these rules; the live record starts here
+  burn_in_weeks: 12         # drawdown and changepoint checks act only after this many weeks
+  benchmark: SPY
+  performance_from: 2026-08-31  # the report also measures from the close before this date

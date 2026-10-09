@@ -786,6 +786,102 @@ def cmd_monitor_baseline(ctx: Context, args) -> int:
     return 0
 
 
+# -- the weekly review -----------------------------------------------------------------------
+
+
+def _definition(ctx: Context, args):
+    """The definition a review runs from: ``--definition``, else the strategy's own name."""
+    from runtime.config import DEFINITIONS, load_definition
+
+    named = getattr(args, "definition", None) or ctx.strategy or "momentum"
+    path = Path(named)
+    if path.suffix != ".yaml" and not path.exists():
+        path = DEFINITIONS / f"{named}.yaml"
+    return load_definition(path)
+
+
+def cmd_review_run(ctx: Context, args) -> int:
+    """Decide the week from the broker connector's answers. Sends nothing."""
+    import json
+
+    from runtime import connector
+    from runtime import review as weekly
+    from runtime.strategies import build_strategy
+
+    definition = _definition(ctx, args)
+    if args.inputs:
+        payloads = connector.Payloads.load(Path(args.inputs))
+    else:
+        log = Path(args.session) if args.session not in (None, "auto") else connector.latest_log()
+        payloads = connector.gather(log)
+        ctx.out(f"session    {log}")
+        if payloads.unnamed:
+            ctx.out(f"warning: weekly histories for contracts {payloads.unnamed} could not be "
+                    f"named; ask for the watchlist or the positions in the same session")
+    if args.save_inputs:
+        payloads.save(Path(args.save_inputs))
+    as_of = datetime.fromisoformat(args.as_of) if args.as_of else ctx.clock()
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=timezone.utc)
+    version = build_strategy(definition.strategy.name, definition.strategy.params).version
+    kept = Path(args.state) if args.state else None
+    if kept is not None and not kept.exists():
+        ctx.out(f"state      none at {kept}: starting a new record")
+        kept = None
+    state = weekly.load_state(kept, version)
+    result = weekly.review(payloads, definition, as_of, state=state,
+                           baseline=weekly.load_baseline(version))
+    ctx.out(weekly.summary(result))
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(json.dumps(result, indent=1), encoding="utf-8")
+        ctx.out(f"written    {args.out}")
+    if args.state_out:
+        if result["final"]:
+            Path(args.state_out).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.state_out).write_text(json.dumps(result["state"], indent=1), encoding="utf-8")
+            ctx.out(f"state      {args.state_out}")
+        else:
+            ctx.out("state      not written: the review is not final until it has its quotes")
+    return 0 if result["final"] else 3
+
+
+def cmd_review_clear(ctx: Context, args) -> int:
+    """Move the review's ladder back up, with a written reason."""
+    import json
+
+    from runtime import review as weekly
+
+    path = Path(args.state)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    cleared = weekly.clear_ladder(state, args.to, args.reason, ctx.clock())
+    Path(args.out or args.state).write_text(json.dumps(cleared, indent=1), encoding="utf-8")
+    ctx.out(f"ladder     {state['ladder']['state']} -> {cleared['ladder']['state']}: {args.reason}")
+    return 0
+
+
+def cmd_review_baseline(ctx: Context, args) -> int:
+    """Publish the strategy's monitoring baseline where the review reads it."""
+    from runtime import review as weekly
+    from runtime.monitor import Baseline
+    from runtime.strategies import build_strategy
+
+    definition = _definition(ctx, args)
+    version = build_strategy(definition.strategy.name, definition.strategy.params).version
+    source = Path(args.source) if args.source else ctx.config().baseline_path
+    baseline = Baseline.load(source)
+    if baseline.strategy_version != str(version):
+        raise ContractViolation(
+            f"{source} is the baseline of {baseline.strategy_version}; the definition is "
+            f"{version}. Rebuild it with `ql monitor baseline` first."
+        )
+    target = weekly.baseline_file(version)
+    baseline.save(target)
+    ctx.out(f"baseline   {version}, {len(baseline.returns)} returns to {baseline.last_bar}")
+    ctx.out(f"published  {target}")
+    return 0
+
+
 def cmd_monitor_run(ctx: Context, args) -> int:
     from runtime.monitor import run_monitor
     from runtime.reporting import live_report
@@ -1141,6 +1237,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-report", action="store_true")
     p.add_argument("--benchmark", default="SPY")
     p.set_defaults(func=cmd_monitor_run)
+
+    review = top.add_parser(
+        "review", help="The weekly decision from the broker connector's data (no gateway)"
+    ).add_subparsers(dest="sub", required=True)
+    p = review.add_parser("run", help="Decide the week; proposes, sends nothing")
+    p.add_argument("--definition", default=None,
+                   help="Name in configs/definitions, or a path (default: the strategy's name)")
+    p.add_argument("--session", default="auto",
+                   help="Session log to read the connector's answers from (default: the newest)")
+    p.add_argument("--inputs", default=None,
+                   help="A folder of saved answers instead of a session log")
+    p.add_argument("--save-inputs", default=None, help="Save the answers used to this folder")
+    p.add_argument("--state", default=None, help="The state the last review kept (JSON)")
+    p.add_argument("--state-out", default=None, help="Where to write the state to keep")
+    p.add_argument("--out", default=None, help="Where to write the full result (JSON)")
+    p.add_argument("--as-of", default=None, help="Decide as of this time (ISO; default: now)")
+    p.set_defaults(func=cmd_review_run)
+    p = review.add_parser("clear", help="Move the review's ladder back up, with a reason")
+    p.add_argument("--state", required=True)
+    p.add_argument("--to", required=True, choices=["normal", "reduce_only"])
+    p.add_argument("--reason", required=True)
+    p.add_argument("--out", default=None)
+    p.set_defaults(func=cmd_review_clear)
+    p = review.add_parser("baseline", help="Publish the monitoring baseline for the review")
+    p.add_argument("--definition", default=None)
+    p.add_argument("--source", default=None,
+                   help="A baseline file (default: the configured strategy's)")
+    p.set_defaults(func=cmd_review_baseline)
 
     report = top.add_parser("report", help="Saved reports").add_subparsers(dest="sub", required=True)
     p = report.add_parser("render", help="Re-render a saved JSON report as HTML")

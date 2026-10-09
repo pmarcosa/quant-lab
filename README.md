@@ -307,6 +307,14 @@ cushion, order size and turnover within the backtest's own extremes). A bar
 below the backtest's 0.5% quantile halts. Live `full` needs eight weeks of clean
 automatic exits first.
 
+**Without the gateway.** `ql review` makes the weekly decision from the IBKR
+connector's answers, in a scheduled session with no gateway and no private
+config: the strategy, the engine, the stop rule and the monitoring ladder are
+the same objects, read from a committed definition
+(`configs/definitions/momentum.yaml`) and a published baseline (`baselines/`).
+It proposes day limit orders for a person to approve and sends nothing (manual,
+step 9.10).
+
 **Any bar size, either side.** The deployed strategy is weekly and long-only;
 the system is neither. The bar size comes from the strategy and drives the data
 refresh, the order type (opening auction for daily and weekly bars, day orders

@@ -395,6 +395,12 @@ class WeeklyMomentum:
         frame = pd.DataFrame(rows)
         if frame.empty:
             return frame
+        # "No exit" must stay None. Left to itself pandas 3 reads a column that
+        # holds text and None as strings and stores the None as NaN, which is
+        # neither None nor false: every rule below that asks "did it trigger
+        # nothing?" would then answer no for a position that is staying.
+        reasons = frame["exit_reason"].astype(object)
+        frame["exit_reason"] = reasons.where(reasons.notna(), None)
         return frame.sort_values("score", ascending=False, na_position="last").reset_index(
             drop=True
         )

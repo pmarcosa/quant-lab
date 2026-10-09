@@ -1379,6 +1379,100 @@ four-name momentum book opens 25% positions and replaces most of itself at a
 rotation, and a 4% weekly loss is an ordinary week. So each limit is set from
 the strategy's own backtest instead: what it has never done is what gets held.
 
+### Step 9.10 — The weekly review where there is no gateway
+
+Everything above needs IB Gateway on this Mac. `ql review` makes the same
+decision where there is none: in a scheduled Claude session that reaches the
+broker through the IBKR connector. The session fetches and reports; the rules
+are this repository's, so the weekly review, the backtest and the paper sleeve
+run one strategy.
+
+```bash
+ql review run --state state.json --state-out state.json --out review.json
+```
+
+**What it reads.** By default the running session's own log
+(`~/.claude/projects/…`, and the logs of any helper the session started), where
+every connector answer is already stored verbatim: retyping a price history
+costs it twice and invites a wrong digit. `--inputs DIR` reads a folder of
+saved answers instead (`--save-inputs DIR` writes one). The session has to have
+asked for:
+
+| answer | connector tool | for |
+|---|---|---|
+| the watchlist | `get_watchlist` | naming contracts |
+| weekly bars, two years, with corporate actions, one call per stock and the benchmark | `get_price_history` | signals |
+| account summary, positions, working orders | `get_account_summary`, `get_account_positions`, `get_account_orders` | the book, the stops |
+| the last seven days' trades | `get_account_trades` | last rotation's fills |
+| the performance series | `get_pa_performance_all_periods` | the live record |
+| a quote per stock to trade or protect (rotations only) | `get_price_snapshot` | limit prices, stop levels |
+
+**What it decides, and with what.** Nothing here is written twice:
+
+| part | comes from |
+|---|---|
+| filters, exits, ranking, frozen positions, weights | `strategies.momentum.WeeklyMomentum` |
+| whole shares, what is too small to send | `engine.decide.decide` |
+| stop and limit levels | `risk.rules.ProtectiveStop` |
+| the degradation ladder | `validation.monitoring.assess` |
+
+**Prices.** The connector's bars are adjusted for splits, not dividends; the
+store's are adjusted for both, and the expert's rule is that signals use the
+total-return series in research and in production alike. The review rebuilds
+it from the dividends the connector lists (every bar before an ex-dividend
+week is scaled by `1 - dividend / previous week's close`). Against the store,
+on the connector's own answers of 2026-10-09: the adjusted closes of all 53
+stocks agree within 0.12% over two years (unadjusted, they are up to 11.6%
+apart), and the scan of that week is the same stock for stock. Orders, stops
+and the value of the book use prices as traded.
+
+**A rotation takes two runs.** The first says which stocks it would trade or
+protect and exits with status 3 (`NOT FINAL`); the session quotes them and
+runs it again. Orders are day limit orders 0.5% through the quote
+(`review.limit_offset`), sized by the engine; stops are replaced for the book
+as it will be after the trades. A person approves each order at the broker:
+the review sends nothing. A rotation chosen from part of the universe is not
+final either: a stock with no current history is named, to be fetched.
+
+**State.** A scheduled session remembers nothing, so `--state-out` writes one
+small JSON document to keep until the next run (the weekly task stores it as a
+project document): the ladder's state, each rotation's proposals and the fills
+that followed, and the weekly returns. It is written only when the review is
+final.
+
+**Monitoring.** The live return is read each week from the broker's
+time-weighted series, which a deposit does not move. Three things differ from
+`ql monitor run`, all of them the expert's:
+
+- the record starts at `review.monitor_from`, the first rotation traded on this
+  strategy version: weeks traded under other rules are another strategy's;
+- for the first `review.burn_in_weeks` (12) the drawdown and changepoint checks
+  are shown but do not move the ladder; the execution-cost check and the loss
+  breaker act from the first week;
+- last week's return is cross-checked against what the positions held a week
+  earlier did, and a gap with no trade to explain it is flagged.
+
+A halted review proposes nothing and leaves the stops alone; reduce-only lets
+exits through. Lifting either is a person's decision:
+
+```bash
+ql review clear --state state.json --to normal --reason "what you checked"
+```
+
+**The definition and the baseline.** `ql review` has no private config to read.
+It runs from `configs/definitions/momentum.yaml` (the strategy with no account
+in it; your private config takes the same file in with `extends:`) and from
+`baselines/<strategy version>.json`. After changing a rule:
+
+```bash
+ql monitor baseline          # rebuild the reference on the store
+ql review baseline           # publish it under the new version's name
+git add configs/definitions baselines && git commit && git push
+```
+
+and move `review.monitor_from` to the first rotation on the new rules. A
+review with no baseline for its version says so and judges nothing.
+
 ---
 ## 10. Monitoring live performance
 
@@ -1817,6 +1911,9 @@ fail.
 | `ql live auto arm --scope exits\|full [--override "…"]` | allow automatic sending (typed phrase) |
 | `ql live auto disarm --reason "…"` | back to manual approval |
 | `ql live auto schedule` | write the Mac launch job for `ql live cycle` |
+| `ql review run [--state F] [--state-out F] [--out F] [--inputs DIR] [--as-of T]` | the week's decision from the broker connector's answers; sends nothing |
+| `ql review clear --state F --to normal\|reduce_only --reason "…"` | lift the review's pause or halt |
+| `ql review baseline [--source F]` | publish the monitoring baseline where the review reads it |
 | `ql monitor baseline` | build the monitoring reference |
 | `ql monitor run [--dry-run] [--no-report] [--benchmark SPY]` | every check, the state, the dashboard |
 | `ql report list` | recent report pages |

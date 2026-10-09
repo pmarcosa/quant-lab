@@ -26,12 +26,20 @@ wrong order. The checks that matter most:
 - **automation is opt-in, twice.** ``automation.mode`` is the most the system
   may do without a person; nothing is automatic until a person also *arms* it
   with a typed phrase (``ql live auto arm``).
+
+**One definition, several users.** What a strategy *is* -- its rules, how it
+trades, its risk limits and monitoring thresholds -- can live in a committed
+file, ``configs/definitions/<name>.yaml``, with no account in it. A private
+config takes it in with ``extends:`` and adds the account; the weekly review
+(``ql review``), which runs where no private config exists, reads the
+definition directly. Both then run the same strategy by construction.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +53,7 @@ from contracts.temporal import BarInterval
 ROOT = Path(__file__).resolve().parent.parent
 CONFIGS = ROOT / "configs"
 STRATEGY_CONFIGS = CONFIGS / "strategies"
+DEFINITIONS = CONFIGS / "definitions"
 LEGACY_CONFIG = CONFIGS / "live.yaml"
 DEFAULT_CONFIG = LEGACY_CONFIG
 STATE = ROOT / "state"
@@ -338,6 +347,35 @@ class MonitoringSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewSettings:
+    """The weekly review from broker-connector data (``ql review``).
+
+    The review proposes; a person approves each order at the broker. So its
+    orders are day limit orders a little through a reference price, where the
+    gateway path sends market orders to the opening auction.
+    """
+
+    #: A buy is limited to the reference price plus this fraction, a sell to
+    #: the price less it: marketable, but not at any price.
+    limit_offset: float = 0.005
+    #: The Monday of the first rotation traded on this strategy version
+    #: (``YYYY-MM-DD``). The live record monitoring judges starts there: weeks
+    #: traded under other rules belong to another strategy. ``None``: no live
+    #: record yet, so monitoring reports and judges nothing.
+    monitor_from: str | None = None
+    #: Live weeks before the drawdown and changepoint checks may move the
+    #: state. They are computed and shown from the first week; the project's
+    #: expert asks for a burn-in before acting on them, and for the execution
+    #: cost check and the loss breaker to act from the start.
+    burn_in_weeks: int = 12
+    #: The benchmark reported beside the account.
+    benchmark: str = "SPY"
+    #: A date (``YYYY-MM-DD``) the report also measures the account and the
+    #: benchmark from, besides the last week and the live record. Optional.
+    performance_from: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class LiveConfig:
     strategy_id: str
     mode: TradingMode
@@ -351,6 +389,7 @@ class LiveConfig:
     leverage: LeverageSettings = field(default_factory=LeverageSettings)
     financing: FinancingSettings = field(default_factory=FinancingSettings)
     automation: AutomationSettings = field(default_factory=AutomationSettings)
+    review: ReviewSettings = field(default_factory=ReviewSettings)
     #: Hours a proposal stays approvable. Orders go to the opening auction, so a
     #: proposal made on Saturday must still be valid on Monday morning. Approval
     #: is also refused as soon as a newer bar exists, whatever this says.
@@ -485,6 +524,20 @@ class LiveConfig:
             raise ContractViolation("config: bootstrap_paths below 500 gives a noisy percentile")
         if self.proposal_ttl_hours <= 0:
             raise ContractViolation("config: proposal_ttl_hours must be positive")
+        v = self.review
+        if not 0 <= v.limit_offset < 0.1 or v.burn_in_weeks < 0:
+            raise ContractViolation(
+                "config: review.limit_offset must be in [0, 0.1) and burn_in_weeks not negative"
+            )
+        for label, day in (("monitor_from", v.monitor_from),
+                           ("performance_from", v.performance_from)):
+            if day is not None:
+                try:
+                    date.fromisoformat(str(day))
+                except ValueError as error:
+                    raise ContractViolation(
+                        f"config: review.{label} must be a date, YYYY-MM-DD; got {day!r}"
+                    ) from error
         from runtime.strategies import build_strategy  # validates name and params
 
         build_strategy(self.strategy.name, self.strategy.params)
@@ -506,7 +559,7 @@ def load_config(path: Path | None = None) -> LiveConfig:
             f"no config at {source}. Copy configs/live.example.yaml to "
             f"configs/strategies/<strategy_id>.yaml and fill in the account."
         )
-    raw: dict[str, Any] = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    raw = _read(source)
     _refuse_unknown_keys(raw, source)
     try:
         strategy_id = str(raw.get("strategy_id") or "").strip()
@@ -528,6 +581,7 @@ def load_config(path: Path | None = None) -> LiveConfig:
             leverage=LeverageSettings(**(raw.get("leverage") or {})),
             financing=FinancingSettings(**(raw.get("financing") or {})),
             automation=AutomationSettings(**(raw.get("automation") or {})),
+            review=_review(raw.get("review") or {}),
             proposal_ttl_hours=float(raw.get("proposal_ttl_hours", 60.0)),
             account_scope=str(raw.get("account_scope", "dedicated")).lower(),
             unmanaged=frozenset(s.upper() for s in raw.get("unmanaged") or ()),
@@ -545,12 +599,129 @@ def load_config(path: Path | None = None) -> LiveConfig:
 _SECTIONS = {
     "gateway": GatewaySettings, "strategy": StrategySettings, "execution": ExecutionSettings,
     "risk": RiskSettings, "monitoring": MonitoringSettings, "leverage": LeverageSettings,
-    "financing": FinancingSettings, "automation": AutomationSettings,
+    "financing": FinancingSettings, "automation": AutomationSettings, "review": ReviewSettings,
 }
 _TOP_LEVEL = frozenset({
     "strategy_id", "mode", "account", "sleeve_capital", "proposal_ttl_hours",
-    "account_scope", "unmanaged", "state_dir", *_SECTIONS,
+    "account_scope", "unmanaged", "state_dir", "extends", *_SECTIONS,
 })
+#: What a definition may not carry: it is committed, and these name an account.
+_PRIVATE = frozenset({"mode", "account", "sleeve_capital", "gateway", "state_dir", "extends"})
+
+
+def _read(source: Path) -> dict[str, Any]:
+    """One config file as a mapping, with the definition it ``extends`` under it.
+
+    ``extends`` names a file relative to the one that has it. The definition's
+    settings are the base and the file's own are laid over them: section by
+    section, key by key, and for the strategy parameter by parameter. A config
+    that extends a definition therefore restates nothing, and one that overrides
+    a rule says so in one visible line.
+    """
+    raw: dict[str, Any] = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    parent = raw.pop("extends", None)
+    if parent is None:
+        return raw
+    base_path = (source.parent / str(parent)).resolve()
+    if not base_path.exists():
+        raise ContractViolation(f"config {source.name}: extends {parent!r}, which is not there")
+    base: dict[str, Any] = yaml.safe_load(base_path.read_text(encoding="utf-8")) or {}
+    if "extends" in base:
+        raise ContractViolation(
+            f"config {source.name}: {base_path.name} extends another file; one level only"
+        )
+    carried = sorted(set(base) & _PRIVATE)
+    if carried:
+        raise ContractViolation(
+            f"definition {base_path.name} carries {carried}; a definition names no account"
+        )
+    return _overlay(base, raw)
+
+
+def _overlay(base: Mapping[str, Any], over: Mapping[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in over.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _overlay(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _review(raw: Mapping[str, Any]) -> ReviewSettings:
+    values = dict(raw)
+    for key in ("monitor_from", "performance_from"):  # YAML reads a bare date as a date
+        if values.get(key) is not None:
+            values[key] = str(values[key])
+    return ReviewSettings(**values)
+
+
+@dataclass(frozen=True, slots=True)
+class Definition:
+    """What a strategy is, with no account: rules, trading, limits, thresholds.
+
+    The part of a config that can be published. ``ql review`` runs from one.
+    """
+
+    strategy_id: str
+    strategy: StrategySettings
+    execution: ExecutionSettings
+    risk: RiskSettings
+    monitoring: MonitoringSettings
+    automation: AutomationSettings
+    review: ReviewSettings
+    unmanaged: frozenset[str] = frozenset()
+    source: Path | None = None
+
+
+def load_definition(path: Path) -> Definition:
+    """Read a committed definition, checked as strictly as a live config.
+
+    The checks are the live config's own, run on the definition with a stand-in
+    paper account, so a setting refused there is refused here too.
+
+    Raises:
+        ContractViolation: If the file is missing, names an account, or holds
+            a setting a live config would refuse.
+    """
+    source = Path(path)
+    if not source.exists():
+        known = sorted(p.stem for p in DEFINITIONS.glob("*.yaml")) if DEFINITIONS.is_dir() else []
+        raise ContractViolation(
+            f"no definition at {source}; known: {', '.join(known) or 'none'} (in {DEFINITIONS})"
+        )
+    raw: dict[str, Any] = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    _refuse_unknown_keys(raw, source)
+    carried = sorted(set(raw) & _PRIVATE)
+    if carried:
+        raise ContractViolation(
+            f"definition {source.name} carries {carried}; a definition names no account"
+        )
+    strategy_id = str(raw.get("strategy_id") or "").strip()
+    if not strategy_id:
+        raise ContractViolation(f"definition {source.name}: strategy_id is required")
+    try:
+        checked = LiveConfig(
+            strategy_id=strategy_id, mode=TradingMode.PAPER, account="DU0000000",
+            sleeve_capital=1.0,
+            strategy=_strategy_settings(raw.get("strategy") or {}),
+            execution=ExecutionSettings(**(raw.get("execution") or {})),
+            risk=RiskSettings(**(raw.get("risk") or {})),
+            monitoring=MonitoringSettings(**_monitoring(raw.get("monitoring") or {})),
+            leverage=LeverageSettings(**(raw.get("leverage") or {})),
+            financing=FinancingSettings(**(raw.get("financing") or {})),
+            automation=AutomationSettings(**(raw.get("automation") or {})),
+            review=_review(raw.get("review") or {}),
+            unmanaged=frozenset(s.upper() for s in raw.get("unmanaged") or ()),
+            source=source,
+        ).validate()
+    except (TypeError, ValueError) as error:
+        raise ContractViolation(f"definition {source.name}: {error}") from error
+    return Definition(
+        strategy_id=strategy_id, strategy=checked.strategy, execution=checked.execution,
+        risk=checked.risk, monitoring=checked.monitoring, automation=checked.automation,
+        review=checked.review, unmanaged=checked.unmanaged, source=source,
+    )
 
 
 def _refuse_unknown_keys(raw: Mapping[str, Any], source: Path) -> None:

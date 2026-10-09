@@ -360,6 +360,27 @@ def test_the_four_week_calendar_is_the_live_accounts():
     assert strategy.rotates_at(datetime(2026, 9, 19, 10, 0, tzinfo=timezone.utc))
 
 
+def test_one_position_leaving_does_not_unfreeze_the_others():
+    """One held name triggers an exit and another is frozen, at the same rotation.
+
+    The exit reason is text for the first and nothing for the second. pandas 3
+    reads such a column as strings and turns the nothing into NaN, and a test
+    for "no exit" written as ``is None`` then failed for every position that
+    was staying: whenever one name was sold on a rule, every frozen name was
+    sold with it. Nothing covered the two cases together.
+    """
+    target = _target({PLODDING: 0.30, FALLING: 0.20}, top_n=0)
+    assert FALLING not in target.weights, "it broke its trend: sold"
+    assert target.weights[PLODDING] == 0.30, "it triggered nothing: frozen as it is"
+    assert target.diagnostics["exits"] == 1.0
+    assert target.diagnostics["frozen"] == 1.0
+    table = WeeklyMomentum(MomentumParams(rebalance_weeks=1, top_n=0)).rank(
+        _Bars(), {PLODDING: 0.30, FALLING: 0.20})
+    reasons = dict(zip(table["instrument"], table["exit_reason"], strict=True))
+    assert reasons[FALLING] == "trend_break"
+    assert reasons[PLODDING] is None, "no exit is None, whatever pandas makes of the column"
+
+
 def test_a_frozen_name_can_be_made_to_fade(portfolio=None):
     """Half its weight at each rotation: capital leaves without one sale."""
     target = _target({PLODDING: 0.30}, top_n=0, freeze_fade=0.5)

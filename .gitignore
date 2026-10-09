@@ -19,6 +19,8 @@ data/ibkr_cache/
 # template is published.
 configs/*
 !configs/live.example.yaml
+# A definition names no account: rules, trading, limits, thresholds.
+!configs/definitions/
 configs/strategies/
 implementation.yaml
 **/implementation.yaml

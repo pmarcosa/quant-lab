@@ -32,6 +32,8 @@ python scripts/demo_causality.py          # asserts the guarantees on that real 
 python scripts/reconcile_conventions.py   # prices the execution conventions
 python scripts/run_funnel.py              # five gates, on the real data
 python scripts/compare_stops.py           # what a protective stop actually buys
+python scripts/compare_execution.py       # commission plans, a minimum order, close and open fills
+python scripts/compare_positions.py       # every name that passes, or the best N
 python scripts/backtest_momentum.py --freq weekly --rebalance-weeks 4 --start 2009-02-24
 pytest -q                                 # 630 tests
 ```

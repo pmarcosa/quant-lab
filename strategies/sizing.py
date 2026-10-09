@@ -13,6 +13,10 @@ from collections.abc import Mapping
 from contracts.errors import ContractViolation
 from contracts.identifiers import InstrumentId
 
+#: Halvings or doublings allowed while bracketing the scale. Scores span far
+#: fewer than 2**200 in practice; the bound turns a hang into an error.
+_MAX_DOUBLINGS = 200
+
 
 def capped_proportional(
     scores: Mapping[InstrumentId, float], floor: float, cap: float, tol: float = 1e-12
@@ -69,12 +73,25 @@ def capped_proportional(
         return sum(min(max(scale * scores[k], floor), cap) for k in names)
 
     # Start from the unconstrained scale, so the common case where no bound
-    # binds converges in a couple of steps.
+    # binds converges in a couple of steps. The brackets stop within ``tol`` of
+    # one, like the bisection: when the bounds only just admit a book (equal
+    # weights, cap of exactly 1/n), ``total`` can never pass one exactly --
+    # ten weights of 0.1 sum to 0.9999999999999999 on Python 3.10 -- and an
+    # exact comparison doubled ``hi`` into infinity and looped for ever.
     lo = hi = 1.0 / sum(scores[k] for k in names)
-    while total(lo) > 1.0:
+    unbracketable = f"could not bracket a scale for {n} names in [{floor}, {cap}]"
+    for _ in range(_MAX_DOUBLINGS):
+        if total(lo) <= 1.0 + tol:
+            break
         lo /= 2.0
-    while total(hi) < 1.0:
+    else:  # pragma: no cover - the feasibility checks above make this unreachable
+        raise ContractViolation(unbracketable)
+    for _ in range(_MAX_DOUBLINGS):
+        if total(hi) >= 1.0 - tol:
+            break
         hi *= 2.0
+    else:  # pragma: no cover - the feasibility checks above make this unreachable
+        raise ContractViolation(unbracketable)
 
     scale = 0.5 * (lo + hi)
     for _ in range(200):

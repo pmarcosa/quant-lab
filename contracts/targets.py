@@ -28,6 +28,38 @@ from contracts.temporal import utc
 MAX_PLAUSIBLE_WEIGHT = 10.0
 
 
+class Holdings(dict):
+    """What a strategy is told about the book: each position's weight and gain.
+
+    A mapping from instrument to weight, as before, so a strategy that only
+    wants the weights reads it as one. ``gains`` adds each position's return on
+    its average cost (``mark / cost - 1``; negative under water).
+
+    Both are dimensionless. A gain says how a position has done, not how big it
+    is, so the strategy still learns the shape of the book and nothing about its
+    size. It is passed, rather than left for the strategy to work out, for the
+    reason the weights are: an exit rule such as "sell what is 20% under its
+    cost" is conditional on a holding, and a strategy cannot derive its cost
+    from a filtration without remembering its own trades -- which would make
+    the decision depend on the object's history instead of on its inputs.
+    """
+
+    __slots__ = ("gains",)
+
+    def __init__(
+        self,
+        weights: Mapping[InstrumentId, float] | None = None,
+        gains: Mapping[InstrumentId, float] | None = None,
+    ) -> None:
+        super().__init__(weights or {})
+        self.gains: dict[InstrumentId, float] = dict(gains or {})
+
+
+def gains_of(held: Mapping[InstrumentId, float]) -> Mapping[InstrumentId, float]:
+    """The gains that came with ``held``, or none if it is a plain mapping."""
+    return getattr(held, "gains", None) or {}
+
+
 @dataclass(frozen=True, slots=True)
 class TargetIntent:
     """A strategy's intended book at one instant.

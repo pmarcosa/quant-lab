@@ -12,6 +12,7 @@ from contracts.errors import ContractViolation
 from contracts.execution import (
     InstrumentConstraints,
     OrderIntent,
+    OrderStatus,
     OrderType,
     Side,
     TimeInForce,
@@ -692,3 +693,213 @@ def test_a_short_backtest_without_permission_fails_loudly(portfolio):
             tradable_at=lambda m: {AAA},
             policy=SizingPolicy(cash_buffer=0.0, min_trade_fraction=0.0),
         )
+
+
+def _stop_run(portfolio, weeks, closes, opens, lows, rotate_every=4):
+    from engine.decide import SizingPolicy
+    from engine.run import run_backtest
+
+    return run_backtest(
+        run=RUN,
+        opening=Book.opening(portfolio, 100_000.0, weeks[0]),
+        strategy=_Holds(AAA, rotate_every=rotate_every),
+        schedule=weeks,
+        filtration_at=_NoFiltration,
+        marks_at=_prices(weeks, closes).__getitem__,
+        execution_at=_prices(weeks, opens).__getitem__,
+        broker=SimulatedBroker(costs=CostModel(0.0, 0.0)),
+        tradable_at=lambda m: {AAA},
+        lows_at=_prices(weeks, lows).__getitem__,
+        supervisor=RiskSupervisor(rules=(), stop=ProtectiveStop(distance=0.12)),
+        policy=SizingPolicy(cash_buffer=0.0, min_trade_fraction=0.0),
+    )
+
+
+def test_a_new_stop_is_live_in_the_bar_it_is_placed_in(portfolio):
+    """Bought at an open of 100, stop at 88, and that same week trades down to 80.
+
+    The stop rests at the broker from the open, so the week's low reaches it and
+    it fills at 88. Testing it only from the following bar left it blind for a
+    week, and then filled it at that bar's open of 82 instead.
+    """
+    weeks = _weekly(4)
+    result = _stop_run(
+        portfolio, weeks,
+        closes=[100.0, 81.0, 82.0, 83.0],
+        opens=[100.0, 100.0, 82.0, 83.0],
+        lows=[99.0, 80.0, 81.0, 82.0],
+    )
+    first = result.steps[0]
+    assert first.stopped_out == ("aaa",), "stopped in the bar it was bought in"
+    bought, stopped = first.fills
+    assert (bought.side, bought.price) == (Side.BUY, 100.0)
+    assert (stopped.side, stopped.price) == (Side.SELL, 88.0)
+    assert first.book_after.positions == {}
+    assert result.stops_fired() == 1
+    # Closed by a stop, so not bought back before the next rotation.
+    for step in result.steps[1:]:
+        assert not step.intents
+
+
+def test_a_new_stop_that_the_bar_never_reaches_keeps_resting(portfolio):
+    weeks = _weekly(3)
+    result = _stop_run(
+        portfolio, weeks,
+        closes=[100.0, 95.0, 96.0],
+        opens=[100.0, 100.0, 95.0],
+        lows=[99.0, 90.0, 94.0],
+    )
+    assert result.stops_fired() == 0
+    assert result.book.positions, "still held"
+
+
+def test_a_rotation_replaces_the_old_stop_before_its_bar(portfolio):
+    """The stop a rotation replaces does not see the bar it is replaced in.
+
+    Held from 100 with a stop at 88. The second rotation fills at an open of 120
+    and that week trades down to 87. The old stop was withdrawn before the bar,
+    so nothing fills at 88; the new one, at 88% of 120, fills at 105.6.
+    """
+    weeks = _weekly(4)
+    result = _stop_run(
+        portfolio, weeks, rotate_every=2,
+        closes=[100.0, 100.0, 118.0, 110.0],
+        opens=[100.0, 100.0, 100.0, 120.0],
+        lows=[99.0, 99.0, 99.0, 87.0],
+    )
+    # Step 2 is the second rotation: decided on week 2's close, filled on week
+    # 3's open of 120, re-anchored there, and stopped by that week's low.
+    (stopped,) = [f for f in result.all_fills() if f.client_order_id.endswith("-stop")]
+    assert stopped.price == pytest.approx(105.6)
+    assert result.stops_fired() == 1
+
+
+# -- limit orders and stop-limits at the simulated broker ------------------------
+
+
+def _priced(side, quantity, order_type, limit, stop=None, gtc=False, tag=""):
+    from dataclasses import replace
+
+    base = order(AAA, side, quantity, tag=tag)
+    return replace(
+        base, order_type=order_type, limit_price=limit, stop_price=stop,
+        time_in_force=TimeInForce.GTC if gtc else TimeInForce.DAY,
+    )
+
+
+def _broker():
+    return SimulatedBroker(costs=CostModel(0.0, 0.0))
+
+
+def test_a_buy_limit_fills_at_the_open_when_the_open_is_inside_it(portfolio):
+    broker = _broker()
+    broker.submit(_priced(Side.BUY, 10, OrderType.LIMIT, limit=102.0))
+    (fill,) = broker.advance(at(2020, 1, 10), {AAA: 101.0}, lows={AAA: 99.0})
+    assert fill.price == 101.0, "the open, not the limit: a limit is a ceiling"
+
+
+def test_a_buy_limit_fills_at_the_limit_when_the_bar_only_trades_down_to_it(portfolio):
+    broker = _broker()
+    broker.submit(_priced(Side.BUY, 10, OrderType.LIMIT, limit=102.0))
+    (fill,) = broker.advance(at(2020, 1, 10), {AAA: 105.0}, lows={AAA: 101.0})
+    assert fill.price == 102.0
+
+
+def test_a_day_limit_the_bar_never_reaches_expires_unfilled(portfolio):
+    """Gapped away: an order that could not fill at its price fills at none."""
+    broker = _broker()
+    intent = _priced(Side.BUY, 10, OrderType.LIMIT, limit=102.0)
+    broker.submit(intent)
+    assert broker.advance(at(2020, 1, 10), {AAA: 110.0}, lows={AAA: 106.0}) == ()
+    (state,) = broker.poll([intent.client_order_id])
+    assert state.status is OrderStatus.CANCELLED and "limit" in state.message
+    assert broker.unfilled == 1
+
+
+def test_a_sell_limit_is_the_mirror(portfolio):
+    broker = _broker()
+    broker.submit(_priced(Side.SELL, 10, OrderType.LIMIT, limit=98.0))
+    (fill,) = broker.advance(at(2020, 1, 10), {AAA: 95.0}, highs={AAA: 99.0})
+    assert fill.price == 98.0
+
+
+def test_slippage_never_carries_a_fill_through_its_limit(portfolio):
+    broker = SimulatedBroker(costs=CostModel(commission_bps=0.0, slippage_bps=100.0))
+    broker.submit(_priced(Side.BUY, 10, OrderType.LIMIT, limit=101.5))
+    (fill,) = broker.advance(at(2020, 1, 10), {AAA: 101.0}, lows={AAA: 99.0})
+    assert fill.price == 101.5, "101 plus 1% is 102.01; the limit holds it at 101.50"
+
+
+def test_a_stop_limit_touched_inside_the_bar_fills_at_the_stop(portfolio):
+    broker = _broker()
+    broker.submit(_priced(Side.SELL, 100, OrderType.STOP_LIMIT, limit=87.56, stop=88.0, gtc=True))
+    (fill,) = broker.advance(at(2020, 1, 10), {AAA: 95.0}, lows={AAA: 85.0})
+    assert fill.price == 88.0
+
+
+def test_a_stop_limit_gapped_inside_its_limit_fills_at_the_open(portfolio):
+    broker = _broker()
+    broker.submit(_priced(Side.SELL, 100, OrderType.STOP_LIMIT, limit=87.56, stop=88.0, gtc=True))
+    (fill,) = broker.advance(at(2020, 1, 10), {AAA: 87.8}, lows={AAA: 80.0})
+    assert fill.price == 87.8
+
+
+def test_a_stop_limit_gapped_through_its_limit_does_not_fill(portfolio):
+    """What the limit costs: the gap it was meant to bound leaves the position open.
+
+    A plain stop here fills at the open of 80. The stop-limit triggers, rests as
+    a limit at 87.56 above the market, and is filled only when a later bar comes
+    back up to it.
+    """
+    broker = _broker()
+    intent = _priced(Side.SELL, 100, OrderType.STOP_LIMIT, limit=87.56, stop=88.0, gtc=True)
+    broker.submit(intent)
+    assert broker.advance(at(2020, 1, 10), {AAA: 80.0}, lows={AAA: 75.0}, highs={AAA: 82.0}) == ()
+    assert intent.client_order_id in broker.working, "still resting"
+    # A week that stays below it: still nothing.
+    assert broker.advance(at(2020, 1, 17), {AAA: 78.0}, lows={AAA: 76.0}, highs={AAA: 85.0}) == ()
+    # A week that trades back up through the limit: filled there.
+    (fill,) = broker.advance(at(2020, 1, 24), {AAA: 84.0}, lows={AAA: 83.0}, highs={AAA: 90.0})
+    assert fill.price == 87.56
+
+
+def test_a_gapped_stop_limit_fills_at_its_limit_if_the_same_bar_recovers(portfolio):
+    broker = _broker()
+    broker.submit(_priced(Side.SELL, 100, OrderType.STOP_LIMIT, limit=87.56, stop=88.0, gtc=True))
+    (fill,) = broker.advance(at(2020, 1, 10), {AAA: 80.0}, lows={AAA: 79.0}, highs={AAA: 89.0})
+    assert fill.price == 87.56
+
+
+def test_an_untouched_stop_limit_keeps_resting(portfolio):
+    broker = _broker()
+    broker.submit(_priced(Side.SELL, 100, OrderType.STOP_LIMIT, limit=87.56, stop=88.0, gtc=True))
+    assert broker.advance(at(2020, 1, 10), {AAA: 95.0}, lows={AAA: 90.0}) == ()
+
+
+def test_a_stop_with_a_limit_offset_is_placed_as_a_stop_limit():
+    stop = ProtectiveStop(distance=0.12, limit_offset=0.005)
+    (placed,) = stop.orders_for(
+        {AAA: position(AAA, anchor=100.0)},
+        run=RUN, portfolio=_PORTFOLIO, strategy_version=VERSION,
+        moment=at(2020, 1, 3), constraints_for=lambda i: InstrumentConstraints(i, "USD"),
+    )
+    assert placed.order_type is OrderType.STOP_LIMIT
+    assert placed.stop_price == pytest.approx(88.0)
+    assert placed.limit_price == pytest.approx(87.56)
+    assert placed.time_in_force is TimeInForce.GTC
+
+
+def test_a_shorts_stop_limit_sits_above_its_stop():
+    stop = ProtectiveStop(distance=0.12, limit_offset=0.005)
+    (placed,) = stop.orders_for(
+        {AAA: position(AAA, quantity=-40, anchor=100.0)},
+        run=RUN, portfolio=_PORTFOLIO, strategy_version=VERSION,
+        moment=at(2020, 1, 3), constraints_for=lambda i: InstrumentConstraints(i, "USD"),
+    )
+    assert (placed.side, placed.stop_price) == (Side.BUY, pytest.approx(112.0))
+    assert placed.limit_price == pytest.approx(112.56)
+
+
+def test_an_impossible_stop_limit_offset_is_refused():
+    with pytest.raises(ContractViolation):
+        ProtectiveStop(distance=0.12, limit_offset=1.0)

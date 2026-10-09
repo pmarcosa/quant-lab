@@ -5,17 +5,23 @@ The strategy the user runs, expressed against the framework's contracts. It impo
 strategy — which is what the architecture test enforces and what makes it
 replaceable.
 
-The rules, unchanged from the version validated over 17 years:
+The rules are the ones the weekly review of the live account applies, so that a
+backtest, a paper sleeve and that review describe one strategy:
 
 1. **Rank** the eligible universe by trailing return over ``lookback_weeks``.
-2. **Gate** on trend and pace. A name must be above a rising SMA, and its recent
-   pace must be a real fraction of its long-horizon pace, which rejects names
-   that have already finished their move — something the ranking alone cannot
-   see.
-3. **Exit** held names on trend break, RSI reversion, or a drawdown from the
-   rolling high. Exits are evaluated before selection, so a name that triggered
-   one cannot be re-bought the same week.
-4. **Size** inverse to volatility, bounded (see :mod:`strategies.sizing`).
+2. **Gate** on trend and pace. A name must be above a rising SMA, and its return
+   over the last ``pace_weeks`` must be a real fraction of its return over the
+   lookback, which rejects names that have already finished their move —
+   something the ranking alone cannot see.
+3. **Exit** held names on trend break, RSI reversion, a drawdown from the
+   rolling high, or a loss on cost while the trailing return is negative. Exits
+   are evaluated before selection, so a name that triggered one cannot be
+   re-bought the same week.
+4. **Hold** every name that passes, or the best ``top_n`` of them. A held name
+   that no longer passes but has triggered no exit is kept as it is -- frozen --
+   and takes no part in the re-weighting.
+5. **Size** the names that pass inverse to volatility, bounded (see
+   :mod:`strategies.sizing`), over the part of the book the frozen names leave.
 
 An empty target is a position, not a failure: it means nothing qualified and the
 book should be in cash.
@@ -33,7 +39,7 @@ import pandas as pd
 
 from contracts.errors import ContractViolation
 from contracts.identifiers import InstrumentId, StrategyVersion
-from contracts.targets import TargetIntent
+from contracts.targets import TargetIntent, gains_of
 from contracts.temporal import BarInterval, Filtration, FiltrationSpec
 from strategies.sizing import capped_proportional
 
@@ -43,7 +49,13 @@ STRATEGY_NAME = "weekly-momentum"
 #: alone. Counting bars from the start of a run would make the rotation phase
 #: depend on where the run began, and two runs over overlapping windows would
 #: rotate on different weeks -- which is a silent difference, not a visible one.
-CADENCE_EPOCH = datetime(1999, 1, 4, tzinfo=timezone.utc)
+#:
+#: Which Monday matters for a cadence of several weeks: it picks one of the
+#: possible calendars. This one puts a four-week rotation on the live account's
+#: calendar, which rebalances on Monday 2026-09-21 (decided on the close of
+#: Friday the 18th) and every four weeks from there. Until 2026-10-09 the epoch
+#: was a week earlier, and backtests rotated a week before the account did.
+CADENCE_EPOCH = datetime(1999, 1, 11, tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,8 +72,13 @@ class MomentumParams:
         pace_weeks: Short horizon for the deceleration filter.
         sma_weeks: Trend SMA period.
         sma_slope_weeks: Bars back the SMA must have risen over.
-        pace_ratio_min: Short pace must reach this fraction of the long pace.
-        top_n: Positions held.
+        pace_ratio_min: The return over ``pace_weeks`` must reach this fraction
+            of the return over ``lookback_weeks``. Total returns, not returns
+            per week: 0.4 asks the last four weeks for 40% of the quarter's
+            move. (Until 2026-10-09 the comparison was per week, which asks for
+            about 12% and lets through names that have nearly stopped.)
+        top_n: The most names the book is split between, best trailing return
+            first. Zero means every name that passes the filters.
         min_history_weeks: Bars a name needs before it may be selected. Point-in-
             time availability, not a data-quality filter.
         rsi_period: RSI lookback.
@@ -73,6 +90,23 @@ class MomentumParams:
         rsi_exit_low: RSI level that fires it once armed.
         rsi_exit_window: Bars the arming level is looked for in.
         high_drawdown_exit: Fraction below the rolling high that forces an exit.
+        cost_stop_loss: A held name this far below its average cost is sold if
+            its trailing return is also negative. Zero disables it. It needs the
+            position's gain, which the engine supplies with the holdings.
+        hold_unqualified: Keep a held name that fails the entry filters but has
+            triggered no exit, at the weight it has. Off, such a name is sold at
+            the next rotation, as it was until 2026-10-09.
+        freeze_rotations: How long a name may stay frozen. A frozen name is kept
+            only if it passed the entry filters at one of this many rotations
+            before the present one; after that it is sold. Zero is no limit.
+            Passing today does not count: a name that passes again but ranks
+            below ``top_n`` after its rotations of grace is sold. (Counting it
+            was tried on 2026-10-09 and kept more idle names for no gain.)
+            Read from the name's own history, so the strategy still remembers
+            nothing between decisions.
+        freeze_fade: The fraction of its weight a frozen name keeps at each
+            rotation. 1.0 keeps all of it; 0.5 halves it every rotation, so
+            capital leaves a name that has stopped qualifying without one sale.
         weight_floor_mult: Lower weight bound, as a multiple of equal weight.
         weight_cap_mult: Upper weight bound, as a multiple of equal weight.
         rebalance_weeks: Weeks between rotations. Between them the strategy holds
@@ -94,6 +128,10 @@ class MomentumParams:
     rsi_exit_low: float = 50.0
     rsi_exit_window: int = 4
     high_drawdown_exit: float = 0.12
+    cost_stop_loss: float = 0.20
+    hold_unqualified: bool = True
+    freeze_rotations: int = 0
+    freeze_fade: float = 1.0
     weight_floor_mult: float = 0.5
     weight_cap_mult: float = 2.0
     rebalance_weeks: int = 1
@@ -103,14 +141,26 @@ class MomentumParams:
             raise ContractViolation(
                 f"rebalance_weeks must be at least 1; got {self.rebalance_weeks}"
             )
-        if self.top_n < 1:
-            raise ContractViolation(f"top_n must be at least 1; got {self.top_n}")
+        if self.top_n < 0:
+            raise ContractViolation(
+                f"top_n must be a number of names, or 0 for every name that passes; "
+                f"got {self.top_n}"
+            )
+        if self.freeze_rotations < 0 or not 0.0 < self.freeze_fade <= 1.0:
+            raise ContractViolation(
+                f"freeze_rotations must not be negative and freeze_fade must be in (0, 1]; "
+                f"got {self.freeze_rotations} and {self.freeze_fade}"
+            )
+        if not 0.0 <= self.cost_stop_loss < 1.0:
+            raise ContractViolation(
+                f"cost_stop_loss must be a fraction in [0, 1); got {self.cost_stop_loss}"
+            )
         if not 0.0 <= self.weight_floor_mult <= 1.0 <= self.weight_cap_mult:
             raise ContractViolation(
                 f"weight bounds must satisfy floor <= 1 <= cap as multiples of equal weight; "
                 f"got floor {self.weight_floor_mult}, cap {self.weight_cap_mult}"
             )
-        if self.weight_cap_mult * self.top_n < 1.0:
+        if self.top_n and self.weight_cap_mult * self.top_n < 1.0:
             raise ContractViolation(
                 f"{self.top_n} names capped at {self.weight_cap_mult}x equal weight cannot "
                 f"fill the book"
@@ -207,15 +257,17 @@ def entry_ok(row: Mapping[str, float], params: MomentumParams) -> bool:
     ret_pace = row["ret_pace"]
     if not np.isfinite(ret_pace):
         return False
-    pace_long = ret_long / params.lookback_weeks
-    pace_short = ret_pace / params.pace_weeks
-    return not (pace_long > 0 and (ret_pace < 0 or pace_short < params.pace_ratio_min * pace_long))
+    return not (ret_pace < 0 or ret_pace < params.pace_ratio_min * ret_long)
 
 
-def exit_reason(row: Mapping[str, float], params: MomentumParams) -> str | None:
+def exit_reason(
+    row: Mapping[str, float], params: MomentumParams, gain: float | None = None
+) -> str | None:
     """Why a held name should be sold, or None to keep holding.
 
-    Returns one of ``trend_break``, ``rsi_reversion``, ``below_high``, or None.
+    Returns one of ``trend_break``, ``rsi_reversion``, ``below_high``,
+    ``cost_stop``, or None. ``gain`` is the position's return on its average
+    cost; without it the cost rule cannot fire.
     """
     close, sma, sma_prev = row["close"], row["sma"], row["sma_prev"]
     if np.isfinite(sma) and close < sma and not (sma > sma_prev):
@@ -228,6 +280,19 @@ def exit_reason(row: Mapping[str, float], params: MomentumParams) -> str | None:
     high_long = row["high_long"]
     if np.isfinite(high_long) and close < (1.0 - params.high_drawdown_exit) * high_long:
         return "below_high"
+
+    # A loss on cost alone is not a reason to sell -- the cost is the holder's
+    # past, not the instrument's future -- so it counts only with a trailing
+    # return that is also negative: a loser that is still losing.
+    ret_long = row["ret_long"]
+    if (
+        params.cost_stop_loss > 0
+        and gain is not None
+        and gain <= -params.cost_stop_loss
+        and np.isfinite(ret_long)
+        and ret_long < 0
+    ):
+        return "cost_stop"
     return None
 
 
@@ -259,7 +324,7 @@ class WeeklyMomentum:
     """
 
     params: MomentumParams = MomentumParams()
-    code_version: str = "2.0"
+    code_version: str = "3.0"
     precomputed: Mapping[InstrumentId, pd.DataFrame] | None = None
 
     @property
@@ -291,6 +356,7 @@ class WeeklyMomentum:
         """
         params = self.params
         depth = FULL_HISTORY
+        gains = gains_of(held)
         rows: list[dict[str, Any]] = []
 
         for instrument in filtration.universe(min_bars=params.min_history_weeks):
@@ -301,7 +367,17 @@ class WeeklyMomentum:
             if not np.isfinite(row["close"]):
                 continue
             is_held = instrument in held
-            reason = exit_reason(row, params) if is_held else None
+            reason = exit_reason(row, params, gains.get(instrument)) if is_held else None
+            # Whether it qualified at one of the last few rotations: what a
+            # limit on freezing asks. One bar per week, so a rotation back is
+            # ``rebalance_weeks`` rows back.
+            recently = True
+            if is_held and params.freeze_rotations:
+                recently = any(
+                    entry_ok(table.iloc[-1 - back * params.rebalance_weeks], params)
+                    for back in range(1, params.freeze_rotations + 1)
+                    if len(table) > back * params.rebalance_weeks
+                )
             rows.append(
                 {
                     "instrument": instrument,
@@ -310,6 +386,7 @@ class WeeklyMomentum:
                     "atr_pct": float(row["atr_pct"]),
                     "rsi": float(row["rsi"]),
                     "held": is_held,
+                    "passed_recently": recently,
                     "exit_reason": reason,
                     "eligible": bool(entry_ok(row, params)) and reason is None,
                 }
@@ -357,9 +434,26 @@ class WeeklyMomentum:
 
         weights: dict[InstrumentId, float] = {}
         diagnostics: dict[str, float] = {"candidates": float(len(table))}
+        frozen: dict[InstrumentId, float] = {}
+        exits = 0
 
         if not table.empty:
-            picks = table.loc[table["eligible"]].head(params.top_n)
+            passing = table.loc[table["eligible"]]
+            picks = passing.head(params.top_n) if params.top_n else passing
+            chosen = set(picks["instrument"])
+            exits = int(table["exit_reason"].notna().sum())
+            if params.hold_unqualified:
+                # Frozen: held, no exit triggered, and not among the names the
+                # book is being split between -- because it fails an entry
+                # filter, or passes but ranks below ``top_n``. It keeps the
+                # weight it has. A position is judged by its exit rules, not by
+                # whether it would be bought again today.
+                frozen = {
+                    row.instrument: held[row.instrument] * params.freeze_fade
+                    for row in table.itertuples()
+                    if row.held and row.exit_reason is None and row.instrument not in chosen
+                    and row.passed_recently
+                }
             scored = {
                 row.instrument: 1.0 / row.atr_pct
                 for row in picks.itertuples()
@@ -378,8 +472,23 @@ class WeeklyMomentum:
                 # fallback; silently dropping the name is not.
                 equal = 1.0 / len(picks)
                 weights = {row.instrument: equal for row in picks.itertuples()}
-            diagnostics["selected"] = float(len(weights))
-            diagnostics["eligible"] = float(int(table["eligible"].sum()))
+            diagnostics["eligible"] = float(len(passing))
+
+        if params.hold_unqualified:
+            # A held name with no bar this week cannot be judged, so it cannot
+            # be sold on a rule either: it stays as it is.
+            ranked = set(table["instrument"]) if not table.empty else set()
+            frozen.update({i: w for i, w in held.items() if i not in ranked})
+
+        # The names that pass share what the frozen ones leave: the book less
+        # the frozen positions, which is how the capital is counted by hand.
+        budget = max(0.0, 1.0 - sum(abs(w) for w in frozen.values()))
+        weights = {i: w * budget for i, w in weights.items()}
+        diagnostics["selected"] = float(len(weights))
+        diagnostics["frozen"] = float(len(frozen))
+        diagnostics["frozen_weight"] = float(sum(abs(w) for w in frozen.values()))
+        diagnostics["exits"] = float(exits)
+        weights.update(frozen)
 
         diagnostics["rotated"] = 1.0
         return TargetIntent(
@@ -397,7 +506,14 @@ class WeeklyMomentum:
             frame = self.precomputed.get(instrument)
             if frame is None or frame.empty:
                 return None
-            visible = frame.loc[frame.index <= filtration.decision_time]
+            index = frame.index
+            if index.is_monotonic_increasing:
+                # The same rows as the mask below, found by binary search and
+                # taken as a slice: no pass over the whole history and no copy
+                # of it, for every name at every decision.
+                visible = frame.iloc[: index.searchsorted(filtration.decision_time, side="right")]
+            else:
+                visible = frame.loc[index <= filtration.decision_time]
             return None if visible.empty else visible
         bars = _bars(filtration, instrument, FULL_HISTORY)
         if bars.empty:

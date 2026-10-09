@@ -27,6 +27,7 @@ purge of 4 bars (the holding period), embargo of 9 bars (1% of the sample).
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 
@@ -158,7 +159,7 @@ def purged_splits(
 def split_count(blocks: int = DEFAULT_BLOCKS, test_blocks: int | None = None) -> int:
     """How many combinations a configuration produces, without building them."""
     held_out = blocks // 2 if test_blocks is None else test_blocks
-    return len(list(itertools.combinations(range(blocks), held_out)))
+    return math.comb(blocks, held_out)
 
 
 def block_sharpes(returns: np.ndarray, splits: Sequence[Split]) -> np.ndarray:

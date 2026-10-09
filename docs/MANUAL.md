@@ -469,11 +469,19 @@ browser (section 6.1).
 | `--lookback` | from config, else 13 | momentum horizon, in weeks |
 | `--rebalance-weeks` | from config, else 4 | weeks between rotations. The book is still marked every week. |
 | `--stop` | from config, else 0.12 | protective stop distance; `0` disables it |
-| `--cost-bps` / `--slippage-bps` | 10 / 10 | commission and slippage per side, in basis points |
+| `--cost-bps` / `--slippage-bps` | from config, else 10 / 10 | commission and slippage per side, in basis points |
+| `--commission` | bps | `bps` charges `--cost-bps` of each order's value. `ibkr-tiered` and `ibkr-fixed` charge IBKR's published plan in dollars per order instead: per share, with the minimum, the 1% cap, and (tiered) exchange, clearing and regulatory fees |
+| `--share-price` | 100 | with an IBKR plan: the typical share price per-share fees are charged at. The stored history is split-adjusted, so an old bar of a stock that later split shows many more shares than were traded; `0` charges on the stored quantity |
+| `--cash-buffer` / `--no-trade-band` | from config, else 0.01 / 0.005 | the fraction of equity held back from sizing, and the size below which an adjustment is not sent |
+| `--limit-band` | from config, else market orders | send limit orders this far through the decision price; an instrument that gaps past the band is not traded |
+| `--stop-limit-offset` | from config, else a plain stop | make the stop a stop-limit this far under the stop. A stop-limit does not fill when the price gaps through its limit; a negative value forces a plain stop |
+| `--min-order` | 0 | orders below this many dollars are not sent. Exits are exempt |
+| `--min-order-fraction` | 0 | the same rule as a fraction of equity, for an account that stays its present size (1,000 dollars at 17,000 is 0.06) |
+| `--fill` | next-open | `decision-close` fills rotation orders at the close they were decided on, as a closing-auction order would. It looks ahead by the last minutes before the auction |
 | `--start` | the first week in the store | earliest week, as an ISO date |
 | `--benchmark` | SPY | the comparison line in the report |
 | `--universe` | from config, else the whole store | a universe name or file (step 4.5) |
-| `--capital` | 100,000 | starting capital; see below |
+| `--capital` | the config's `sleeve_capital`, else 100,000 | starting capital; see below |
 | `--report` | off | writes `state/reports/<id>/backtest-<time>.html` and `.json` |
 
 `--top`, `--lookback` and `--rebalance-weeks` are the momentum strategy's
@@ -602,7 +610,61 @@ This runs the same strategy with several stop distances and records each run as
 a trial. It shows what the stop actually buys: less drawdown, paid for in
 positions cut just before they recovered.
 
-### Step 5.5 — Query the ledger directly
+### Step 5.5 — Compare execution rules
+
+```bash
+python scripts/compare_execution.py
+```
+
+This measures three execution rules against one baseline (decide on the weekly
+close, fill at the next open, IBKR's tiered commissions, the account's present
+size as opening capital):
+
+- a minimum order size, as a share of equity and as a number of dollars;
+- deciding on the close and filling at that close;
+- deciding on the open and filling at that open;
+- the minimum order size together with the better of the two fills.
+
+It also prices the baseline's orders under each commission model for an account
+that stays its present size, and repeats the main variants on the three other
+four-week rotation calendars. Each variant is compared with the baseline on the
+weekly difference of returns, with Newey-West errors. Every run is recorded as a
+trial in the study `execution-rules`; the details go to
+`state/scratch/compare_execution.json`.
+
+Read two things before trusting a difference. "Decide on the open, fill at the
+open" cannot be traded as simulated: the open is not known before the opening
+auction prints it. And a difference that appears on one rotation calendar and
+not on the others is timing luck.
+
+### Step 5.6 — How many names to hold
+
+```bash
+python scripts/compare_positions.py
+```
+
+The strategy splits the book between the best `top_n` names that pass its
+filters (`0`: every name that passes) and keeps -- freezes -- a held name that
+is not among them but has triggered no exit, for at most `freeze_rotations`
+rotations. This script takes the configured strategy with every name that
+passes as its reference, then runs the best 4 to 10 names and each way of
+handling frozen names (kept, kept for one or two rotations, halved, sold) on the
+four rotation calendars, the pace filter both ways, and three single switches
+(the stop-loss on cost, the stop type, limit orders). It reports how many
+positions the book held and how small the smallest target was for an account of
+the present size. It stops after `--budget` seconds and goes on where it left
+off when run again. Every run is recorded in the study `position-count`.
+
+The config in use since 2026-10-09 is `top_n: 5`, `freeze_rotations: 2`,
+`pace_ratio_min: 0.1231` (pace compared per week) and `cost_stop_loss: 0.0`.
+
+**One place for how the strategy trades.** `execution:` and `risk:` in the
+strategy's config set the cash buffer, the no-trade band, limit or market
+orders, the commission plan and the stop type. `ql backtest`, `ql monitor
+baseline` and the live proposal all read them, so after changing one, rebuild
+the baseline.
+
+### Step 5.7 — Query the ledger directly
 
 The ledger holds one JSON object per line and is easy to query:
 

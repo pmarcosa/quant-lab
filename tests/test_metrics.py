@@ -88,3 +88,17 @@ def test_sortino_ignores_upside_deviation():
     calm_stats = summarise(curve(calm), periods_per_year=52)
     wild_stats = summarise(curve(wild), periods_per_year=52)
     assert wild_stats.sortino > calm_stats.sortino
+
+
+def test_sortino_averages_the_shortfall_over_every_period():
+    """Sortino and Price: a gain is a shortfall of zero, not a skipped period.
+
+    One loss of 2% among four periods: the downside deviation is
+    sqrt(0.02**2 / 4) = 1%, not sqrt(0.02**2 / 1) = 2%.
+    """
+    values = [100.0]
+    for move in (0.01, -0.02, 0.01, 0.01):
+        values.append(values[-1] * (1 + move))
+    stats = summarise(curve(values), periods_per_year=1)
+    mean = (0.01 - 0.02 + 0.01 + 0.01) / 4
+    assert stats.sortino == pytest.approx(mean / 0.01)

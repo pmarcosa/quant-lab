@@ -25,7 +25,7 @@ mode: paper
 account: DU1234567
 sleeve_capital: 100000
 gateway: {{host: 127.0.0.1, port: 4002, client_id: 5}}
-strategy: {{rebalance_weeks: 1, top_n: 2, lookback_weeks: 13}}
+strategy: {{name: weekly-momentum, params: {{rebalance_weeks: 1, top_n: 2, lookback_weeks: 13, pace_ratio_min: 0.2}}}}
 risk: {{stop_distance: 0.12}}
 monitoring: {{bootstrap_paths: 1000}}
 state_dir: {state}

@@ -16,6 +16,12 @@ from data.ingest import to_observations, universe_from_store
 GROWTH = {"AAA": 0.020, "BBB": 0.015, "CCC": 0.008, "DDD": 0.004, "EEE": -0.01}
 LAST_LABEL = datetime(2026, 9, 14)  # the Monday label of the latest complete week
 
+#: These names climb at a constant rate, and a constant rate does not pass the
+#: strategy's pace filter: 4 weeks of 13 carry 31% of the move, and the filter
+#: asks for 40%. The filter has its own tests; the fixtures that only need names
+#: to hold relax it with these parameters.
+STEADY = {"pace_ratio_min": 0.2}
+
 
 class Clock:
     def __init__(self, start: datetime):

@@ -38,7 +38,9 @@ class Performance:
         sharpe_geometric: ``(cagr - rf) / volatility``. Reported because the
             previous system used it; systematically higher, and not comparable
             with published Sharpe figures.
-        sortino: As Sharpe, but against downside deviation only.
+        sortino: As Sharpe, but against downside deviation only: the root
+            mean square of the shortfall below the risk-free rate, taken over
+            every period (a gain is a shortfall of zero, not a missing value).
         max_drawdown: Deepest peak-to-trough fall in equity, as a fraction.
         final_equity: Where the curve ended.
         periods: Number of return observations.
@@ -122,8 +124,13 @@ def summarise(
         float(np.mean(excess)) / deviation * math.sqrt(periods_per_year) if deviation > 0 else 0.0
     )
 
-    downside = excess[excess < 0.0]
-    downside_deviation = float(np.sqrt(np.mean(downside**2))) if downside.size else 0.0
+    # Downside deviation over *every* period, with the gains counted as zero
+    # shortfall (Sortino and Price, 1994): sqrt(mean(min(excess, 0)**2)).
+    # Averaging over the losing periods alone divides by fewer observations,
+    # inflates the deviation by about sqrt(N / losers) and understates the
+    # ratio -- by roughly 1.4x for a strategy that loses half its weeks.
+    shortfall = np.minimum(excess, 0.0)
+    downside_deviation = float(np.sqrt(np.mean(shortfall**2)))
     sortino = (
         float(np.mean(excess)) / downside_deviation * math.sqrt(periods_per_year)
         if downside_deviation > 0

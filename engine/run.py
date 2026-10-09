@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Protocol
 
 from contracts.errors import ContractViolation
-from contracts.execution import Fill, OrderIntent, Side
+from contracts.execution import Fill, OrderIntent, Side, is_stop_order
 from contracts.identifiers import InstrumentId, PortfolioId, RunId
 from contracts.risk import LeveragePolicy, LeverageState, PositionRisk, RiskReview
 from contracts.strategy import Strategy
@@ -43,6 +43,11 @@ PricesAt = Callable[[datetime], Mapping[InstrumentId, float]]
 
 #: Which instruments may be traded at a moment. Separate from having a price.
 TradableAt = Callable[[datetime], Collection[InstrumentId]]
+
+#: A bar that began with less gross exposure than this was (nearly) in cash and
+#: says nothing about the strategy's risk per unit of exposure; base returns
+#: skip it. One constant, because the run and its result must agree.
+MIN_GROSS_FOR_BASE_RETURN = 0.05
 
 
 class RiskSupervision(Protocol):
@@ -146,7 +151,7 @@ class RunResult:
         out = []
         previous_equity, previous_gross = self.opening_equity, 0.0
         for step in self.steps:
-            if previous_equity > 0 and previous_gross > 0.05:
+            if previous_equity > 0 and previous_gross > MIN_GROSS_FOR_BASE_RETURN:
                 out.append((step.equity_after / previous_equity - 1.0) / previous_gross)
             previous_equity, previous_gross = step.equity_after, step.gross_after
         return out
@@ -157,7 +162,7 @@ class RunResult:
         previous_equity = self.opening_equity
         for step in self.steps:
             traded = sum(
-                f.quantity * f.price for f in step.fills if not f.client_order_id.endswith("-stop")
+                f.quantity * f.price for f in step.fills if not is_stop_order(f.client_order_id)
             )
             if traded > 0 and previous_equity > 0:
                 out.append(traded / previous_equity)
@@ -172,7 +177,7 @@ class RunResult:
             if previous_equity > 0:
                 out.extend(
                     f.quantity * f.price / previous_equity for f in step.fills
-                    if not f.client_order_id.endswith("-stop")
+                    if not is_stop_order(f.client_order_id)
                 )
             previous_equity = step.equity_after
         return out
@@ -202,6 +207,7 @@ def run_backtest(
     leverage: LeveragePolicy | None = None,
     financing: FinancingModel | None = None,
     bars_per_week: float = 1.0,
+    fill_at_decision: bool = False,
 ) -> RunResult:
     """Run ``strategy`` over ``schedule``, one decision per entry.
 
@@ -231,6 +237,15 @@ def run_backtest(
             cushion. Without one, carrying a levered or short book is free --
             which only a long-only, fully paid book can honestly assume.
         bars_per_week: For the leverage policy's per-week speeds.
+        fill_at_decision: Fill the rotation's orders at the decision's own
+            marks instead of at the next bar's open. This is the convention of
+            an order sent to the auction that sets the bar's close, decided a
+            few minutes before it: the decision and the fill share one price.
+            It is realisable only as far as the price just before the auction
+            equals the auction's; the backtest uses the close for both, which is
+            a small lookahead and the reason the default is off. Stops are
+            placed and triggered exactly as without it, so two runs differing in
+            this flag differ in the rotation's fill prices and in nothing else.
 
     Returns:
         Every step in order, with the books before and after.
@@ -260,9 +275,8 @@ def run_backtest(
     # Stop order id to (instrument, side). The engine tracks this itself rather
     # than asking the broker, so the execution port stays as narrow as it is.
     resting_stops: dict[str, tuple[InstrumentId, Side]] = {}
-    opening_equity = opening.equity(
-        {i: marks_at(opening.as_of)[i] for i in opening.positions}
-    )
+    opening_marks = marks_at(opening.as_of) if opening.positions else {}
+    opening_equity = opening.equity({i: opening_marks[i] for i in opening.positions})
     # The history a leverage policy may look at: equity per bar, and returns
     # per unit of gross exposure (the strategy's own risk, leverage divided out).
     equity_history: list[float] = [opening_equity]
@@ -320,8 +334,13 @@ def run_backtest(
         # the market the position overshoots through zero -- a long becomes a
         # short, or a short a long -- without anyone deciding to.
         trading = {(i.instrument, i.side) for i in intents}
+        # A rotation replaces every stop at the bar it fills in, so the old ones
+        # are withdrawn before that bar: they are cancelled before the opening
+        # orders go in and never see its range. Leaving them in would test two
+        # stops on one position against the same bar, at two different levels.
+        replacing = supervisor is not None and rotated and index + 1 < len(moments)
         for oid, (instrument, side) in list(resting_stops.items()):
-            if (instrument, side) in trading:
+            if replacing or (instrument, side) in trading:
                 broker.cancel(oid)
                 resting_stops.pop(oid, None)
 
@@ -329,14 +348,26 @@ def run_backtest(
         carried = 0.0
         for intent in intents:
             broker.submit(intent)
+        # Filling at the decision: the orders trade now, at the marks they were
+        # sized on. Only their own instruments are priced, so no resting stop is
+        # looked at here; stops keep to the bars, as in the default convention.
+        # The last decision has no bar after it and stays unfilled either way.
+        filled_at_decision: tuple[Fill, ...] = ()
+        if fill_at_decision and index + 1 < len(moments) and intents:
+            traded_now = {i.instrument: marks[i.instrument] for i in intents}
+            filled_at_decision = broker.advance(moment, traded_now)
+            book = book.at(moment).apply_all(filled_at_decision)
+        # The next bar's prices, asked for once: the fills, the financing, the
+        # new stops' anchors and the mark all read the same bar.
+        fill_prices = execution_at(execution_time) if has_next else marks
         if has_next:
             lows = None if lows_at is None else lows_at(execution_time)
             highs = None if highs_at is None else highs_at(execution_time)
-            fills = broker.advance(execution_time, execution_at(execution_time), lows, highs)
+            fills = broker.advance(execution_time, fill_prices, lows, highs)
             if financing is not None:
                 # The book as it stood through the bar pays for being carried,
                 # priced where the bar ended.
-                prices_then = {**marks, **execution_at(execution_time)}
+                prices_then = {**marks, **fill_prices}
                 charges = financing.charges(
                     book, _held_marks(book, prices_then), moment, execution_time
                 )
@@ -346,30 +377,30 @@ def run_backtest(
             for charge in charges:
                 book = book.charge(charge)
                 carried += charge.amount
+        fills = filled_at_decision + fills
 
-        stopped = tuple(
-            str(f.instrument) for f in fills if f.client_order_id.endswith("-stop")
-        )
-        for oid in [f.client_order_id for f in fills if f.client_order_id in resting_stops]:
-            resting_stops.pop(oid, None)
-        for name in stopped:
-            stopped_since_rotation.add(InstrumentId(name))
-            # A position closed by a risk mechanism stays closed. Re-entering it
-            # on the next bar because the strategy still likes it turns a stop
-            # into a round trip with costs and no protection. It becomes a
-            # candidate again at the next rotation, like anything else.
-            anchors.pop(InstrumentId(name), None)
+        # A position closed by a risk mechanism stays closed. Re-entering it on
+        # the next bar because the strategy still likes it turns a stop into a
+        # round trip with costs and no protection. It becomes a candidate again
+        # at the next rotation, like anything else.
+        if rotated:
+            stopped_since_rotation.clear()
+
+        def close_out(stop_fills: Sequence[Fill]) -> None:
+            for fill in stop_fills:
+                resting_stops.pop(fill.client_order_id, None)
+                stopped_since_rotation.add(fill.instrument)
+                anchors.pop(fill.instrument, None)
+
+        close_out([f for f in fills if is_stop_order(f.client_order_id)])
 
         # Stops rest at the broker between rotations and are replaced at each
         # one, at the new anchor. Leaving an old stop in place would be
         # protecting a price that is no longer relevant.
-        if rotated:
-            stopped_since_rotation.clear()
         if supervisor is not None and rotated and has_next:
             for oid in list(resting_stops):
                 broker.cancel(oid)
             resting_stops.clear()
-            fill_prices = execution_at(execution_time)
             for instrument, position in book.positions.items():
                 anchors[instrument] = _anchor_price(
                     instrument, fill_prices, position.average_cost
@@ -384,10 +415,24 @@ def run_backtest(
             ):
                 broker.submit(intent)
                 resting_stops[intent.client_order_id] = (intent.instrument, intent.side)
+            # A stop is live from the moment it is placed, and it is placed at
+            # this bar's open -- so this bar's range can already reach it. The
+            # bar is shown to the broker again for the new stops alone (nothing
+            # else is working: the rotation's orders have filled or expired).
+            # Waiting for the next bar left every new stop blind for its first
+            # week, the week a failed entry is most likely to show itself, and
+            # then filled it late at a worse open.
+            triggered = broker.advance(execution_time, fill_prices, lows, highs)
+            if triggered:
+                book = book.apply_all(triggered)
+                close_out(triggered)
+                fills = fills + triggered
 
+        stopped = tuple(
+            str(f.instrument) for f in fills if is_stop_order(f.client_order_id)
+        )
         marked_at = execution_time if has_next else moment
-        prices = execution_at(marked_at) if has_next else marks
-        valued = {i: prices.get(i, marks[i]) for i in book.positions}
+        valued = {i: fill_prices.get(i, marks[i]) for i in book.positions}
         equity_after = book.equity(valued)
         gross_after = gross_leverage(book, valued) if book.positions else 0.0
         steps.append(
@@ -407,7 +452,7 @@ def run_backtest(
             )
         )
         previous_equity, previous_gross = equity_history[-1], gross_history[-1]
-        if previous_equity > 0 and previous_gross > 0.05:
+        if previous_equity > 0 and previous_gross > MIN_GROSS_FOR_BASE_RETURN:
             base_returns.append((equity_after / previous_equity - 1.0) / previous_gross)
         equity_history.append(equity_after)
         gross_history.append(gross_after)

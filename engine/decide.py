@@ -23,6 +23,8 @@ quantities from the fill — doing so is a lookahead.
 
 from __future__ import annotations
 
+import math
+import numbers
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,7 +41,7 @@ from contracts.execution import (
 )
 from contracts.identifiers import InstrumentId, PortfolioId, RunId, StrategyVersion
 from contracts.strategy import Strategy
-from contracts.targets import TargetIntent
+from contracts.targets import Holdings, TargetIntent
 from contracts.temporal import Filtration, utc
 from engine.accounting import Book
 
@@ -60,6 +62,24 @@ class SizingPolicy:
             not sent. Without a no-trade band a rotation emits a handful of
             single-share orders every period, each paying full commission and
             spread to correct a rounding difference.
+        min_order_value: Orders worth less than this many dollars are not sent,
+            unless they close a position. A broker's minimum fee is a fixed
+            number of dollars, so below some size an order pays more in
+            commission than the adjustment is worth; unlike the no-trade band
+            this is an absolute size, and it also applies to opening a new
+            position. Exits are exempt: an order the strategy or a stop needs
+            to get out is never held back for being small. Zero disables it.
+        min_order_fraction: The same rule as a fraction of equity. A number of
+            dollars stops binding as a backtest's equity compounds, so a rule
+            that matters at 17,000 dollars is invisible at 500,000; the fraction
+            asks what the rule does to an account that stays the size it is
+            today (1,000 dollars at 17,000 is about 0.06). The larger of the two
+            thresholds applies.
+        limit_band: Send the rotation's orders as limit orders this far through
+            the decision mark -- a buy up to ``mark * (1 + band)``, a sell down
+            to ``mark * (1 - band)`` -- instead of as market orders. The order
+            then cannot fill at any price, and an instrument that gaps past the
+            band is not traded at all. ``None`` sends market orders.
         allow_short: Whether a negative target weight may open a short. Off by
             default: a strategy that emits one by accident should fail, not
             silently borrow stock.
@@ -78,6 +98,9 @@ class SizingPolicy:
 
     cash_buffer: float = 0.01
     min_trade_fraction: float = 0.005
+    min_order_value: float = 0.0
+    min_order_fraction: float = 0.0
+    limit_band: float | None = None
     allow_short: bool = False
     time_in_force: TimeInForce = TimeInForce.OPG
     leverage: float = 1.0
@@ -90,6 +113,16 @@ class SizingPolicy:
             raise ContractViolation(
                 f"min_trade_fraction cannot be negative; got {self.min_trade_fraction}"
             )
+        if self.min_order_value < 0.0:
+            raise ContractViolation(
+                f"min_order_value cannot be negative; got {self.min_order_value}"
+            )
+        if not 0.0 <= self.min_order_fraction < 1.0:
+            raise ContractViolation(
+                f"min_order_fraction must be in [0, 1); got {self.min_order_fraction}"
+            )
+        if self.limit_band is not None and not 0.0 <= self.limit_band < 1.0:
+            raise ContractViolation(f"limit_band must be in [0, 1); got {self.limit_band}")
         if not 0.0 < self.leverage <= 10.0:
             raise ContractViolation(f"leverage must be in (0, 10]; got {self.leverage}")
 
@@ -182,8 +215,12 @@ def decide(
 
     # The strategy sees the shape of the book, never its size. Computing this
     # before the target keeps the equity out of the strategy's reach entirely.
-    held_now = (
-        book.weights({i: marks[i] for i in book.positions}) if book.positions else {}
+    held_now = Holdings(
+        book.weights({i: marks[i] for i in book.positions}) if book.positions else {},
+        gains={
+            i: marks[i] / p.average_cost - 1.0
+            for i, p in book.positions.items() if p.average_cost > 0
+        },
     )
     target = strategy.target(filtration, held_now)
 
@@ -210,6 +247,7 @@ def decide(
 
     investable = equity * (1.0 - policy.cash_buffer)
     floor_value = equity * policy.min_trade_fraction
+    smallest_order = max(policy.min_order_value, equity * policy.min_order_fraction)
 
     intents: list[OrderIntent] = []
     skipped: dict[InstrumentId, str] = {}
@@ -230,6 +268,16 @@ def decide(
         rules = constraints_for(instrument)
         held = book.quantity(instrument)
         weight = wanted.get(instrument, 0.0)
+
+        # A target that restates a position's present weight asks for nothing.
+        # Sizing it again would not return the shares held: the cash buffer
+        # shaves it and rounding takes a share, so every week a strategy said
+        # "keep this" the engine would sell a little of it, and only the
+        # no-trade band stood in the way.
+        if held != 0.0 and weight != 0.0 and math.isclose(
+            weight, held_now.get(instrument, 0.0), rel_tol=1e-12, abs_tol=0.0
+        ):
+            continue
 
         if weight == 0.0:
             # Exiting. Close the whole position: never leave a stub behind
@@ -261,6 +309,12 @@ def decide(
         # tradable lot the position cannot be closed, and that is worth knowing.
         if desired == 0.0 and quantity != abs(held):
             quantity = abs(held)
+        # A fixed minimum fee makes a small order expensive whatever it is for,
+        # so this applies to opening a position as well as adjusting one. Never
+        # to closing: a small exit is still an exit.
+        if desired != 0.0 and quantity * price < smallest_order:
+            skipped[instrument] = "below the minimum order size"
+            continue
 
         intents.append(
             OrderIntent(
@@ -273,7 +327,8 @@ def decide(
                 strategy_version=strategy.version,
                 side=side,
                 quantity=quantity,
-                order_type=OrderType.MARKET,
+                order_type=OrderType.MARKET if policy.limit_band is None else OrderType.LIMIT,
+                limit_price=_limit(price, side, policy.limit_band, rules),
                 decision_time=moment,
                 time_in_force=policy.time_in_force,
                 reason=_reason(held, desired),
@@ -326,8 +381,23 @@ def leverage_scale(
     return 1.0
 
 
+def _limit(
+    mark: float, side: Side, band: float | None, rules: InstrumentConstraints
+) -> float | None:
+    """The limit for a rotation order: the mark, moved ``band`` against the trader."""
+    if band is None:
+        return None
+    return rules.round_price(mark * (1.0 + band) if side is Side.BUY else mark * (1.0 - band))
+
+
 def _usable(price: float) -> bool:
-    return isinstance(price, (int, float)) and price > 0 and price == price
+    """A price that can size an order: a finite, positive real number.
+
+    ``numbers.Real`` rather than ``(int, float)``, so a NumPy integer mark is
+    accepted; ``isfinite`` rather than ``price == price``, which caught NaN but
+    let infinity through to size every order at zero shares without a word.
+    """
+    return isinstance(price, numbers.Real) and math.isfinite(price) and price > 0
 
 
 def _reason(held: float, desired: float) -> str:

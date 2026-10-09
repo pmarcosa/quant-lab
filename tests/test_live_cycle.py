@@ -20,7 +20,7 @@ from execution.ibkr import IBKRBroker  # noqa: E402
 from runtime.config import LiveConfig, RiskSettings, StrategySettings  # noqa: E402
 from runtime.live import LiveSession  # noqa: E402
 from tests.fake_gateway import FakeGateway  # noqa: E402
-from tests.live_fixtures import Clock, append_week, build_market  # noqa: E402
+from tests.live_fixtures import STEADY, Clock, append_week, build_market  # noqa: E402
 
 SATURDAY = datetime(2026, 9, 19, 10, 0, tzinfo=timezone.utc)
 
@@ -29,7 +29,7 @@ def config(tmp_path, **risk):
     return LiveConfig(
         strategy_id="momentum",
         mode=TradingMode.PAPER, account="DU1234567", sleeve_capital=100_000.0,
-        strategy=StrategySettings(params={"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13}),
+        strategy=StrategySettings(params={"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13, **STEADY}),
         risk=RiskSettings(**{"stop_distance": 0.12, "max_order_fraction": 0.6, **risk}),
         state_dir=tmp_path / "state",
     )
@@ -245,6 +245,44 @@ def test_a_name_a_stop_closed_is_not_bought_back_before_the_next_rotation(world)
     proposal = session.propose()
     bought = {str(o.intent.instrument) for o in proposal.orders if o.intent.side.value == "buy"}
     assert stopped not in bought
+
+
+@pytest.mark.parametrize("change", ["tighter", "off_then_on"])
+def test_a_replaced_stop_is_really_placed(world, change):
+    """A stop cancelled and placed again for the same rotation must rest at the broker.
+
+    Its id is derived from the decision, which has not changed. Reusing it made
+    the broker return the cancelled order instead of placing the new one:
+    ``place_stops`` reported success, the journal said "placed", and the
+    positions were unprotected.
+    """
+    session, gateway, clock, frames, tmp_path = world
+    run_first_rotation(world)
+    broker = session.broker
+    before = {str(w.instrument) for w in broker.working_orders()}
+    assert len(before) == 2
+
+    def reopened(distance):
+        return LiveSession(config(tmp_path, stop_distance=distance), broker,
+                           tmp_path / "store", clock=clock)
+
+    if change == "tighter":
+        placed, cancelled = reopened(0.10).place_stops()
+        assert (placed, cancelled) == (2, 2)
+        expected = 0.90
+    else:
+        assert reopened(0).place_stops() == (0, 2)
+        assert not broker.working_orders()
+        reopened(0.12).place_stops()
+        expected = 0.88
+
+    working = broker.working_orders()
+    assert {str(w.instrument) for w in working} == before, "every position protected again"
+    book = session.book()
+    for w in working:
+        assert w.stop_price == pytest.approx(
+            book.positions[w.instrument].average_cost * expected, abs=0.011
+        )
 
 
 def _hand_trade(gateway, symbol="DDD", reference=""):

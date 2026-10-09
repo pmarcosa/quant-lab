@@ -22,7 +22,7 @@ from runtime.monitor import (  # noqa: E402
     run_monitor,
 )
 from tests.fake_gateway import FakeGateway  # noqa: E402
-from tests.live_fixtures import Clock, append_week, build_market  # noqa: E402
+from tests.live_fixtures import STEADY, Clock, append_week, build_market  # noqa: E402
 
 SATURDAY = datetime(2026, 9, 19, 10, 0, tzinfo=timezone.utc)
 
@@ -36,7 +36,7 @@ def make_session(tmp_path, weeks=120, **strategy):
         strategy_id="momentum",
         mode=TradingMode.PAPER, account="DU1234567", sleeve_capital=100_000.0,
         strategy=StrategySettings(
-            params={"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13, **strategy}
+            params={"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13, **STEADY, **strategy}
         ),
         risk=RiskSettings(stop_distance=0.12),
         state_dir=tmp_path / "state",
@@ -78,6 +78,35 @@ def test_a_baseline_is_built_saved_and_reloaded(tmp_path):
     assert reloaded == baseline
     assert len(baseline.returns) > 20
     assert baseline.modeled_bps > 0
+
+
+def test_the_expected_return_of_a_rotation_is_a_return_not_a_count_of_bars(tmp_path):
+    """One rotation of a strategy that makes a few percent a month earns a few percent.
+
+    It was computed by compounding ``1 + equity ratio`` -- every bar a doubling --
+    and came out near 1 for a weekly rotation and near 15 for a four-weekly one.
+    The halt on execution cost divides the cost by this number, so with the
+    doublings in it the halt could never fire.
+    """
+    session, _, clock, _ = make_session(tmp_path)
+    baseline = build_baseline(session, clock.now)
+    assert 0.0 < baseline.expected_rotation_return < 0.5
+
+
+def test_the_baseline_trades_the_way_the_config_says(tmp_path):
+    """The config's costs and sizing reach the baseline; changing them makes it stale."""
+    from dataclasses import replace
+
+    from runtime.config import ExecutionSettings
+
+    session, _, clock, _ = make_session(tmp_path)
+    flat = build_baseline(session, clock.now)
+    tiered = ExecutionSettings(commission="ibkr-tiered", cash_buffer=0.0, no_trade_band=0.0)
+    session.config = replace(session.config, execution=tiered)
+    planned = build_baseline(session, clock.now)
+    assert planned.settings["execution"]["commission"] == "ibkr-tiered"
+    assert planned.settings != flat.settings, "so the old baseline is refused as stale"
+    assert planned.modeled_bps < flat.modeled_bps, "a plan in dollars costs less than 10 bp here"
 
 
 def test_a_baseline_built_for_other_settings_is_refused(tmp_path):

@@ -101,19 +101,72 @@ class ExecutionSettings:
     strategies -- the live counterpart of the backtest's next-open fill -- and
     as day market orders for intraday ones, where the next bar's open is not an
     auction.
+
+    The rest says how weights become orders and what an order costs. It is read
+    by the backtest, by the monitoring baseline and by the live proposal alike,
+    so the three describe one way of trading: a strategy sized one way live and
+    another in its baseline would be compared with something it is not.
     """
 
     time_in_force: str = "auto"
+    #: Fraction of equity held back from sizing (``SizingPolicy.cash_buffer``).
+    cash_buffer: float = 0.01
+    #: Adjustments worth less than this fraction of equity are not sent.
+    no_trade_band: float = 0.005
+    #: Send limit orders this far through the decision price instead of market
+    #: orders. ``None``: market orders.
+    limit_band: float | None = None
+    #: ``bps``: ``commission_bps`` of each order's value. ``ibkr-tiered`` or
+    #: ``ibkr-fixed``: that plan, in dollars per order.
+    commission: str = "bps"
+    commission_bps: float = 10.0
+    slippage_bps: float = 10.0
+    #: With a plan: the typical share price per-share fees are charged at, since
+    #: stored history is split-adjusted. 0 charges on the stored quantity.
+    share_price: float = 100.0
 
     def resolve(self, interval: BarInterval) -> TimeInForce:
         if self.time_in_force == "auto":
             return TimeInForce.DAY if interval.is_intraday else TimeInForce.OPG
         return TimeInForce(self.time_in_force)
 
+    def sizing(self, interval: BarInterval, **more):
+        """The sizing rules these settings ask for; ``more`` adds or overrides."""
+        from engine.decide import SizingPolicy
+
+        return SizingPolicy(**{
+            "cash_buffer": self.cash_buffer, "min_trade_fraction": self.no_trade_band,
+            "limit_band": self.limit_band, "time_in_force": self.resolve(interval), **more,
+        })
+
+    def costs(self):
+        """The cost model these settings ask for."""
+        from execution.simulated import COMMISSION_PLANS, CostModel
+
+        plan = None
+        if self.commission != "bps":
+            plan = COMMISSION_PLANS[self.commission].with_reference_price(
+                self.share_price if self.share_price > 0 else None
+            )
+        return CostModel(commission_bps=self.commission_bps, slippage_bps=self.slippage_bps,
+                         schedule=plan)
+
 
 @dataclass(frozen=True, slots=True)
 class RiskSettings:
     stop_distance: float = 0.12
+    #: Make the stop a stop-limit that sells no lower than this fraction under
+    #: the stop (0.005: half a percent). ``None``: a plain stop, which always
+    #: fills; a stop-limit does not when the price gaps through its limit.
+    stop_limit_offset: float | None = None
+
+    def stop(self):
+        """The protective stop these settings ask for, or None when it is off."""
+        from risk.rules import ProtectiveStop
+
+        if self.stop_distance <= 0:
+            return None
+        return ProtectiveStop(distance=self.stop_distance, limit_offset=self.stop_limit_offset)
     max_gross: float = 1.0
     #: Net exposure band, longs minus shorts over equity. ``max_net`` empty
     #: means "the same as ``max_gross``": for a long-only book net *is* gross,
@@ -363,9 +416,24 @@ class LiveConfig:
             raise ContractViolation(
                 "config: execution.time_in_force must be auto, opg, day or gtc"
             )
+        e = self.execution
+        if e.commission not in ("bps", "ibkr-tiered", "ibkr-fixed"):
+            raise ContractViolation(
+                "config: execution.commission must be bps, ibkr-tiered or ibkr-fixed"
+            )
+        if not 0 <= e.cash_buffer < 1 or e.no_trade_band < 0:
+            raise ContractViolation(
+                "config: execution.cash_buffer must be in [0, 1) and no_trade_band not negative"
+            )
+        if e.limit_band is not None and not 0 <= e.limit_band < 1:
+            raise ContractViolation("config: execution.limit_band must be in [0, 1), or null")
+        if e.commission_bps < 0 or e.slippage_bps < 0 or e.share_price < 0:
+            raise ContractViolation("config: execution costs cannot be negative")
         r = self.risk
         if not 0 < r.stop_distance < 1 and r.stop_distance != 0:
             raise ContractViolation("config: risk.stop_distance must be in (0, 1), or 0")
+        if r.stop_limit_offset is not None and not 0 <= r.stop_limit_offset < 1:
+            raise ContractViolation("config: risk.stop_limit_offset must be in [0, 1), or null")
         if not 0 < r.max_order_fraction <= 1:
             raise ContractViolation("config: risk.max_order_fraction must be in (0, 1]")
         if r.max_gross <= 0:

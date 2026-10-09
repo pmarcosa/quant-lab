@@ -31,6 +31,7 @@ expert's version.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -100,11 +101,13 @@ class LeverageSchedule:
         """True when this schedule can only ever answer 1.0."""
         return self.maximum <= 1.0 and self.floor == 1.0 and self.target == 1.0
 
-    def base_level(self, base_returns) -> float:
+    def base_level(self, base_returns: Sequence[float] | np.ndarray) -> float:
         """Leverage before drawdown and cushion: fixed, or set by tail risk."""
         if self.cvar_target is None:
             return self.target
-        window = np.asarray(list(base_returns)[-self.cvar_window:], dtype=float)
+        # Slice before converting: the history grows every bar, and copying all
+        # of it to keep the last ``cvar_window`` made a run quadratic.
+        window = np.asarray(base_returns[-self.cvar_window:], dtype=float)
         window = window[np.isfinite(window)]
         if window.size < self.min_history:
             return self.target

@@ -348,8 +348,7 @@ def cmd_backtest(ctx: Context, args) -> int:
     from dataclasses import replace as _replace
 
     from contracts.identifiers import RunId
-    from engine.decide import SizingPolicy
-    from execution.simulated import CostModel
+    from execution.simulated import COMMISSION_PLANS
     from risk.rules import (
         GrossExposureLimit,
         NetExposureLimit,
@@ -357,7 +356,13 @@ def cmd_backtest(ctx: Context, args) -> int:
         RiskSupervisor,
         ShortSales,
     )
-    from runtime.config import FinancingSettings, LeverageSettings, RiskSettings, StrategySettings
+    from runtime.config import (
+        ExecutionSettings,
+        FinancingSettings,
+        LeverageSettings,
+        RiskSettings,
+        StrategySettings,
+    )
     from runtime.reporting import backtest_report
     from runtime.research import (
         STARTING_CAPITAL,
@@ -376,6 +381,25 @@ def cmd_backtest(ctx: Context, args) -> int:
     risk = config.risk if config else RiskSettings()
     lev = config.leverage if config else LeverageSettings()
     fin = config.financing if config else FinancingSettings()
+    # How weights become orders and what they cost: the config's, so a plain
+    # `ql backtest` trades the way the live proposal and its baseline do. An
+    # option on the command line overrides one setting for one run.
+    execution = config.execution if config else ExecutionSettings()
+    given_execution = {
+        "commission": args.commission, "commission_bps": args.cost_bps,
+        "slippage_bps": args.slippage_bps, "share_price": args.share_price,
+        "cash_buffer": args.cash_buffer, "no_trade_band": args.no_trade_band,
+        "limit_band": args.limit_band,
+    }
+    execution = _replace(
+        execution, **{k: v for k, v in given_execution.items() if v is not None}
+    )
+    if args.stop_limit_offset is not None:
+        risk = _replace(risk, stop_limit_offset=(
+            args.stop_limit_offset if args.stop_limit_offset >= 0 else None
+        ))
+    capital = (args.capital if args.capital is not None
+               else config.sleeve_capital if config else STARTING_CAPITAL)
     if args.leverage is not None:
         # A research override: a fixed leverage, with the cap raised to meet it.
         lev = _replace(lev, target=args.leverage, cvar_target=None,
@@ -402,7 +426,7 @@ def cmd_backtest(ctx: Context, args) -> int:
     universe = universe_list(args.universe or chosen.universe)
     market = load_market(ctx.store, interval=interval, start=start,
                          symbols=universe.symbols if universe else None)
-    if args.capital <= 0:
+    if capital <= 0:
         raise ContractViolation("--capital must be positive")
     strategy = build_strategy(chosen.name, params, market)
     supervisor = RiskSupervisor(
@@ -411,7 +435,8 @@ def cmd_backtest(ctx: Context, args) -> int:
             GrossExposureLimit(risk.max_gross),
             NetExposureLimit(risk.min_net, risk.net_cap),
         ),
-        stop=ProtectiveStop(stop) if stop > 0 else None,
+        stop=(ProtectiveStop(stop, limit_offset=risk.stop_limit_offset)
+              if stop > 0 else None),
     )
     # A strategy that needs a warm-up says so in its parameters; the backtest
     # window starts after it, so its first bars are not reported as flat returns.
@@ -421,22 +446,50 @@ def cmd_backtest(ctx: Context, args) -> int:
         if spec is not None else 0
     )
     schedule = list(market.schedule)[warmup:]
-    costs = CostModel(commission_bps=args.cost_bps, slippage_bps=args.slippage_bps)
+    if args.min_order < 0 or not 0 <= args.min_order_fraction < 1:
+        raise ContractViolation(
+            "--min-order cannot be negative, and --min-order-fraction must be in [0, 1)"
+        )
+    if execution.commission not in ("bps", *COMMISSION_PLANS):
+        raise ContractViolation(f"unknown commission model {execution.commission!r}")
+    # A broker's plan in dollars replaces the flat basis points. Per-share fees
+    # are charged at a typical share price unless told otherwise: the stored
+    # history is split-adjusted (see CommissionSchedule.reference_share_price).
+    costs = execution.costs()
+    plan = costs.schedule
+    at_decision = args.fill == "decision-close"
     run_name = "bt-" + "-".join(str(v) for _, v in sorted(params.items()))[:40]
     result = run_once(market, strategy, schedule, RunId(run_name), costs,
-                      SizingPolicy(cash_buffer=0.01, min_trade_fraction=0.005,
-                                   allow_short=risk.allow_short),
+                      execution.sizing(interval, min_order_value=args.min_order,
+                                       min_order_fraction=args.min_order_fraction,
+                                       allow_short=risk.allow_short),
                       supervisor=supervisor,
                       leverage=None if schedule_rule.is_static_unlevered else schedule_rule,
-                      financing=fin.model(), capital=args.capital)
+                      financing=fin.model(), capital=capital,
+                      fill_at_decision=at_decision)
 
     # Every backtest is a trial. Recording it keeps the Deflated Sharpe honest.
     returns = periodic_returns(result)
     window = f"{schedule[0].date()}..{schedule[-1].date()}"
     label = trial_label(market, schedule)
-    note = f"stop={stop} cost={args.cost_bps} slip={args.slippage_bps}"
+    note = f"stop={stop} cost={execution.commission_bps} slip={execution.slippage_bps}"
+    # Only when asked for, so a run without them keeps the note it always had
+    # and is still recognised as the same trial.
+    note += f" commission={costs.describe()}" if plan is not None else ""
+    note += f" min_order={args.min_order:g}" if args.min_order > 0 else ""
+    note += (f" min_order_fraction={args.min_order_fraction:g}"
+             if args.min_order_fraction > 0 else "")
+    note += " fill=decision-close" if at_decision else ""
+    defaults = ExecutionSettings()
+    if (execution.cash_buffer, execution.no_trade_band) != (
+        defaults.cash_buffer, defaults.no_trade_band
+    ):
+        note += f" buffer={execution.cash_buffer:g} band={execution.no_trade_band:g}"
+    note += f" limit_band={execution.limit_band:g}" if execution.limit_band is not None else ""
+    if stop > 0 and risk.stop_limit_offset is not None:
+        note += f" stop_limit={risk.stop_limit_offset:g}"
     note += f" universe={universe.name}:{universe.fingerprint}" if universe else ""
-    note += f" capital={args.capital:g}" if args.capital != STARTING_CAPITAL else ""
+    note += f" capital={capital:g}" if capital != STARTING_CAPITAL else ""
     if risk.allow_short:
         note += f" short gross={risk.max_gross} net=[{risk.min_net},{risk.net_cap}]"
     if not schedule_rule.is_static_unlevered:
@@ -455,7 +508,17 @@ def cmd_backtest(ctx: Context, args) -> int:
     stats = summarise(result.equity_curve(), periods_per_year=market.periods_per_year)
     shown = " · ".join(f"{k} {v}" for k, v in sorted(params.items()))
     ctx.out(f"strategy     {strategy.version} ({chosen.name}, {interval.frequency})")
-    ctx.out(f"settings     {shown} · stop {stop:.0%} · costs {args.cost_bps}+{args.slippage_bps} bp"
+    charged = f"{execution.commission_bps}" if plan is None else costs.describe()
+    stop_kind = ("" if risk.stop_limit_offset is None or stop <= 0
+                 else f" (limit {risk.stop_limit_offset:.1%} under)")
+    ctx.out(f"settings     {shown} · stop {stop:.0%}{stop_kind} · "
+            f"costs {charged}+{execution.slippage_bps} bp"
+            + (f" · limit orders within {execution.limit_band:.1%}"
+               if execution.limit_band is not None else "")
+            + (f" · orders from {args.min_order:,.0f}" if args.min_order > 0 else "")
+            + (f" · orders from {args.min_order_fraction:.1%} of equity"
+               if args.min_order_fraction > 0 else "")
+            + (" · filled at the decision's close" if at_decision else "")
             + (" · shorts allowed" if risk.allow_short else ""))
     named = f"config {config.source.name}" if config and config.source else "the config"
     source = ("--universe" if args.universe else
@@ -472,8 +535,10 @@ def cmd_backtest(ctx: Context, args) -> int:
     ctx.out(f"volatility   {stats.volatility:.1%}")
     ctx.out(f"Sharpe       {stats.sharpe:.2f}")
     ctx.out(f"max drawdown {stats.max_drawdown:.1%}")
-    ctx.out(f"final equity {stats.final_equity:,.0f} from {args.capital:,.0f}")
+    ctx.out(f"final equity {stats.final_equity:,.0f} from {capital:,.0f}")
     ctx.out(f"stops fired  {result.stops_fired()}")
+    paid = sum(f.commission for f in result.all_fills())
+    ctx.out(f"commissions  {paid:,.0f} over {len(result.all_fills())} fills")
     if not schedule_rule.is_static_unlevered or result.financing_paid > 0:
         levels = [s.leverage for s in result.steps]
         ctx.out(f"leverage     average {sum(levels) / len(levels):.2f}x, range "
@@ -488,9 +553,11 @@ def cmd_backtest(ctx: Context, args) -> int:
                 "and recalls are not modelled")
     if args.report:
         settings = {**params, "strategy": chosen.name, "interval": interval.frequency,
-                    "stop_distance": stop, "commission_bps": args.cost_bps,
-                    "slippage_bps": args.slippage_bps, "window": window,
-                    "capital": args.capital,
+                    "stop_distance": stop,
+                    "commission_bps": (execution.commission_bps if plan is None
+                                       else costs.describe()),
+                    "slippage_bps": execution.slippage_bps, "window": window,
+                    "capital": capital,
                     "universe": universe.describe() if universe else "store"}
         # A universe may leave the benchmark out; price it from the whole store.
         whole = (load_market(ctx.store, interval=interval, start=start)
@@ -951,8 +1018,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lookback", type=int, default=None, help="Momentum lookback, weeks")
     p.add_argument("--rebalance-weeks", type=int, default=None, help="Weeks between rotations")
     p.add_argument("--stop", type=float, default=None, help="Stop distance; 0 disables")
-    p.add_argument("--cost-bps", type=float, default=10.0)
-    p.add_argument("--slippage-bps", type=float, default=10.0)
+    p.add_argument("--cost-bps", type=float, default=None,
+                   help="Commission in basis points (default: config, else 10)")
+    p.add_argument("--slippage-bps", type=float, default=None,
+                   help="Slippage in basis points (default: config, else 10)")
+    p.add_argument("--commission", choices=["bps", "ibkr-tiered", "ibkr-fixed"], default=None,
+                   help="Commission model: --cost-bps of value, or an IBKR plan in dollars "
+                        "per order (default: config, else bps)")
+    p.add_argument("--share-price", type=float, default=None,
+                   help="With an IBKR plan: the typical share price per-share fees are "
+                        "charged at, because history is split-adjusted (0: use stored prices)")
+    p.add_argument("--cash-buffer", type=float, default=None,
+                   help="Fraction of equity held back from sizing (default: config, else 0.01)")
+    p.add_argument("--no-trade-band", type=float, default=None,
+                   help="Adjustments below this fraction of equity are not sent "
+                        "(default: config, else 0.005)")
+    p.add_argument("--limit-band", type=float, default=None,
+                   help="Send limit orders this far through the decision price instead of "
+                        "market orders (default: config, else market orders)")
+    p.add_argument("--stop-limit-offset", type=float, default=None,
+                   help="Make the stop a stop-limit this far under the stop; a negative "
+                        "value forces a plain stop (default: config, else a plain stop)")
+    p.add_argument("--min-order", type=float, default=0.0,
+                   help="Do not send orders below this many dollars, exits excepted")
+    p.add_argument("--min-order-fraction", type=float, default=0.0,
+                   help="The same rule as a fraction of equity, for an account that "
+                        "stays its present size (1,000 at 17,000 is 0.06)")
+    p.add_argument("--fill", choices=["next-open", "decision-close"], default="next-open",
+                   help="Where rotation orders fill: the next bar's open (default), or the "
+                        "close they were decided on (a closing-auction order)")
     p.add_argument("--start", default=None, help="Earliest week, ISO date")
     p.add_argument("--benchmark", default="SPY")
     p.add_argument("--ledger", default=str(ROOT / "state" / "research.jsonl"))
@@ -961,8 +1055,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Research override: a fixed gross leverage (e.g. 1.3)")
     p.add_argument("--margin-rate", type=float, default=None,
                    help="Annual interest on borrowed cash (default: config, 0.055)")
-    p.add_argument("--capital", type=float, default=100_000.0,
-                   help="Starting capital (default 100,000). Fix it before validating; "
+    p.add_argument("--capital", type=float, default=None,
+                   help="Starting capital (default: the config's sleeve_capital, else "
+                        "100,000). Fix it before validating; "
                         "picking the one that backtests best is one more trial")
     p.add_argument("--universe", default=None,
                    help="A universe name (data/universes/<name>.txt) or file "

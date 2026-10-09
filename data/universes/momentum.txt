@@ -1,0 +1,58 @@
+# The momentum strategy's buyable universe: the individual stocks of the IBKR
+# watchlist "Robot Trading - Universo" (53 of its 73 instruments, read
+# 2026-10-09). Not here, by rule: the 11 sector ETFs, GLD and COPX (reference
+# only since 2026-10-05), SPY (the benchmark), the cash and bond ETFs, and
+# STRK (a preferred share held for income, never ranked).
+AAPL
+ABBV
+ADBE
+AMD
+AMT
+AMZN
+ASML
+AVGO
+AXP
+CAT
+COP
+COST
+CRCL
+CRM
+CVX
+DIS
+FCX
+GE
+GOOGL
+HON
+INTC
+JNJ
+JPM
+KO
+LIN
+LITE
+LLY
+MA
+MCD
+META
+MRVL
+MSFT
+MSTR
+NEE
+NOW
+NVDA
+O
+ORCL
+PANW
+PEP
+PG
+PLD
+PLTR
+QCOM
+SPCX
+TSM
+TXN
+UNH
+UNP
+V
+WMT
+XOM
+ZM

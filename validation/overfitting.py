@@ -30,6 +30,7 @@ series"; the definition is what is followed here, and the test
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -298,8 +299,6 @@ def probability_of_backtest_overfitting(
         ContractViolation: With fewer than two trials — there is no selection to
             judge — or if the blocks do not fit.
     """
-    import itertools
-
     matrix = np.asarray(returns_matrix, dtype=float)
     if matrix.ndim != 2:
         raise ContractViolation("returns_matrix must be T x N")

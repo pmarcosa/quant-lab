@@ -181,7 +181,7 @@ class UniverseList:
         if not path.exists():
             raise ContractViolation(f"no universe file at {path}")
         symbols: list[str] = []
-        for line in path.read_text().splitlines():
+        for line in path.read_text(encoding="utf-8").splitlines():
             ticker = line.split("#", 1)[0].strip().upper()
             if ticker and ticker not in symbols:
                 symbols.append(ticker)

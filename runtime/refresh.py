@@ -36,6 +36,7 @@ import pandas as pd
 from contracts.identifiers import InstrumentId
 from contracts.temporal import BarInterval
 from data.adjustments import (
+    PRICE_COLUMNS,
     adjust,
     factors_from,
     is_rescaled,
@@ -48,9 +49,6 @@ from data.adjustments import (
 from data.bitemporal import BitemporalStore
 from data.ingest import complete_bars, to_observations
 from data.vendor import CACHE_COLUMNS, cache_inventory, write_cache_csv
-
-PRICE_COLUMNS = ("open", "high", "low", "close")
-
 
 #: IBKR's bar-size strings and how far back a routine refresh re-fetches.
 #: Weekly and daily go back far enough to pick up a restatement from a recent
@@ -134,27 +132,24 @@ def merge_into_cache(
 def changed_rows(
     store: BitemporalStore, instrument: InstrumentId, rows: pd.DataFrame, horizon: datetime
 ) -> tuple[pd.DataFrame, int, int]:
-    """Rows that are new to the store, or differ from what it last recorded."""
+    """Rows that are new to the store, or differ from what it last recorded.
+
+    Vectorised: after a dividend every stored bar is compared, which row by row
+    (``iterrows``) cost a Python-level loop and a Series per bar per symbol.
+    """
     known = store.as_of(instrument, horizon)
     if known.empty:
         return rows, len(rows), 0
-    new_mask, revised_mask = [], []
-    for _, row in rows.iterrows():
-        event = row["event_time"]
-        if event not in known.index:
-            new_mask.append(True)
-            revised_mask.append(False)
-            continue
-        previous = known.loc[event]
-        differs = any(
-            not np.isclose(float(row[c]), float(previous[c]), rtol=1e-9, atol=1e-9)
-            for c in PRICE_COLUMNS
-            if c in row and c in previous
-        )
-        new_mask.append(False)
-        revised_mask.append(differs)
-    keep = [a or b for a, b in zip(new_mask, revised_mask, strict=True)]
-    return rows.loc[keep], sum(new_mask), sum(revised_mask)
+    events = pd.DatetimeIndex(rows["event_time"])
+    is_new = ~events.isin(known.index)
+    columns = [c for c in PRICE_COLUMNS if c in rows.columns and c in known.columns]
+    # New events line up with NaN, which is never "close"; they are masked out.
+    current = rows[columns].to_numpy(dtype=float)
+    previous = known[columns].reindex(events).to_numpy(dtype=float)
+    same = np.isclose(current, previous, rtol=1e-9, atol=1e-9).all(axis=1)
+    is_revised = ~is_new & ~same
+    keep = is_new | is_revised
+    return rows.loc[keep], int(is_new.sum()), int(is_revised.sum())
 
 
 #: How far back an intraday refresh re-reads the dividend factors. It has to

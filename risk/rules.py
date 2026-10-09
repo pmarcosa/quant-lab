@@ -29,11 +29,11 @@ from contracts.execution import (
     OrderType,
     Side,
     TimeInForce,
-    client_order_id,
     split_legs,
+    stop_order_id,
 )
 from contracts.identifiers import InstrumentId
-from contracts.risk import PositionRisk, RiskFinding, RiskReview, Severity
+from contracts.risk import PositionRisk, RiskFinding, RiskReview, RiskRule, Severity
 
 # -- shared arithmetic ---------------------------------------------------------
 
@@ -180,11 +180,12 @@ class GrossExposureLimit:
             abs(p.quantity) * _mark(i, positions, marks)
             for i, p in positions.items() if i not in changes
         ) + sum(abs(c.base) * c.mark for c in changes.values())
-        room = [self.maximum * equity - base]
+        room = self.maximum * equity - base
 
         def room_for(change: _Change, shares: float) -> float:
-            allowed = min(shares, max(room[0], 0.0) / change.mark)
-            room[0] -= allowed * change.mark
+            nonlocal room  # the budget is shared: each grant shrinks the next
+            allowed = min(shares, max(room, 0.0) / change.mark)
+            room -= allowed * change.mark
             return allowed
 
         return _trim_to_budget(
@@ -223,17 +224,18 @@ class NetExposureLimit:
         if equity <= 0:
             raise ContractViolation(f"cannot measure exposure against equity of {equity}")
         changes = _changes(intents, positions, marks)
-        net = [(sum(
+        net = (sum(
             p.quantity * _mark(i, positions, marks)
             for i, p in positions.items() if i not in changes
-        ) + sum(c.base * c.mark for c in changes.values())) / equity]
+        ) + sum(c.base * c.mark for c in changes.values())) / equity
 
         def room_for(change: _Change, shares: float) -> float:
+            nonlocal net  # each grant moves the net exposure the next one sees
             per_share = change.direction * change.mark / equity
             limit = self.maximum if per_share > 0 else self.minimum
-            headroom = (limit - net[0]) / per_share
+            headroom = (limit - net) / per_share
             allowed = min(shares, max(headroom, 0.0))
-            net[0] += allowed * per_share
+            net += allowed * per_share
             return allowed
 
         return _trim_to_budget(
@@ -425,15 +427,33 @@ class ProtectiveStop:
 
     The stop is a **broker-resting order**, not a process check. If the machine
     running this is off, the position is still protected.
+
+    ``limit_offset`` makes it a stop-limit: once touched it sells no lower than
+    that fraction under the stop (0.005 is half a percent). That bounds the
+    price and gives up the certainty: a gap through the limit leaves the
+    position open. ``None`` is a plain stop, which always fills.
     """
 
     distance: float = 0.12
+    limit_offset: float | None = None
 
     def __post_init__(self) -> None:
         if not 0.0 < self.distance < 1.0:
             raise ContractViolation(
                 f"stop distance must be a fraction in (0, 1); got {self.distance}"
             )
+        if self.limit_offset is not None and not 0.0 <= self.limit_offset < 1.0:
+            raise ContractViolation(
+                f"stop limit offset must be a fraction in [0, 1); got {self.limit_offset}"
+            )
+
+    def limit(self, level: float, position: float = 1.0) -> float | None:
+        """The worst price a stop-limit accepts; None for a plain stop."""
+        if self.limit_offset is None:
+            return None
+        if position < 0:
+            return level * (1.0 + self.limit_offset)
+        return level * (1.0 - self.limit_offset)
 
     @property
     def name(self) -> str:
@@ -469,21 +489,22 @@ class ProtectiveStop:
                 continue
             side = Side.closing(position.quantity)
             level = rules.round_price(self.level(anchor, position.quantity))
+            limit = self.limit(level, position.quantity)
             orders.append(
                 OrderIntent(
-                    client_order_id=client_order_id(
+                    client_order_id=stop_order_id(
                         run, portfolio, instrument, moment, side, quantity
-                    )
-                    + "-stop",
+                    ),
                     run=run,
                     portfolio=portfolio,
                     instrument=instrument,
                     strategy_version=strategy_version,
                     side=side,
                     quantity=quantity,
-                    order_type=OrderType.STOP,
+                    order_type=OrderType.STOP if limit is None else OrderType.STOP_LIMIT,
                     decision_time=moment,
                     stop_price=level,
+                    limit_price=None if limit is None else rules.round_price(limit),
                     time_in_force=TimeInForce.GTC,
                     reason="protective stop",
                 )
@@ -499,7 +520,7 @@ class RiskSupervisor:
     A risk layer that swallows its own errors is decoration.
     """
 
-    rules: tuple = ()
+    rules: tuple[RiskRule, ...] = ()
     stop: ProtectiveStop | None = None
 
     def protective_orders(

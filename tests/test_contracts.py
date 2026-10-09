@@ -9,12 +9,15 @@ import pytest
 from contracts.errors import ContractViolation
 from contracts.execution import (
     BrokerCapabilities,
+    Fill,
     InstrumentConstraints,
     OrderIntent,
     OrderStatus,
     OrderType,
     Side,
     client_order_id,
+    is_stop_order,
+    stop_order_id,
 )
 from contracts.identifiers import (
     InstrumentId,
@@ -144,10 +147,27 @@ def test_a_different_quantity_produces_a_different_order_id() -> None:
     assert client_order_id(*base, 12.0) != client_order_id(*base, 13.0)
 
 
+def test_a_replaced_stop_gets_a_new_id_and_the_first_keeps_the_old_one() -> None:
+    """A stop placed again for the same decision must not reuse the cancelled one's id."""
+    base = (RunId("r1"), PortfolioId(TenantId("user"), "m"), InstrumentId("i"), NOW, Side.SELL, 12.0)
+    first = stop_order_id(*base)
+    assert first == client_order_id(*base) + "-stop", "ids made before placements existed"
+    assert stop_order_id(*base, placement=1) not in (first, stop_order_id(*base, placement=2))
+    assert is_stop_order(first) and not is_stop_order(client_order_id(*base))
+
+
 def test_quantity_rounds_down_and_respects_the_minimum() -> None:
     constraints = InstrumentConstraints(InstrumentId("i"), "USD", lot_step=1.0, min_quantity=1.0)
     assert constraints.round_quantity(12.7) == 12.0
     assert constraints.round_quantity(0.4) == 0.0
+
+
+def test_an_exact_multiple_of_a_fractional_lot_is_not_rounded_down() -> None:
+    """0.3 / 0.1 is 2.9999999999999996 in floating point; three lots are still three."""
+    constraints = InstrumentConstraints(InstrumentId("i"), "USD", lot_step=0.1, min_quantity=0.1)
+    assert constraints.round_quantity(0.3) == 0.3
+    assert constraints.round_quantity(0.7 - 0.3) == 0.4
+    assert constraints.round_quantity(0.39) == 0.3, "a fraction still rounds down"
 
 
 def test_price_rounds_to_the_tick() -> None:
@@ -176,6 +196,23 @@ def test_direction_lives_in_side_not_in_the_sign_of_quantity() -> None:
             quantity=-5.0,
             order_type=OrderType.MARKET,
             decision_time=NOW,
+        )
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_a_fill_or_an_order_without_a_finite_number_is_refused(bad) -> None:
+    """NaN fails every comparison, so ``x <= 0`` let it through to poison the book."""
+    with pytest.raises(ContractViolation):
+        Fill("x", InstrumentId("i"), Side.BUY, quantity=1.0, price=bad, at=NOW)
+    with pytest.raises(ContractViolation):
+        Fill("x", InstrumentId("i"), Side.BUY, quantity=bad, price=10.0, at=NOW)
+    with pytest.raises(ContractViolation):
+        Fill("x", InstrumentId("i"), Side.BUY, quantity=1.0, price=10.0, at=NOW, commission=bad)
+    with pytest.raises(ContractViolation):
+        OrderIntent(
+            client_order_id="x", run=RunId("r"), portfolio=PortfolioId(TenantId("user"), "m"),
+            instrument=InstrumentId("i"), strategy_version=StrategyVersion.of(StrategyId("s"), {}),
+            side=Side.BUY, quantity=bad, order_type=OrderType.MARKET, decision_time=NOW,
         )
 
 

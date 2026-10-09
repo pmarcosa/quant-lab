@@ -44,15 +44,16 @@ from contracts.execution import (
     Side,
     TimeInForce,
     client_order_id,
+    is_stop_order,
     order_prefix,
     split_legs,
+    stop_order_id,
 )
 from contracts.identifiers import InstrumentId, PortfolioId, RunId, TenantId
 from contracts.live import DegradationState, EventKind, TradingMode
 from contracts.strategy import Strategy
 from contracts.temporal import BarInterval
 from engine.accounting import Book
-from engine.decide import SizingPolicy
 from engine.run import _position_risk, propose
 from risk.rules import (
     GrossExposureLimit,
@@ -279,8 +280,7 @@ class LiveSession:
                            symbols=universe.symbols if universe else None)
 
     def stop_rule(self) -> ProtectiveStop | None:
-        d = self.config.risk.stop_distance
-        return ProtectiveStop(distance=d) if d > 0 else None
+        return self.config.risk.stop()
 
     def supervisor(
         self,
@@ -511,7 +511,7 @@ class LiveSession:
                 continue
             payload = fill_to_dict(found.fill)
             payload["execution_id"] = found.execution_id
-            payload["stop"] = found.fill.client_order_id.endswith("-stop")
+            payload["stop"] = is_stop_order(found.fill.client_order_id)
             self.journal.append(EventKind.FILL, now, payload)
             new_fills += 1
             if payload["stop"]:
@@ -753,7 +753,7 @@ class LiveSession:
             protected = {
                 (str(w.instrument), w.side) for w in self.broker.working_orders()
                 if w.client_order_id.startswith(self.order_prefix)
-                and w.client_order_id.endswith("-stop")
+                and is_stop_order(w.client_order_id)
             }
             for ticker, quantity in sorted(sleeve.items()):
                 if (ticker, Side.closing(quantity)) not in protected:
@@ -898,9 +898,8 @@ class LiveSession:
                 run=self.run, book=book, strategy=strategy, moment=moment,
                 filtration_at=market.filtration_at, marks_at=lambda _: marks,
                 constraints_for=self.broker.constraints, tradable=tradable,
-                policy=SizingPolicy(
-                    time_in_force=self.config.execution.resolve(interval),
-                    allow_short=self.config.risk.allow_short,
+                policy=self.config.execution.sizing(
+                    interval, allow_short=self.config.risk.allow_short,
                     leverage=leverage, previous_leverage=previous_leverage,
                 ),
             )
@@ -1101,7 +1100,7 @@ class LiveSession:
         for event in self.journal.events(EventKind.SUBMISSION, EventKind.ORDER_STATUS):
             last_status[event.payload["client_order_id"]] = event.payload.get("status", "submitted")
         return any(
-            status not in ("filled", "cancelled", "rejected") and not oid.endswith("-stop")
+            status not in ("filled", "cancelled", "rejected") and not is_stop_order(oid)
             for oid, status in last_status.items()
         )
 
@@ -1257,7 +1256,7 @@ class LiveSession:
         for working in self.broker.working_orders():
             if (
                 working.client_order_id.startswith(self.order_prefix)
-                and working.client_order_id.endswith("-stop")
+                and is_stop_order(working.client_order_id)
                 and (str(working.instrument), working.side) in trading
             ):
                 self.broker.cancel(working.client_order_id)
@@ -1310,7 +1309,7 @@ class LiveSession:
         book = self.book()
         ours = [
             w for w in self.broker.working_orders()
-            if w.client_order_id.startswith(self.order_prefix) and w.client_order_id.endswith("-stop")
+            if w.client_order_id.startswith(self.order_prefix) and is_stop_order(w.client_order_id)
         ]
         if rule is None:
             for w in ours:
@@ -1333,7 +1332,8 @@ class LiveSession:
             p["instrument"]: p.get("mark") for p in opening.payload.get("positions", ())
         } if opening else {}
 
-        desired: dict[str, tuple[float, float, str, datetime]] = {}
+        # quantity, level, rotation, decision time, anchor
+        desired: dict[str, tuple[float, float, str, datetime, float]] = {}
         for instrument, position in book.positions.items():
             ticker = str(instrument)
             anchor_rotation = anchors.get(ticker, {}).get("rotation")
@@ -1374,15 +1374,32 @@ class LiveSession:
                 cancelled += 1
             else:
                 desired.pop(str(w.instrument))
+        # A replacement stop is the same decision as the one it replaces, so
+        # it needs a fresh id or the broker hands back the cancelled order
+        # (``stop_order_id``). Numbered from the journal, which keeps the id
+        # deterministic; ids just cancelled are skipped too, in case one was
+        # placed but never journaled.
+        placements: dict[tuple[str, str | None], int] = {}
+        for event in self.journal.events(EventKind.STOP_PLACED):
+            key = (event.payload["instrument"], event.payload.get("rotation"))
+            placements[key] = placements.get(key, 0) + 1
+        taken = {w.client_order_id for w in ours}
         version = self.strategy().version
         for ticker, (position, level, rotation_key, decision, anchor) in sorted(desired.items()):
             instrument = InstrumentId(ticker)
             side = Side.closing(position)
             quantity = abs(position)
+            placement = placements.get((ticker, rotation_key), 0)
+            order_id = stop_order_id(
+                self.run, self.portfolio, instrument, decision, side, quantity, placement
+            )
+            while order_id in taken:
+                placement += 1
+                order_id = stop_order_id(
+                    self.run, self.portfolio, instrument, decision, side, quantity, placement
+                )
             intent = OrderIntent(
-                client_order_id=client_order_id(
-                    self.run, self.portfolio, instrument, decision, side, quantity
-                ) + "-stop",
+                client_order_id=order_id,
                 run=self.run, portfolio=self.portfolio, instrument=instrument,
                 strategy_version=version, side=side,
                 quantity=quantity, order_type=OrderType.STOP, decision_time=decision,
@@ -1453,7 +1470,7 @@ class LiveSession:
         if self.broker is not None:
             stop_by_name = {
                 str(w.instrument): w.stop_price for w in self.broker.working_orders()
-                if w.client_order_id.endswith("-stop")
+                if is_stop_order(w.client_order_id)
             }
             stop_source = "broker"
         else:
@@ -1499,7 +1516,7 @@ class LiveSession:
             elif event.kind is EventKind.STOP_CANCELLED:
                 if live.get(p["instrument"], ("",))[0] == p["client_order_id"]:
                     live.pop(p["instrument"])
-            elif event.kind is EventKind.FILL and p.get("client_order_id", "").endswith("-stop"):
+            elif event.kind is EventKind.FILL and is_stop_order(p.get("client_order_id", "")):
                 live.pop(p.get("instrument", ""), None)
         return {name: level for name, (_, level) in live.items()}
 

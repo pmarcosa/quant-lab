@@ -1,0 +1,37 @@
+# The momentum universe as it stood until 2026-10-09: 34 symbols, including
+# four that are not individual stocks (SPY, GLD, COPX, FXE) and STRK. Kept so
+# that backtests recorded on it can be repeated; the strategy uses momentum.txt.
+AAPL
+ADBE
+AMZN
+AVGO
+CAT
+CRM
+COPX
+COST
+CRCL
+DIS
+FXE
+GLD
+GOOGL
+INTC
+JPM
+LITE
+LLY
+META
+MRVL
+MSFT
+MSTR
+NEE
+NFLX
+NOW
+NVDA
+ORCL
+PLTR
+SPCX
+SPY
+STRK
+UNH
+WMT
+XOM
+ZM

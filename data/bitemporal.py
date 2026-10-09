@@ -136,6 +136,30 @@ class BitemporalStore:
             ``available_time`` column alongside the payload. Empty when nothing
             was knowable.
         """
+        latest = latest_revisions(self.knowable(instrument, decision_time))
+        if latest.empty:
+            return pd.DataFrame()
+        if fields is not None:
+            unknown = [f for f in fields if f not in latest.columns]
+            if unknown:
+                raise ContractViolation(f"unknown field(s) {unknown} in dataset {self.dataset!r}")
+            latest = latest[["available_time", *fields]]
+        return latest
+
+    def knowable(self, instrument: InstrumentId, decision_time: datetime) -> pd.DataFrame:
+        """Every version of every event knowable at ``decision_time``, revisions included.
+
+        :meth:`as_of` is this with only the latest version of each event kept.
+        The difference matters to anything that caches one read and slices it
+        for earlier decision times: a revision published between the decision
+        and the read replaces the version the decision could actually see, so
+        a cache must hold every version and choose per decision, never once.
+
+        Returns:
+            Frame indexed by ``event_time`` (repeated once per revision), with
+            each event's versions in publication order. Empty when nothing was
+            knowable.
+        """
         moment = utc(decision_time)
         target = self._file(instrument)
         if not target.exists():
@@ -150,20 +174,9 @@ class BitemporalStore:
         knowable = frame[(frame["event_time"] <= moment) & (frame["available_time"] <= moment)]
         if knowable.empty:
             return pd.DataFrame()
-
-        latest = (
-            knowable.sort_values(list(TIME_COLUMNS))
-            .groupby("event_time", as_index=False)
-            .last()
-            .set_index("event_time")
-            .sort_index()
-        )
-        if fields is not None:
-            unknown = [f for f in fields if f not in latest.columns]
-            if unknown:
-                raise ContractViolation(f"unknown field(s) {unknown} in dataset {self.dataset!r}")
-            latest = latest[["available_time", *fields]]
-        return latest
+        # Stable, so two rows with identical times keep file order and the one
+        # appended later is the later revision -- deterministically.
+        return knowable.sort_values(list(TIME_COLUMNS), kind="stable").set_index("event_time")
 
     def first_known(self, instrument: InstrumentId, horizon: datetime) -> pd.Series:
         """For each event, the moment it was *first* knowable, up to ``horizon``.
@@ -206,6 +219,18 @@ class BitemporalStore:
     def bars_known_at(self, instrument: InstrumentId, decision_time: datetime) -> int:
         """How many observations were knowable at ``decision_time``."""
         return len(self.as_of(instrument, decision_time))
+
+
+def latest_revisions(versions: pd.DataFrame) -> pd.DataFrame:
+    """The latest version of each event, from :meth:`BitemporalStore.knowable` rows.
+
+    The whole latest row, not the last non-null value per column (which is what
+    ``groupby().last()`` returns): a revision that blanks one field must not be
+    stitched together with a field from the version it replaced.
+    """
+    if versions.empty or versions.index.is_unique:
+        return versions
+    return versions[~versions.index.duplicated(keep="last")]
 
 
 def observations_from_bars(

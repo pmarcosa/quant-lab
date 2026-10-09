@@ -167,6 +167,7 @@ def run_once(
     leverage=None,
     financing=None,
     capital: float = STARTING_CAPITAL,
+    fill_at_decision: bool = False,
 ) -> RunResult:
     """One backtest. The only way research runs anything.
 
@@ -197,6 +198,7 @@ def run_once(
         leverage=leverage,
         financing=financing,
         bars_per_week=market.interval.bars_per_week,
+        fill_at_decision=fill_at_decision,
     )
 
 

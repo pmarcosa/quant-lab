@@ -38,7 +38,7 @@ strategy:
   name: weekly-momentum     # a key of runtime/strategies.py; its bar size comes from it
   params:
     rebalance_weeks: 4
-    top_n: 4
+    top_n: 4                # the most names held; 0: every name that passes the filters
     lookback_weeks: 13
   # The list it chooses from: data/universes/<name>.txt, or a path. Omit it and
   # the strategy chooses from every instrument in the store, so a fetch widens
@@ -47,9 +47,20 @@ strategy:
 
 execution:
   time_in_force: auto       # auto: opening auction for daily/weekly bars, day orders intraday
+  # How weights become orders and what an order costs. The backtest, the
+  # monitoring baseline and the live proposal all read these, so change one and
+  # rebuild the baseline (`ql monitor baseline`).
+  cash_buffer: 0.01         # fraction of equity held back from sizing
+  no_trade_band: 0.005      # adjustments below this fraction of equity are not sent
+  limit_band: null          # e.g. 0.02: limit orders within 2% of the decision price; null: market
+  commission: bps           # bps | ibkr-tiered | ibkr-fixed
+  commission_bps: 10        # used when commission is bps
+  slippage_bps: 10
+  share_price: 100          # with an IBKR plan: typical share price for per-share fees
 
 risk:
   stop_distance: 0.12       # protective stop from the rotation price; 0 disables it
+  stop_limit_offset: null   # e.g. 0.005: a stop-limit half a percent under the stop; null: plain stop
   max_gross: 1.0            # longs plus shorts, as a fraction of equity
   max_net: null             # longs minus shorts, upper bound; null: same as max_gross
   min_net: -1.0             # ...and lower bound (binds only when shorts are allowed)

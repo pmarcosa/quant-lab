@@ -114,9 +114,11 @@ def test_a_sleeve_refuses_a_universe_other_than_the_one_it_opened_on(tmp_path):
     second = write_universe(universes, "second", "AAA\nBBB\nCCC\nDDD\nEEE\n")
     config = h.config.read_text()
     h.config.write_text(config.replace(
-        "strategy: {rebalance_weeks: 1, top_n: 2, lookback_weeks: 13}",
-        f"strategy: {{params: {{rebalance_weeks: 1, top_n: 2, lookback_weeks: 13}}, "
-        f"universe: '{first}'}}"))
+        "strategy: {name: weekly-momentum, params: {rebalance_weeks: 1, top_n: 2, "
+        "lookback_weeks: 13, pace_ratio_min: 0.2}}",
+        f"strategy: {{params: {{rebalance_weeks: 1, top_n: 2, lookback_weeks: 13, "
+        f"pace_ratio_min: 0.2}}, universe: '{first}'}}"))
+    assert str(first) in h.config.read_text(), "the universe was written into the config"
     code, out = h.run("live", "init")
     assert code == 0, out
     code, out = h.run("live", "propose")

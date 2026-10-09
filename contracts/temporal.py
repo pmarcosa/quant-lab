@@ -115,7 +115,7 @@ class BarInterval(str, Enum):
         return self.periods_per_year / 52.0
 
     @property
-    def duration(self):
+    def duration(self) -> timedelta:
         """How long one bar lasts, in wall-clock time (a trading day for DAY)."""
         return {
             "1Min": timedelta(minutes=1), "1Hour": timedelta(hours=1),

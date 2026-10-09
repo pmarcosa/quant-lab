@@ -21,6 +21,7 @@ detected on read rather than silently parsed.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Iterator, Mapping, Sequence
@@ -32,7 +33,7 @@ from typing import Any
 import numpy as np
 
 from contracts.errors import ContractViolation, StateIntegrityError
-from contracts.identifiers import StrategyVersion
+from contracts.identifiers import StrategyId, StrategyVersion
 from contracts.temporal import utc
 
 #: Bumped when the row schema changes, so old studies stay readable and are not
@@ -81,7 +82,9 @@ class Trial:
         if not self.study:
             raise ContractViolation("a trial must belong to a named study")
         for key, value in self.metrics.items():
-            if not isinstance(value, (int, float)) or value != value:
+            # Infinity too, not only NaN: json writes it as the non-standard
+            # token ``Infinity``, and a ledger row must stay plain JSON.
+            if not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ContractViolation(f"metric {key!r} is not a finite number: {value!r}")
         if self.dates and len(self.dates) != len(self.returns):
             raise ContractViolation(
@@ -111,8 +114,6 @@ class Trial:
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> Trial:
-        from contracts.identifiers import StrategyId
-
         if row.get("format") not in READABLE_FORMATS:
             raise StateIntegrityError(
                 f"ledger row is format {row.get('format')!r}, this code reads "

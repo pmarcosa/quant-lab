@@ -493,6 +493,53 @@ def test_costs_are_split_because_they_behave_differently():
 
 
 def test_the_broker_refuses_an_order_type_it_does_not_support(portfolio):
-    broker = SimulatedBroker()
+    from dataclasses import replace
+
+    from execution.simulated import SIMULATED_CAPABILITIES
+
+    market_only = replace(SIMULATED_CAPABILITIES, order_types=frozenset({OrderType.MARKET}))
+    broker = SimulatedBroker(supports=market_only)
     with pytest.raises(ContractViolation, match="stop_limit"):
         broker.capabilities().require(OrderType.STOP_LIMIT)
+    # The simulator itself models all four, the stop-limit's missed fills included.
+    SimulatedBroker().capabilities().require(OrderType.STOP_LIMIT)
+
+
+def test_a_target_that_restates_a_position_asks_for_no_trade(portfolio):
+    """Keeping a position must not shave it.
+
+    Sized afresh, 995 shares at their own weight come back as 985 once the cash
+    buffer is held out, and the engine would sell ten shares of a position the
+    strategy said to leave alone. No band is set here to hide it.
+    """
+    book = Book(portfolio=portfolio, cash=100_000.0, as_of=at(2020)).apply(
+        _fill(AAA, Side.BUY, 995, 100.0, at(2020, 1, 2))
+    )
+    weight = book.weights({AAA: 110.0})[AAA]
+    decision = decide(
+        run=RUN, book=book, strategy=ScriptedStrategy({AAA: weight}),
+        filtration=FixedFiltration(at(2020, 1, 3)), marks={AAA: 110.0},
+        constraints_for=whole_shares,
+        policy=SizingPolicy(cash_buffer=0.01, min_trade_fraction=0.0),
+    )
+    assert decision.is_flat
+
+
+def test_the_strategy_is_told_each_positions_gain_on_its_cost(portfolio):
+    """Dimensionless, like the weights: how a position has done, not how big it is."""
+    book = Book(portfolio=portfolio, cash=100_000.0, as_of=at(2020)).apply(
+        _fill(AAA, Side.BUY, 100, 100.0, at(2020, 1, 2))
+    )
+    seen = {}
+
+    class Watching(ScriptedStrategy):
+        def target(self, filtration, held):
+            seen.update(held.gains)
+            return super().target(filtration, held)
+
+    decide(
+        run=RUN, book=book, strategy=Watching({AAA: 0.1}),
+        filtration=FixedFiltration(at(2020, 1, 3)), marks={AAA: 75.0},
+        constraints_for=whole_shares, policy=SizingPolicy(),
+    )
+    assert seen == {AAA: pytest.approx(-0.25)}

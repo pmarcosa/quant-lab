@@ -27,7 +27,7 @@ from runtime.config import (  # noqa: E402
 from runtime.live import LiveSession  # noqa: E402
 from runtime.monitor import build_baseline  # noqa: E402
 from tests.fake_gateway import FakeGateway  # noqa: E402
-from tests.live_fixtures import Clock, append_week, build_market  # noqa: E402
+from tests.live_fixtures import STEADY, Clock, append_week, build_market  # noqa: E402
 
 SATURDAY = datetime(2026, 9, 19, 10, 0, tzinfo=timezone.utc)
 
@@ -36,7 +36,7 @@ def config(tmp_path, mode="full", **auto):
     return LiveConfig(
         strategy_id="momentum",
         mode=TradingMode.PAPER, account="DU1234567", sleeve_capital=100_000.0,
-        strategy=StrategySettings(params={"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13}),
+        strategy=StrategySettings(params={"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13, **STEADY}),
         risk=RiskSettings(stop_distance=0.12, max_order_fraction=0.6),
         automation=AutomationSettings(mode=mode, **auto),
         state_dir=tmp_path / "state",

@@ -62,6 +62,40 @@ def test_the_cache_cannot_widen_what_is_visible(pair):
             assert fast.metadata(instrument) == slow.metadata(instrument)
 
 
+def test_a_revision_after_the_decision_does_not_hide_the_original(tmp_path):
+    """A dividend refresh re-appends every stored bar with a later available time.
+
+    A decision before that refresh could see the original rows, and must still
+    see them through the cache. Holding only the latest version made the whole
+    history vanish from every earlier decision -- the instrument silently
+    dropped out of the backtest -- while the uncached path saw it all.
+    """
+    store = BitemporalStore(tmp_path, "bars_1week")
+    spy = InstrumentId("spy")
+    bars = weekly_bars("2015-01-02", 300)
+    store.append(spy, to_observations(bars))
+    restated_at = datetime(2021, 1, 4, tzinfo=timezone.utc)
+    restated = to_observations(bars.loc[bars.index < "2020-12-25"] * 0.98)
+    restated["available_time"] = restated_at
+    store.revise(spy, restated)
+    universe = universe_from_store(store, still_trading_after=datetime(2020, 1, 1, tzinfo=timezone.utc))
+    replay = ReplayFiltrations(store, universe, datetime(2021, 6, 1, tzinfo=timezone.utc))
+
+    for moment in (
+        datetime(2018, 3, 5, 22, tzinfo=timezone.utc),   # before the restatement
+        datetime(2021, 3, 1, 22, tzinfo=timezone.utc),   # after it
+    ):
+        slow = StoreFiltration(store, universe, moment).history(spy, "close", 10_000)
+        fast = replay.at(moment).history(spy, "close", 10_000)
+        assert len(slow) > 100, "the check is vacuous if nothing is visible"
+        pd.testing.assert_series_equal(fast, slow, check_names=False)
+
+    before = replay.at(datetime(2018, 3, 5, 22, tzinfo=timezone.utc))
+    assert before.history(spy, "close", 1).iloc[-1] == pytest.approx(
+        float(bars.loc[:"2018-03-05", "close"].iloc[-1])
+    ), "before the restatement, the original price"
+
+
 def test_a_decision_past_the_load_horizon_is_refused(pair):
     """Serving a pinned view from a stale load would silently hide later rows."""
     store, universe = pair

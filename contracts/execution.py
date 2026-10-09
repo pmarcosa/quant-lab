@@ -25,6 +25,7 @@ Rounding is never left implicit.
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -34,6 +35,9 @@ from typing import Protocol, runtime_checkable
 from contracts.errors import ContractViolation
 from contracts.identifiers import InstrumentId, PortfolioId, RunId, StrategyVersion
 from contracts.temporal import utc
+
+#: Relative slack when counting whole lots, for float division's last bit.
+_LOT_TOLERANCE = 1e-9
 
 
 class Side(str, Enum):
@@ -136,11 +140,18 @@ class InstrumentConstraints:
     shortable: bool = False
 
     def round_quantity(self, quantity: float) -> float:
-        """Round down to a tradable quantity, or zero if below the minimum."""
+        """Round down to a tradable quantity, or zero if below the minimum.
+
+        Down, but not past a whole lot that float division merely obscured:
+        ``0.3 / 0.1`` is ``2.9999999999999996``, and truncating that sells two
+        lots of a three-lot position. The tolerance is far below any real lot,
+        so it only ever rescues an exact multiple, never rounds a fraction up.
+        """
         if self.lot_step <= 0:
             raise ContractViolation(f"lot_step must be positive; got {self.lot_step}")
-        lots = int(abs(quantity) / self.lot_step)
-        rounded = lots * self.lot_step
+        lots = math.floor(abs(quantity) / self.lot_step + _LOT_TOLERANCE)
+        # Rounded so a fractional step does not leave 0.30000000000000004 behind.
+        rounded = round(lots * self.lot_step, 10)
         if rounded < self.min_quantity:
             return 0.0
         return rounded if quantity >= 0 else -rounded
@@ -185,6 +196,9 @@ class BrokerCapabilities:
 ORDER_PREFIX = "ql-"
 #: Between the strategy id and the hash. Not a character an id may contain.
 ORDER_ID_SEPARATOR = "."
+#: Every protective stop's id ends with this, so a fill or a working order says
+#: whether a stop or a rotation produced it without a lookup.
+STOP_SUFFIX = "-stop"
 
 #: A strategy tag: lowercase letters, digits and dashes, starting with a letter.
 _TAG_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789-")
@@ -243,6 +257,53 @@ def client_order_id(
         side: Buy or sell.
         quantity: Rounded quantity.
     """
+    return order_prefix(portfolio) + _decision_hash(
+        run, portfolio, instrument, decision_time, side, quantity
+    )
+
+
+def stop_order_id(
+    run: RunId,
+    portfolio: PortfolioId,
+    instrument: InstrumentId,
+    decision_time: datetime,
+    side: Side,
+    quantity: float,
+    placement: int = 0,
+) -> str:
+    """The idempotency key for a protective stop: ``ql-<strategy>.<hash>-stop``.
+
+    ``placement`` counts the stops already placed for this position since the
+    decision. It exists because a stop, unlike a rotation order, is cancelled
+    and placed again for the *same* decision -- when its level moves, or when
+    stops are switched off and on. Reusing the first id for the replacement
+    would make an idempotent broker return the cancelled order instead of
+    placing the new one: the call succeeds, the journal says "placed", and the
+    position is unprotected. The first placement keeps the plain decision hash,
+    so ids made before this argument existed are unchanged.
+    """
+    extra = (f"placement {placement}",) if placement else ()
+    return (
+        order_prefix(portfolio)
+        + _decision_hash(run, portfolio, instrument, decision_time, side, quantity, *extra)
+        + STOP_SUFFIX
+    )
+
+
+def is_stop_order(order_id: str) -> bool:
+    """Whether an order id belongs to a protective stop rather than a rotation."""
+    return order_id.endswith(STOP_SUFFIX)
+
+
+def _decision_hash(
+    run: RunId,
+    portfolio: PortfolioId,
+    instrument: InstrumentId,
+    decision_time: datetime,
+    side: Side,
+    quantity: float,
+    *extra: str,
+) -> str:
     material = "|".join(
         [
             str(run),
@@ -251,9 +312,10 @@ def client_order_id(
             utc(decision_time).isoformat(),
             side.value,
             f"{quantity:.8f}",
+            *extra,
         ]
     )
-    return order_prefix(portfolio) + hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
 
 
 def is_valid_strategy_id(value: str) -> bool:
@@ -266,6 +328,11 @@ def is_valid_strategy_id(value: str) -> bool:
         and not value.endswith("-")
         and "--" not in value
     )
+
+
+def _positive(value: float) -> bool:
+    """Finite and above zero. False for NaN and infinity, which ``<= 0`` misses."""
+    return math.isfinite(value) and value > 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,7 +355,9 @@ class OrderIntent:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "decision_time", utc(self.decision_time))
-        if self.quantity <= 0:
+        # Not `quantity <= 0`: NaN fails every comparison, so that form waves
+        # it through, and it surfaces much later as a NaN book.
+        if not _positive(self.quantity):
             raise ContractViolation(
                 f"quantity must be positive; direction is carried by side, got {self.quantity}"
             )
@@ -340,14 +409,16 @@ class Fill:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "at", utc(self.at))
-        if self.quantity <= 0:
+        # A fill is the only thing that moves the book, so a NaN here would
+        # poison cash and equity for the rest of the run without an error.
+        if not _positive(self.quantity):
             raise ContractViolation(
                 f"fill quantity must be positive; direction is carried by side, "
                 f"got {self.quantity}"
             )
-        if self.price <= 0:
-            raise ContractViolation(f"fill price must be positive; got {self.price}")
-        if self.commission < 0:
+        if not _positive(self.price):
+            raise ContractViolation(f"fill price must be positive and finite; got {self.price}")
+        if not (math.isfinite(self.commission) and self.commission >= 0):
             raise ContractViolation(f"commission cannot be negative; got {self.commission}")
 
     @property

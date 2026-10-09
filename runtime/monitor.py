@@ -22,14 +22,12 @@ from typing import Any
 import numpy as np
 
 from contracts.errors import ContractViolation
+from contracts.execution import is_stop_order
 from contracts.identifiers import RunId
 from contracts.live import DegradationState, EventKind
-from engine.decide import SizingPolicy
-from execution.simulated import CostModel
 from risk.rules import (
     GrossExposureLimit,
     NetExposureLimit,
-    ProtectiveStop,
     RiskSupervisor,
     ShortSales,
 )
@@ -78,7 +76,9 @@ class Baseline:
 
     def save(self, path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"format": BASELINE_FORMAT, **asdict(self)}, indent=1))
+        path.write_text(
+            json.dumps({"format": BASELINE_FORMAT, **asdict(self)}, indent=1), encoding="utf-8"
+        )
 
     @classmethod
     def load(cls, path) -> Baseline:
@@ -86,7 +86,7 @@ class Baseline:
             raise ContractViolation(
                 "no monitoring baseline yet; build it with `ql monitor baseline`"
             )
-        raw = json.loads(path.read_text())
+        raw = json.loads(path.read_text(encoding="utf-8"))
         if raw.pop("format", None) != BASELINE_FORMAT:
             raise ContractViolation("the baseline file is from another version; rebuild it")
         return cls(**raw)
@@ -104,6 +104,10 @@ def _settings(session: LiveSession) -> dict[str, Any]:
         "params": dict(sorted(c.strategy.params.items())),
         "interval": session.interval.value,
         "stop_distance": c.risk.stop_distance,
+        "stop_limit_offset": c.risk.stop_limit_offset,
+        "execution": asdict(c.execution),
+        "capital": c.sleeve_capital,
+        "universe": c.strategy.universe,
         "max_gross": c.risk.max_gross,
         "max_net": c.risk.net_cap,
         "min_net": c.risk.min_net,
@@ -125,7 +129,7 @@ def build_baseline(session: LiveSession, now: datetime) -> Baseline:
     c = session.config
     market = session.market()
     strategy = _strategy_for_backtest(session, market)
-    stop = ProtectiveStop(c.risk.stop_distance) if c.risk.stop_distance > 0 else None
+    stop = c.risk.stop()
     schedule = c.leverage.schedule(c.risk.max_gross)
     supervisor = RiskSupervisor(
         rules=(
@@ -137,14 +141,15 @@ def build_baseline(session: LiveSession, now: datetime) -> Baseline:
     )
     result = run_once(
         market, strategy, list(market.schedule), RunId("baseline"),
-        CostModel(commission_bps=10.0, slippage_bps=10.0),
-        SizingPolicy(
-            cash_buffer=0.01, min_trade_fraction=0.005, allow_short=c.risk.allow_short,
-            time_in_force=c.execution.resolve(market.interval),
-        ),
+        # The costs and sizing the live proposal uses, at the sleeve's own
+        # capital: with a commission in dollars and whole shares, what a
+        # rotation costs depends on how much money it moves.
+        c.execution.costs(),
+        c.execution.sizing(market.interval, allow_short=c.risk.allow_short),
         supervisor=supervisor,
         leverage=None if schedule.is_static_unlevered else schedule,
         financing=c.financing.model(),
+        capital=c.sleeve_capital,
     )
     curve = result.equity_curve()
     equity = np.array([e for _, e in curve], dtype=float)
@@ -154,7 +159,7 @@ def build_baseline(session: LiveSession, now: datetime) -> Baseline:
     # at the first, and rotations are measured between them.
     trading = [
         k for k, step in enumerate(result.steps)
-        if any(not f.client_order_id.endswith("-stop") for f in step.fills)
+        if any(not is_stop_order(f.client_order_id) for f in step.fills)
     ]
     if not trading:
         raise ContractViolation("the baseline backtest never traded; nothing to compare with")
@@ -168,18 +173,23 @@ def build_baseline(session: LiveSession, now: datetime) -> Baseline:
         marks = step.decision.marks
         for fill in step.fills:
             mark = marks.get(fill.instrument)
-            if not mark or fill.client_order_id.endswith("-stop"):
+            if not mark or is_stop_order(fill.client_order_id):
                 continue
             direction = 1.0 if fill.side.value == "buy" else -1.0
             costs += fill.quantity * mark * direction * (fill.price - mark) / mark + fill.commission
             notional += fill.quantity * mark
     modeled = 10_000.0 * costs / notional if notional else 20.0
 
-    # Expected return of one rotation: compounded returns between consecutive
-    # trading steps. Strategy-agnostic -- it reads when the strategy traded,
-    # not what its parameters say about when it should.
+    # Expected return of one rotation: the return between consecutive trading
+    # steps. Strategy-agnostic -- it reads when the strategy traded, not what
+    # its parameters say about when it should.
+    #
+    # Until 2026-10-09 this compounded ``1 + equity ratio`` instead of the
+    # ratio, so every bar counted as a doubling and a four-week rotation
+    # "expected" about 1,500%. The halt on execution cost divides by this
+    # number, so it could never fire.
     per_rotation = [
-        float(np.prod(1.0 + (equity[b:e + 1][1:] / equity[b:e + 1][:-1])) - 1.0)
+        float(equity[e] / equity[b] - 1.0)
         for b, e in zip(trading, trading[1:], strict=False)
         if e > b
     ]

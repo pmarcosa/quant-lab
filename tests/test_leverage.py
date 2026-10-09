@@ -182,12 +182,12 @@ def test_a_levered_backtest_holds_more_than_its_equity_and_pays_for_it(tmp_path)
     from runtime.research import run_once
     from runtime.strategies import build_strategy
     from runtime.wiring import load_market
-    from tests.live_fixtures import build_market
+    from tests.live_fixtures import STEADY, build_market
 
     build_market(tmp_path, weeks=120)
     market = load_market(tmp_path)
     strategy = build_strategy(
-        "weekly-momentum", {"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13}, market
+        "weekly-momentum", {"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13, **STEADY}, market
     )
     common = dict(
         market=market, strategy=strategy, schedule=list(market.schedule)[30:],
@@ -241,13 +241,13 @@ def levered(tmp_path):
     from runtime.config import LeverageSettings, RiskSettings, StrategySettings
     from runtime.live import LiveSession
     from tests.fake_gateway import FakeGateway
-    from tests.live_fixtures import Clock, build_market
+    from tests.live_fixtures import STEADY, Clock, build_market
 
     frames = build_market(tmp_path / "store")
     gateway = FakeGateway(cash=100_000.0)
     gateway.prices = {s: float(f["close"].iloc[-1]) for s, f in frames.items()}
     config = _config(
-        strategy=StrategySettings(params={"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13}),
+        strategy=StrategySettings(params={"rebalance_weeks": 1, "top_n": 2, "lookback_weeks": 13, **STEADY}),
         risk=RiskSettings(max_gross=1.3, stop_distance=0.12, max_order_fraction=0.7),
         leverage=LeverageSettings(target=1.3), state_dir=tmp_path / "state",
     )

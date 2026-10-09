@@ -480,6 +480,18 @@ def test_the_first_pass_of_a_rotation_asks_for_quotes(universe: str):
     assert stops["FAST"]["quantity"] == orders["FAST"]["quantity"]
 
 
+def test_a_review_on_last_weeks_bars_is_not_final(universe: str):
+    """Histories that all stop a week short are a failed fetch, not a decision."""
+    d = definition(universe)
+    # The made-up histories carry a bar for the week of the review itself, so
+    # it takes a fortnight for them to fall behind.
+    a_fortnight_on = MONDAY + timedelta(days=14)
+    result = weekly.review(payloads(), d, a_fortnight_on)
+    assert result["data_behind"] == "2026-10-16" and not result["final"]
+    assert "NOT FINAL" in weekly.summary(result)
+    assert weekly.review(payloads(), d, MONDAY)["data_behind"] is None
+
+
 def test_a_rotation_chosen_from_part_of_the_universe_is_not_final(universe: str):
     partial = payloads()
     del partial.history["FAST"]

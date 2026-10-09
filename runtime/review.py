@@ -308,7 +308,10 @@ def review(
     expected = connector.last_closed_week(as_of)
     ends = pd.Series({s: p.traded.index[-1] for s, p in tradable.items()})
     decision_bar = ends.max()
-    if decision_bar < expected:
+    # No history reaching the week that has ended is a failed fetch, not a quiet
+    # week: deciding on last week's bar would call a rotation a monitoring week.
+    behind = bool(decision_bar < expected)
+    if behind:
         notes.append(
             f"the newest bar closes {decision_bar.date()}, but the week to "
             f"{expected.date()} has ended: the data is behind"
@@ -469,7 +472,7 @@ def review(
     # A rotation chosen from part of the universe is a different rotation: the
     # stock that was not fetched may be the one that belonged among the best.
     history_needed = sorted({*missing, *stale}) if rotation else []
-    final = not quotes_needed and not history_needed
+    final = not quotes_needed and not history_needed and not behind
 
     # -- the record of this rotation's proposals, for next week's execution check --
     new_state = watch["state"]
@@ -497,6 +500,10 @@ def review(
         "final": final,
         "quotes_needed": quotes_needed,
         "history_needed": history_needed,
+        "data_behind": expected.date().isoformat() if behind else None,
+        # What to ask the connector for, for the symbols above: it takes contract ids.
+        "contracts": {symbol: contract for contract, symbol in sorted(payloads.names.items())
+                      if symbol in {*quotes_needed, *history_needed}},
         "data": {
             "universe": universe.describe(), "with_bars": len(current), "missing": missing,
             "stale": stale, "bars": int(min(len(p.traded) for p in current.values())),
@@ -952,6 +959,10 @@ def summary(result: Mapping[str, Any]) -> str:
         f"({result['strategy_version']})")
     add(f"next rebalance: {result['next_rebalance']}"
         + (f"; this one is {result['this_rebalance']}" if result["this_rebalance"] else ""))
+    if result.get("data_behind"):
+        add(f"NOT FINAL — no history reaches the week that ended {result['data_behind']}: what "
+            f"follows is last week's picture. Fetch the weekly histories again, then run the "
+            f"review again")
     data = result["data"]
     add(f"data: {data['with_bars']} stocks with bars (at least {data['bars']} weeks), "
         f"{data['dividends_applied']} dividends applied"
@@ -982,12 +993,17 @@ def summary(result: Mapping[str, Any]) -> str:
     for problem in checks["problems"]:
         add(f"  {problem}")
     if result["week"] == "rebalance":
+        contracts = result.get("contracts", {})
+
+        def named(symbols: list[str]) -> str:
+            return ", ".join(f"{s} ({contracts[s]})" if s in contracts else s for s in symbols)
+
         if result["history_needed"]:
             add("NOT FINAL — no current weekly history for these; fetch it, then run the "
-                "review again: " + ", ".join(result["history_needed"]))
+                "review again: " + named(result["history_needed"]))
         if result["quotes_needed"]:
             add("NOT FINAL — quote these, then run the review again: "
-                + ", ".join(result["quotes_needed"]))
+                + named(result["quotes_needed"]))
         add(f"orders ({len(result['orders'])}):")
         for order in result["orders"]:
             add(f"  {order['side']:4} {order['quantity']:g} {order['symbol']} LIMIT "

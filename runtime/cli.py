@@ -881,8 +881,11 @@ def cmd_review_collect(ctx: Context, args) -> int:
                if getattr(payloads, name) is None]
     ctx.out(f"session    {log}")
     ctx.out(f"kept       {folder}")
+    contract = {symbol: number for number, symbol in payloads.names.items()}
     ctx.out(f"histories  {len(wanted) - len(missing)} of {len(wanted)}"
-            + (f"; missing {', '.join(missing)}" if missing else ""))
+            + ("; missing " + ", ".join(
+                f"{symbol} ({contract[symbol]})" if symbol in contract else symbol
+                for symbol in missing) if missing else ""))
     ctx.out(f"account    {'complete' if not account else 'missing ' + ', '.join(account)}")
     ctx.out(f"quotes     {len(payloads.quotes)}")
     ctx.out(f"state      {'read' if payloads.state else 'not read'}")

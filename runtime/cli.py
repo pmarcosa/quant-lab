@@ -824,10 +824,17 @@ def cmd_review_run(ctx: Context, args) -> int:
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=timezone.utc)
     version = build_strategy(definition.strategy.name, definition.strategy.params).version
-    kept = Path(args.state) if args.state else None
-    if kept is not None and not kept.exists():
-        ctx.out(f"state      none at {kept}: starting a new record")
+    # The state the last review kept: a file if one is named, else the state
+    # document the session read back, else none -- a new record.
+    kept: Path | str | None = Path(args.state) if args.state else None
+    if isinstance(kept, Path) and not kept.exists():
+        ctx.out(f"state      none at {kept}")
         kept = None
+    if kept is None and payloads.state:
+        kept = payloads.state
+        ctx.out("state      the document the session read")
+    if kept is None:
+        ctx.out("state      none: starting a new record")
     state = weekly.load_state(kept, version)
     result = weekly.review(payloads, definition, as_of, state=state,
                            baseline=weekly.load_baseline(version))

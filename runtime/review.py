@@ -158,7 +158,7 @@ def empty_state(version: object) -> dict[str, Any]:
 
 
 def load_state(source: str | Path | Mapping[str, Any] | None, version: object) -> dict[str, Any]:
-    """The state a session kept, or a fresh one.
+    """The state a session kept -- a file, its text, or the mapping -- or a fresh one.
 
     A state written for another strategy version keeps its ladder -- a halt is
     a person's to lift, not a version bump's -- and starts the record again.
@@ -168,7 +168,7 @@ def load_state(source: str | Path | Mapping[str, Any] | None, version: object) -
     if isinstance(source, Mapping):
         raw = dict(source)
     else:
-        text = Path(source).read_text(encoding="utf-8") if Path(str(source)).exists() else str(source)
+        text = source.read_text(encoding="utf-8") if isinstance(source, Path) else str(source)
         raw = json.loads(text) if text.strip() else {}
     if not raw:
         return empty_state(version)

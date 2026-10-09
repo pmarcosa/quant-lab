@@ -318,12 +318,56 @@ def test_answers_are_found_in_the_session_and_in_its_helpers(tmp_path: Path):
          {"contract_id": 12, **weekly_call}, history(SHAPES["FAST"])),
     ])
     found = connector.gather(main)
+    assert found.state is None
     assert sorted(found.history) == ["FAST", "RISE"]
     assert found.history["RISE"]["close"][-2] == 200.0, "the helper's later answer replaces the first"
     assert found.unnamed == [99], "a history that cannot be named is reported, not guessed"
     assert connector.quote(found.quotes["FAST"]) == 301.0
     assert connector.cash(found.account) == 500.0
     assert found.orders is None, "an answer that is not JSON is not an answer"
+
+
+def test_the_state_document_a_session_read_is_found(tmp_path: Path, universe: str):
+    """The session reads the state back from where it keeps it; the review picks it up."""
+    from runtime.cli import Context, main
+
+    d = definition(universe)
+    kept = {**weekly.empty_state(version_of(d)),
+            "ladder": {"state": "halted", "by": "monitor", "reason": "kept from last week",
+                       "since": None}}
+    log = _log(tmp_path / "session.jsonl", [
+        ("2026-10-05T06:00:00Z", "Projects",
+         {"method": "project_read", "path": "claude/quant-lab-review-state.json"},
+         {"method": "project_read", "path": "claude/quant-lab-review-state.json",
+          "content": json.dumps(kept)}),
+        ("2026-10-05T06:00:05Z", "Projects",
+         {"method": "project_read", "path": "claude/trading-system.md"},
+         {"method": "project_read", "content": "# not the state"}),
+    ])
+    found = connector.gather(log)
+    assert json.loads(found.state)["ladder"]["reason"] == "kept from last week"
+
+    # From the command line: the kept halt reaches the decision without being typed again.
+    answers = payloads()
+    answers.state = found.state
+    answers.save(tmp_path / "answers")
+    shared = tmp_path / "made-up.yaml"
+    shared.write_text(f"""
+strategy_id: momentum
+strategy:
+  name: weekly-momentum
+  params: {{rebalance_weeks: 1, top_n: 0, pace_ratio_min: 0.4, cost_stop_loss: 0.0}}
+  universe: {universe}
+execution: {{cash_buffer: 0.0, no_trade_band: 0.0, commission: ibkr-tiered}}
+risk: {{stop_distance: 0.12, stop_limit_offset: 0.005}}
+monitoring: {{bootstrap_paths: 500}}
+""")
+    lines: list[str] = []
+    main(["review", "run", "--definition", str(shared), "--inputs", str(tmp_path / "answers"),
+          "--out", str(tmp_path / "review.json")],
+         context=Context(out=lines.append, clock=lambda: MONDAY))
+    result = json.loads((tmp_path / "review.json").read_text())
+    assert result["monitoring"]["state_before"] == "halted"
 
 
 def test_saved_answers_load_back_the_same(tmp_path: Path):

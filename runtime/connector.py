@@ -50,6 +50,9 @@ PRICE_FIELDS = ("open", "high", "low", "close")
 
 #: Where Claude Code keeps session logs.
 LOG_ROOT = Path.home() / ".claude" / "projects"
+#: The name the review's state is kept under between sessions. A session that
+#: reads a document whose path ends with this has handed the review its state.
+STATE_DOCUMENT = "review-state.json"
 
 
 # -- weekly bars -----------------------------------------------------------------------------
@@ -422,6 +425,8 @@ class Payloads:
     orders: Mapping[str, Any] | None = None
     trades: Mapping[str, Any] | None = None
     performance: Mapping[str, Any] | None = None
+    #: The state document the session read back (``STATE_DOCUMENT``), as text.
+    state: str | None = None
     unnamed: list[int] = field(default_factory=list)
 
     def save(self, folder: Path) -> None:
@@ -437,6 +442,8 @@ class Payloads:
             payload = getattr(self, name)
             if payload is not None:
                 (folder / f"{name}.json").write_text(json.dumps(payload))
+        if self.state is not None:
+            (folder / STATE_DOCUMENT).write_text(self.state)
 
     @classmethod
     def load(cls, folder: Path) -> Payloads:
@@ -452,6 +459,8 @@ class Payloads:
             path = folder / f"{name}.json"
             if path.exists():
                 setattr(found, name, json.loads(path.read_text()))
+        if (folder / STATE_DOCUMENT).exists():
+            found.state = (folder / STATE_DOCUMENT).read_text()
         return found
 
 
@@ -503,4 +512,24 @@ def gather(log: Path, tickers: Mapping[int, str] | None = None) -> Payloads:
             found.trades = call.result
         elif tool == "get_pa_performance_all_periods":
             found.performance = call.result
+        elif str(call.arguments.get("path", "")).endswith(STATE_DOCUMENT) and str(
+                call.arguments.get("method", "")).endswith("read"):
+            found.state = _document(call.result)
     return found
+
+
+def _document(result: Any) -> str | None:
+    """A document a session read: its text, wherever the tool put it.
+
+    A small document comes back inline; a large one is written to a file and
+    the answer names the file.
+    """
+    if not isinstance(result, Mapping):
+        return None
+    content = result.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    for value in result.values():
+        if isinstance(value, str) and value.endswith(".json") and Path(value).is_file():
+            return Path(value).read_text(encoding="utf-8")
+    return None

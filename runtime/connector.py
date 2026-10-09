@@ -427,7 +427,28 @@ class Payloads:
     performance: Mapping[str, Any] | None = None
     #: The state document the session read back (``STATE_DOCUMENT``), as text.
     state: str | None = None
+    #: Contract id to ticker, as far as the session's answers named them.
+    names: dict[int, str] = field(default_factory=dict)
     unnamed: list[int] = field(default_factory=list)
+
+    def over(self, older: Payloads) -> Payloads:
+        """These answers laid over an earlier collection: the newer one wins.
+
+        A long session's log is cut back when its context is compacted, and the
+        answers made before that go with it. Collecting after each batch of
+        calls, and laying each collection over the last, keeps them.
+        """
+        merged = Payloads(
+            history={**older.history, **self.history},
+            quotes={**older.quotes, **self.quotes},
+            state=self.state if self.state is not None else older.state,
+            names={**older.names, **self.names},
+        )
+        for name in ("account", "positions", "orders", "trades", "performance"):
+            mine = getattr(self, name)
+            setattr(merged, name, mine if mine is not None else getattr(older, name))
+        merged.unnamed = [c for c in self.unnamed if c not in merged.names]
+        return merged
 
     def save(self, folder: Path) -> None:
         """One file per answer, so a run can be repeated from the folder alone."""
@@ -444,6 +465,9 @@ class Payloads:
                 (folder / f"{name}.json").write_text(json.dumps(payload))
         if self.state is not None:
             (folder / STATE_DOCUMENT).write_text(self.state)
+        if self.names:
+            (folder / "names.json").write_text(
+                json.dumps({str(contract): symbol for contract, symbol in self.names.items()}))
 
     @classmethod
     def load(cls, folder: Path) -> Payloads:
@@ -461,6 +485,9 @@ class Payloads:
                 setattr(found, name, json.loads(path.read_text()))
         if (folder / STATE_DOCUMENT).exists():
             found.state = (folder / STATE_DOCUMENT).read_text()
+        if (folder / "names.json").exists():
+            found.names = {int(contract): str(symbol) for contract, symbol
+                           in json.loads((folder / "names.json").read_text()).items()}
         return found
 
 
@@ -485,7 +512,7 @@ def gather(log: Path, tickers: Mapping[int, str] | None = None) -> Payloads:
         elif call.tool.endswith("get_account_positions"):
             names.update({p.contract_id: p.symbol for p in positions(call.result)})
 
-    found = Payloads()
+    found = Payloads(names=names)
     for call in made:
         tool = call.tool.rsplit("__", 1)[-1]
         if tool == "get_price_history":

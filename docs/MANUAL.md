@@ -1388,15 +1388,21 @@ are this repository's, so the weekly review, the backtest and the paper sleeve
 run one strategy.
 
 ```bash
-ql review run --state state.json --state-out state.json --out review.json
+ql review collect --keep answers/                       # after each batch of connector calls
+ql review run --keep answers/ --state-out state.json --out review.json
 ```
 
 **What it reads.** By default the running session's own log
 (`~/.claude/projects/…`, and the logs of any helper the session started), where
 every connector answer is already stored verbatim: retyping a price history
-costs it twice and invites a wrong digit. `--inputs DIR` reads a folder of
-saved answers instead (`--save-inputs DIR` writes one). The session has to have
-asked for:
+costs it twice and invites a wrong digit. A long session's log is cut back
+when its context is compacted, and the answers made before that go with it
+(seen on 2026-10-09: the main log restarted, the helpers' logs did not), so
+the answers are collected into a folder as they arrive: `ql review collect
+--keep DIR` lays what the log holds now over what the folder already has,
+says what is still missing (exit status 3 until nothing is) and `ql review run
+--keep DIR` does the same before deciding. `--inputs DIR` replays a folder
+without reading any log. The session has to have asked for:
 
 | answer | connector tool | for |
 |---|---|---|
@@ -1436,7 +1442,9 @@ final either: a stock with no current history is named, to be fetched.
 
 **State.** A scheduled session remembers nothing, so `--state-out` writes one
 small JSON document to keep until the next run (the weekly task stores it as a
-project document): the ladder's state, each rotation's proposals and the fills
+project document whose name ends in `review-state.json`, and reads it back at
+the start of the next session: the review finds that reading in the log, like
+any other answer, so `--state` is only needed for a file): the ladder's state, each rotation's proposals and the fills
 that followed, and the weekly returns. It is written only when the review is
 final.
 
@@ -1911,7 +1919,8 @@ fail.
 | `ql live auto arm --scope exits\|full [--override "…"]` | allow automatic sending (typed phrase) |
 | `ql live auto disarm --reason "…"` | back to manual approval |
 | `ql live auto schedule` | write the Mac launch job for `ql live cycle` |
-| `ql review run [--state F] [--state-out F] [--out F] [--inputs DIR] [--as-of T]` | the week's decision from the broker connector's answers; sends nothing |
+| `ql review collect --keep DIR` | keep the session's connector answers in a folder; says what is missing |
+| `ql review run [--keep DIR] [--state F] [--state-out F] [--out F] [--inputs DIR] [--as-of T]` | the week's decision from the broker connector's answers; sends nothing |
 | `ql review clear --state F --to normal\|reduce_only --reason "…"` | lift the review's pause or halt |
 | `ql review baseline [--source F]` | publish the monitoring baseline where the review reads it |
 | `ql monitor baseline` | build the monitoring reference |

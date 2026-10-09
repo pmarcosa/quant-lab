@@ -370,6 +370,69 @@ monitoring: {{bootstrap_paths: 500}}
     assert result["monitoring"]["state_before"] == "halted"
 
 
+def test_answers_collected_before_the_log_was_cut_back_are_kept(tmp_path: Path, universe: str):
+    """A compacted session's log starts again; the kept folder is what remembers."""
+    from runtime.cli import Context, main
+
+    d = definition(universe)
+    names = ["RISE", "FAST", "PLOD", "FALL"]
+    watch = {"instruments": [{"contract_id_ex": str(10 + n), "contract_description": symbol}
+                             for n, symbol in enumerate([*names, "SPY"])]}
+    weekly_call = {"security_type": "STK", "step": "ONE_WEEK"}
+    shared = tmp_path / "made-up.yaml"
+    shared.write_text(f"""
+strategy_id: momentum
+strategy:
+  name: weekly-momentum
+  params: {{rebalance_weeks: 1, top_n: 0, pace_ratio_min: 0.4, cost_stop_loss: 0.0}}
+  universe: {universe}
+execution: {{cash_buffer: 0.0, no_trade_band: 0.0, commission: ibkr-tiered}}
+risk: {{stop_distance: 0.12, stop_limit_offset: 0.005}}
+monitoring: {{bootstrap_paths: 500}}
+""")
+    log = tmp_path / "session.jsonl"
+    first = [("2026-10-05T06:00:00Z", IBKR + "get_watchlist", {"id": "104"}, watch),
+             ("2026-10-05T06:00:05Z", "Projects",
+              {"method": "project_read", "path": "claude/quant-lab-review-state.json"},
+              {"content": json.dumps(weekly.empty_state(version_of(d)))})]
+    first += [("2026-10-05T06:01:00Z", IBKR + "get_price_history",
+               {"contract_id": 10 + n, **weekly_call}, history(SHAPES[symbol]))
+              for n, symbol in enumerate(names)]
+    _log(log, first)
+    lines: list[str] = []
+    context = Context(out=lines.append, clock=lambda: MONDAY)
+    collect = ["review", "collect", "--definition", str(shared), "--session", str(log),
+               "--keep", str(tmp_path / "kept")]
+    assert main(collect, context=context) == 3, "the benchmark and the account are still to come"
+    assert any("missing SPY" in line for line in lines)
+    assert any("missing account" in line for line in lines)
+
+    # The context is compacted: the log now holds only what came after.
+    _log(log, [
+        ("2026-10-05T06:10:00Z", IBKR + "get_price_history",
+         {"contract_id": 10 + len(names), **weekly_call}, history(SHAPES["SPY"])),
+        ("2026-10-05T06:10:10Z", IBKR + "get_account_summary", {}, account(10_000.0)),
+        ("2026-10-05T06:10:20Z", IBKR + "get_account_positions", {}, positions()),
+        ("2026-10-05T06:10:30Z", IBKR + "get_account_orders", {}, {"orders": []}),
+        ("2026-10-05T06:10:40Z", IBKR + "get_account_trades", {}, {"trades": []}),
+        ("2026-10-05T06:10:50Z", IBKR + "get_pa_performance_all_periods", {},
+         performance([0.01])),
+    ])
+    assert main(collect, context=context) == 0
+    kept = Payloads.load(tmp_path / "kept")
+    assert sorted(kept.history) == sorted([*names, "SPY"]), "named from the watchlist kept before"
+    assert kept.state is not None and kept.account is not None
+
+    # And a quote asked for after a second cut is still named.
+    _log(log, [("2026-10-05T06:20:00Z", IBKR + "get_price_snapshot", {"contract_id": 10},
+                {"last": {"price": 201.0}})])
+    main(["review", "run", "--definition", str(shared), "--session", str(log),
+          "--keep", str(tmp_path / "kept"), "--out", str(tmp_path / "review.json")],
+         context=context)
+    assert connector.quote(Payloads.load(tmp_path / "kept").quotes[names[0]]) == 201.0
+    assert json.loads((tmp_path / "review.json").read_text())["data"]["missing"] == []
+
+
 def test_saved_answers_load_back_the_same(tmp_path: Path):
     before = payloads(held={"RISE": (10, 200.0)}, performance=performance([0.01]))
     before.quotes["RISE"] = {"last": {"price": 201.0}}

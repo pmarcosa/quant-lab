@@ -813,8 +813,18 @@ def cmd_review_run(ctx: Context, args) -> int:
         payloads = connector.Payloads.load(Path(args.inputs))
     else:
         log = Path(args.session) if args.session not in (None, "auto") else connector.latest_log()
-        payloads = connector.gather(log)
         ctx.out(f"session    {log}")
+        if args.keep and Path(args.keep).is_dir():
+            # What earlier runs of this session collected: a compacted session's
+            # log no longer holds the answers made before the compaction.
+            kept_answers = connector.Payloads.load(Path(args.keep))
+            payloads = connector.gather(log, kept_answers.names).over(kept_answers)
+        else:
+            payloads = connector.gather(log)
+        if args.keep:
+            payloads.save(Path(args.keep))
+            ctx.out(f"kept       {args.keep}: {len(payloads.history)} histories, "
+                    f"{len(payloads.quotes)} quotes")
         if payloads.unnamed:
             ctx.out(f"warning: weekly histories for contracts {payloads.unnamed} could not be "
                     f"named; ask for the watchlist or the positions in the same session")
@@ -851,6 +861,35 @@ def cmd_review_run(ctx: Context, args) -> int:
         else:
             ctx.out("state      not written: the review is not final until it has its quotes")
     return 0 if result["final"] else 3
+
+
+def cmd_review_collect(ctx: Context, args) -> int:
+    """Put the session's connector answers in a folder, and say what is still missing."""
+    from runtime import connector
+    from runtime.wiring import universe_list
+
+    definition = _definition(ctx, args)
+    folder = Path(args.keep)
+    log = Path(args.session) if args.session not in (None, "auto") else connector.latest_log()
+    earlier = connector.Payloads.load(folder) if folder.is_dir() else connector.Payloads()
+    payloads = connector.gather(log, earlier.names).over(earlier)
+    payloads.save(folder)
+    universe = universe_list(definition.strategy.universe)
+    wanted = [*(universe.symbols if universe is not None else ()), definition.review.benchmark]
+    missing = [symbol for symbol in wanted if symbol not in payloads.history]
+    account = [name for name in ("account", "positions", "orders", "trades", "performance")
+               if getattr(payloads, name) is None]
+    ctx.out(f"session    {log}")
+    ctx.out(f"kept       {folder}")
+    ctx.out(f"histories  {len(wanted) - len(missing)} of {len(wanted)}"
+            + (f"; missing {', '.join(missing)}" if missing else ""))
+    ctx.out(f"account    {'complete' if not account else 'missing ' + ', '.join(account)}")
+    ctx.out(f"quotes     {len(payloads.quotes)}")
+    ctx.out(f"state      {'read' if payloads.state else 'not read'}")
+    if payloads.unnamed:
+        ctx.out(f"warning: weekly histories for contracts {payloads.unnamed} could not be "
+                f"named; ask for the watchlist or the positions in the same session")
+    return 0 if not (missing or account or payloads.unnamed) else 3
 
 
 def cmd_review_clear(ctx: Context, args) -> int:
@@ -1256,11 +1295,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inputs", default=None,
                    help="A folder of saved answers instead of a session log")
     p.add_argument("--save-inputs", default=None, help="Save the answers used to this folder")
+    p.add_argument("--keep", default=None, metavar="DIR",
+                   help="Collect the session's answers into this folder, run after run: "
+                        "survives the session's context being compacted")
     p.add_argument("--state", default=None, help="The state the last review kept (JSON)")
     p.add_argument("--state-out", default=None, help="Where to write the state to keep")
     p.add_argument("--out", default=None, help="Where to write the full result (JSON)")
     p.add_argument("--as-of", default=None, help="Decide as of this time (ISO; default: now)")
     p.set_defaults(func=cmd_review_run)
+    p = review.add_parser("collect", help="Keep the session's connector answers in a folder")
+    p.add_argument("--definition", default=None,
+                   help="Name in configs/definitions, or a path (default: the strategy's name)")
+    p.add_argument("--session", default="auto",
+                   help="Session log to read the connector's answers from (default: the newest)")
+    p.add_argument("--keep", required=True, metavar="DIR", help="The folder to collect into")
+    p.set_defaults(func=cmd_review_collect)
     p = review.add_parser("clear", help="Move the review's ladder back up, with a reason")
     p.add_argument("--state", required=True)
     p.add_argument("--to", required=True, choices=["normal", "reduce_only"])

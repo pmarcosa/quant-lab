@@ -225,8 +225,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--store", default=str(STORE))
     parser.add_argument("--ledger", default=str(ROOT / "state" / "research.jsonl"))
     parser.add_argument("--universe", default="momentum")
-    parser.add_argument("--capital", type=float, default=16_729.0,
-                        help="Opening equity: the account's size today")
+    parser.add_argument("--capital", type=float, default=15_000.0,
+                        help="Opening equity in dollars; pass your account's size")
     parser.add_argument("--min-order", type=float, default=1_000.0)
     parser.add_argument("--share-price", type=float, default=100.0,
                         help="Typical share price per-share fees are charged at")

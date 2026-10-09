@@ -117,8 +117,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=str(STRATEGY_CONFIGS / "momentum.yaml"))
     parser.add_argument("--store", default=str(ROOT / "var" / "store"))
     parser.add_argument("--ledger", default=str(ROOT / "state" / "research.jsonl"))
-    parser.add_argument("--capital", type=float, default=16_729.0,
-                        help="Opening equity: the account's size today")
+    parser.add_argument("--capital", type=float, default=15_000.0,
+                        help="Opening equity in dollars; pass your account's size")
     parser.add_argument("--tops", default="4,5,6,7,8,9,10",
                         help="Limits tried with frozen names kept")
     parser.add_argument("--crossed", default="0,5,6,8",

@@ -828,6 +828,9 @@ def cmd_review_run(ctx: Context, args) -> int:
         if payloads.unnamed:
             ctx.out(f"warning: weekly histories for contracts {payloads.unnamed} could not be "
                     f"named; ask for the watchlist or the positions in the same session")
+        if payloads.ignored:
+            ctx.out(f"warning: left out, asked for without include_corporate_actions: "
+                    f"{', '.join(payloads.ignored)}; ask for them again with it")
     if args.save_inputs:
         payloads.save(Path(args.save_inputs))
     as_of = datetime.fromisoformat(args.as_of) if args.as_of else ctx.clock()
@@ -889,6 +892,9 @@ def cmd_review_collect(ctx: Context, args) -> int:
     ctx.out(f"account    {'complete' if not account else 'missing ' + ', '.join(account)}")
     ctx.out(f"quotes     {len(payloads.quotes)}")
     ctx.out(f"state      {'read' if payloads.state else 'not read'}")
+    if payloads.ignored:
+        ctx.out(f"warning: left out, asked for without include_corporate_actions: "
+                f"{', '.join(payloads.ignored)}; ask for them again with it")
     if payloads.unnamed:
         ctx.out(f"warning: weekly histories for contracts {payloads.unnamed} could not be "
                 f"named; ask for the watchlist or the positions in the same session")

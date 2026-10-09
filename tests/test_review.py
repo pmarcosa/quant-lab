@@ -297,7 +297,8 @@ IBKR = "mcp__Interactive_Brokers_IBKR__"
 def test_answers_are_found_in_the_session_and_in_its_helpers(tmp_path: Path):
     watch = {"instruments": [{"contract_id_ex": "11", "contract_description": "RISE"},
                              {"contract_id_ex": "12", "contract_description": "FAST"}]}
-    weekly_call = {"security_type": "STK", "step": "ONE_WEEK"}
+    weekly_call = {"security_type": "STK", "step": "ONE_WEEK",
+                   "include_corporate_actions": True}
     main = _log(tmp_path / "session.jsonl", [
         ("2026-10-05T06:00:00Z", IBKR + "get_watchlist", {"id": "104"}, watch),
         ("2026-10-05T06:00:10Z", IBKR + "get_account_summary", {}, account(500.0)),
@@ -325,6 +326,33 @@ def test_answers_are_found_in_the_session_and_in_its_helpers(tmp_path: Path):
     assert connector.quote(found.quotes["FAST"]) == 301.0
     assert connector.cash(found.account) == 500.0
     assert found.orders is None, "an answer that is not JSON is not an answer"
+
+
+def test_a_history_asked_for_without_corporate_actions_is_left_out(tmp_path: Path):
+    """Such an answer looks exactly like a stock that pays nothing: it cannot be trusted."""
+    watch = {"instruments": [{"contract_id_ex": "11", "contract_description": "RISE"},
+                             {"contract_id_ex": "12", "contract_description": "FAST"}]}
+    bare = {"security_type": "STK", "step": "ONE_WEEK"}
+    log = _log(tmp_path / "session.jsonl", [
+        ("2026-10-05T06:00:00Z", IBKR + "get_watchlist", {"id": "104"}, watch),
+        ("2026-10-05T06:00:10Z", IBKR + "get_price_history",
+         {"contract_id": 11, **bare}, history(SHAPES["RISE"])),
+        ("2026-10-05T06:00:20Z", IBKR + "get_price_history",
+         {"contract_id": 12, **bare}, history(SHAPES["FAST"])),
+        ("2026-10-05T06:00:30Z", IBKR + "get_price_history",
+         {"contract_id": 12, **bare, "include_corporate_actions": True},
+         history(SHAPES["FAST"])),
+    ])
+    found = connector.gather(log)
+    assert sorted(found.history) == ["FAST"] and found.ignored == ["RISE"]
+    # Asked again, properly, in a later collection: no longer left out.
+    later = _log(tmp_path / "later.jsonl", [
+        ("2026-10-05T06:05:00Z", IBKR + "get_price_history",
+         {"contract_id": 11, **bare, "include_corporate_actions": True},
+         history(SHAPES["RISE"])),
+    ])
+    merged = connector.gather(later, found.names).over(found)
+    assert sorted(merged.history) == ["FAST", "RISE"] and merged.ignored == []
 
 
 def test_the_state_document_a_session_read_is_found(tmp_path: Path, universe: str):
@@ -389,7 +417,8 @@ def test_answers_collected_before_the_log_was_cut_back_are_kept(tmp_path: Path, 
     names = ["RISE", "FAST", "PLOD", "FALL"]
     watch = {"instruments": [{"contract_id_ex": str(10 + n), "contract_description": symbol}
                              for n, symbol in enumerate([*names, "SPY"])]}
-    weekly_call = {"security_type": "STK", "step": "ONE_WEEK"}
+    weekly_call = {"security_type": "STK", "step": "ONE_WEEK",
+                   "include_corporate_actions": True}
     shared = tmp_path / "made-up.yaml"
     shared.write_text(f"""
 strategy_id: momentum
@@ -501,6 +530,30 @@ def test_a_review_on_last_weeks_bars_is_not_final(universe: str):
     assert result["data_behind"] == "2026-10-16" and not result["final"]
     assert "NOT FINAL" in weekly.summary(result)
     assert weekly.review(payloads(), d, MONDAY)["data_behind"] is None
+
+
+def test_a_stock_that_loses_its_dividends_overnight_is_fetched_again(universe: str):
+    """Four payouts last week and none now is an answer without its corporate actions."""
+    d = definition(universe)
+    days = [(LAST_CLOSE - timedelta(days=7 * k + 2)).date() for k in (5, 18, 31, 44)]
+    paying = payloads()
+    paying.history["PLOD"] = history(SHAPES["PLOD"], dividends_on=[(day, 0.5) for day in days])
+    first = weekly.review(paying, d, MONDAY)
+    assert first["state"]["last_review"]["dividends"] == {"PLOD": 4}
+    assert first["history_needed"] == []
+
+    # Next review: the same stock comes back with no dividends listed at all.
+    bare = weekly.review(payloads(), d, MONDAY, state=first["state"])
+    assert bare["data"]["dividends_lost"] == ["PLOD"] and not bare["final"]
+    assert "PLOD" in bare["history_needed"]
+    assert "NOT FINAL" in weekly.summary(bare)
+
+    # One payout sliding out of the window is the calendar, not a failed fetch.
+    one_less = payloads()
+    one_less.history["PLOD"] = history(SHAPES["PLOD"],
+                                       dividends_on=[(day, 0.5) for day in days[:3]])
+    slid = weekly.review(one_less, d, MONDAY, state=first["state"])
+    assert slid["data"]["dividends_lost"] == [] and slid["history_needed"] == []
 
 
 def test_a_rotation_chosen_from_part_of_the_universe_is_not_final(universe: str):

@@ -1432,6 +1432,14 @@ stocks agree within 0.12% over two years (unadjusted, they are up to 11.6%
 apart), and the scan of that week is the same stock for stock. Orders, stops
 and the value of the book use prices as traded.
 
+The connector leaves `corp_actions` out altogether for a stock that pays
+nothing, so an answer that lost its dividends looks like a non-payer. Two
+guards: a weekly history asked for without `include_corporate_actions` is not
+used at all (`collect` lists it as missing and says why), and a stock whose
+answer listed dividends at the last review and lists two or more fewer now is
+named as needing its history again, and the review is NOT FINAL until it has
+it (the window moves a week at a time, so a real change is one payout).
+
 **A rotation takes two runs.** The first says which stocks it would trade or
 protect and exits with status 3 (`NOT FINAL`); the session quotes them and
 runs it again. Orders are day limit orders 0.5% through the quote

@@ -430,6 +430,9 @@ class Payloads:
     #: Contract id to ticker, as far as the session's answers named them.
     names: dict[int, str] = field(default_factory=dict)
     unnamed: list[int] = field(default_factory=list)
+    #: Weekly histories left out because they were asked for without corporate
+    #: actions: such an answer looks exactly like a stock that pays no dividend.
+    ignored: list[str] = field(default_factory=list)
 
     def over(self, older: Payloads) -> Payloads:
         """These answers laid over an earlier collection: the newer one wins.
@@ -448,6 +451,7 @@ class Payloads:
             mine = getattr(self, name)
             setattr(merged, name, mine if mine is not None else getattr(older, name))
         merged.unnamed = [c for c in self.unnamed if c not in merged.names]
+        merged.ignored = [symbol for symbol in self.ignored if symbol not in merged.history]
         return merged
 
     def save(self, folder: Path) -> None:
@@ -524,7 +528,15 @@ def gather(log: Path, tickers: Mapping[int, str] | None = None) -> Payloads:
                 if contract not in found.unnamed:
                     found.unnamed.append(contract)
                 continue
+            if call.arguments.get("include_corporate_actions") not in (True, "true"):
+                # Without them the dividends are not in the answer, and the
+                # signals would be computed on a price series, not a return one.
+                if symbol not in found.history and symbol not in found.ignored:
+                    found.ignored.append(symbol)
+                continue
             found.history[symbol] = call.result
+            if symbol in found.ignored:
+                found.ignored.remove(symbol)
         elif tool == "get_price_snapshot":
             symbol = names.get(int(call.arguments.get("contract_id", 0)))
             if symbol is not None:

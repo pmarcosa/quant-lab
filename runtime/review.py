@@ -472,6 +472,19 @@ def review(
     # A rotation chosen from part of the universe is a different rotation: the
     # stock that was not fetched may be the one that belonged among the best.
     history_needed = sorted({*missing, *stale}) if rotation else []
+    # A stock whose answer listed dividends last week and lists far fewer now did
+    # not stop paying in a week (the window moves by one): the answer came back
+    # without its corporate actions, and its signals would be on bare prices.
+    paid_before = (kept.get("last_review") or {}).get("dividends") or {}
+    paying = {s: p.payouts for s, p in sorted(current.items()) if p.payouts}
+    dividends_lost = sorted(s for s, before in paid_before.items()
+                            if s in current and current[s].payouts < int(before) - 1)
+    for symbol in dividends_lost:
+        notes.append(
+            f"{symbol}: {paid_before[symbol]} dividends in last review's history, "
+            f"{current[symbol].payouts} now; the answer is missing its corporate actions"
+        )
+    history_needed = sorted({*history_needed, *dividends_lost})
     final = not quotes_needed and not history_needed and not behind
 
     # -- the record of this rotation's proposals, for next week's execution check --
@@ -483,6 +496,7 @@ def review(
         "positions": {p.symbol: p.quantity for p in managed},
         "closes": {p.symbol: closes[p.symbol] for p in managed if p.symbol in closes},
         "cash": _round(book.cash, 2),
+        "dividends": paying,
     }
 
     scan = _scan(table, best, target, holdings, rotation)
@@ -508,6 +522,7 @@ def review(
             "universe": universe.describe(), "with_bars": len(current), "missing": missing,
             "stale": stale, "bars": int(min(len(p.traded) for p in current.values())),
             "dividends_applied": int(sum(p.payouts for p in current.values())),
+            "dividends_lost": dividends_lost,
             "quotes": sorted(quotes), "corporate_actions": actions, "short_history": short,
         },
         "account": {
@@ -992,15 +1007,15 @@ def summary(result: Mapping[str, Any]) -> str:
                      else f"{len(checks['problems'])} problem(s)"))
     for problem in checks["problems"]:
         add(f"  {problem}")
+    contracts = result.get("contracts", {})
+
+    def named(symbols: list[str]) -> str:
+        return ", ".join(f"{s} ({contracts[s]})" if s in contracts else s for s in symbols)
+
+    if result["history_needed"]:
+        add("NOT FINAL — no current weekly history for these; fetch it, then run the "
+            "review again: " + named(result["history_needed"]))
     if result["week"] == "rebalance":
-        contracts = result.get("contracts", {})
-
-        def named(symbols: list[str]) -> str:
-            return ", ".join(f"{s} ({contracts[s]})" if s in contracts else s for s in symbols)
-
-        if result["history_needed"]:
-            add("NOT FINAL — no current weekly history for these; fetch it, then run the "
-                "review again: " + named(result["history_needed"]))
         if result["quotes_needed"]:
             add("NOT FINAL — quote these, then run the review again: "
                 + named(result["quotes_needed"]))

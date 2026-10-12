@@ -1438,7 +1438,18 @@ guards: a weekly history asked for without `include_corporate_actions` is not
 used at all (`collect` lists it as missing and says why), and a stock whose
 answer listed dividends at the last review and lists two or more fewer now is
 named as needing its history again, and the review is NOT FINAL until it has
-it (the window moves a week at a time, so a real change is one payout).
+it. The state keeps each dividend's ex-date, and only those the new answer's
+window still covers are expected back: a payout the window has moved past is
+the calendar (INTC last paid in August 2024, before a two-year window, and
+rightly lists none). Counts kept by reviews older than this are noted and not
+compared.
+
+**Between rotations the freeze limit is read from the next rotation.** A
+monitoring week still ranks the universe, to show what the next rotation is
+heading for. The limit on freezing asks whether a held name passed at the two
+rotations before the one deciding, so in a monitoring week it is read four and
+eight weeks back from the next rotation's decision bar, not from this week's.
+The summary names the closes it was read on.
 
 **A rotation takes two runs.** The first says which stocks it would trade or
 protect and exits with status 3 (`NOT FINAL`); the session quotes them and

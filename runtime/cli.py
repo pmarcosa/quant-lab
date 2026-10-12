@@ -862,7 +862,7 @@ def cmd_review_run(ctx: Context, args) -> int:
             Path(args.state_out).write_text(json.dumps(result["state"], indent=1), encoding="utf-8")
             ctx.out(f"state      {args.state_out}")
         else:
-            ctx.out("state      not written: the review is not final until it has its quotes")
+            ctx.out("state      not written: the review is not final (see NOT FINAL above)")
     return 0 if result["final"] else 3
 
 

@@ -450,3 +450,33 @@ def test_impossible_freezing_settings_are_refused():
         MomentumParams(freeze_fade=0.0)
     with pytest.raises(ContractViolation):
         MomentumParams(freeze_rotations=-1)
+
+
+def test_between_rotations_the_freeze_limit_looks_back_from_the_next_rotation():
+    """A monitoring week previews the next rotation: its look-back, not this week's.
+
+    Four bars back from a week that is not a rotation is not a rotation at all.
+    On 2026-10-12 that read the closes of 11-sep and 14-aug where the rotation
+    of 19-oct will read 18-sep and 21-aug, and the two disagreed on three names.
+    """
+    from contracts.targets import Holdings
+
+    params = MomentumParams(rebalance_weeks=4, top_n=0, freeze_rotations=1)
+    strategy = WeeklyMomentum(params)
+    table = indicators(_Bars.frames[RISING], params)
+    seen = set()
+    for ahead in range(4):
+        ranked = strategy.rank(_Bars(), Holdings({RISING: 0.2}), weeks_to_rotation=ahead)
+        row = ranked.loc[ranked["instrument"] == RISING].iloc[0]
+        expected = bool(entry_ok(table.iloc[-1 - (4 - ahead)], params))
+        assert bool(row["passed_recently"]) is expected
+        seen.add(expected)
+    assert seen == {True, False}   # the look-back really moves with the next rotation
+
+
+def test_a_look_ahead_beyond_the_cadence_is_refused():
+    from contracts.targets import Holdings
+
+    strategy = WeeklyMomentum(MomentumParams(rebalance_weeks=4, freeze_rotations=1))
+    with pytest.raises(ContractViolation):
+        strategy.rank(_Bars(), Holdings(), weeks_to_rotation=4)

@@ -539,21 +539,54 @@ def test_a_stock_that_loses_its_dividends_overnight_is_fetched_again(universe: s
     paying = payloads()
     paying.history["PLOD"] = history(SHAPES["PLOD"], dividends_on=[(day, 0.5) for day in days])
     first = weekly.review(paying, d, MONDAY)
-    assert first["state"]["last_review"]["dividends"] == {"PLOD": 4}
+    assert first["state"]["last_review"]["dividends"] == {
+        "PLOD": sorted(day.isoformat() for day in days)}
     assert first["history_needed"] == []
 
     # Next review: the same stock comes back with no dividends listed at all.
     bare = weekly.review(payloads(), d, MONDAY, state=first["state"])
     assert bare["data"]["dividends_lost"] == ["PLOD"] and not bare["final"]
     assert "PLOD" in bare["history_needed"]
-    assert "NOT FINAL" in weekly.summary(bare)
+    assert "without dividends the last review saw" in weekly.summary(bare)
 
-    # One payout sliding out of the window is the calendar, not a failed fetch.
+    # A payout the window still covers cannot drop out on its own either.
     one_less = payloads()
     one_less.history["PLOD"] = history(SHAPES["PLOD"],
                                        dividends_on=[(day, 0.5) for day in days[:3]])
-    slid = weekly.review(one_less, d, MONDAY, state=first["state"])
+    short = weekly.review(one_less, d, MONDAY, state=first["state"])
+    assert short["data"]["dividends_lost"] == ["PLOD"] and not short["final"]
+
+    # One the window has moved past is the calendar, not a failed fetch.
+    moved_on = payloads()
+    moved_on.history["PLOD"] = history(SHAPES["PLOD"][-40:],
+                                       dividends_on=[(day, 0.5) for day in days[:3]])
+    slid = weekly.review(moved_on, d, MONDAY, state=first["state"])
     assert slid["data"]["dividends_lost"] == [] and slid["history_needed"] == []
+
+
+def test_a_stock_whose_dividends_all_predate_the_window_is_not_refetched(universe: str):
+    """INTC on 2026-10-12: it last paid in Aug-2024, before a two-year window.
+
+    The answer lists no corporate actions at all, which is right, and the review
+    must be final rather than ask for the same answer again every week.
+    """
+    d = definition(universe)
+    paid_long_ago = (LAST_CLOSE - timedelta(days=7 * (WEEKS + 10))).date()
+    state = weekly.review(payloads(), d, MONDAY)["state"]
+    state["last_review"]["dividends"] = {"PLOD": [paid_long_ago.isoformat()]}
+    result = weekly.review(payloads(), d, MONDAY, state=state)
+    assert result["data"]["dividends_lost"] == [] and result["history_needed"] == []
+
+
+def test_dividends_kept_as_counts_by_an_older_review_are_not_compared(universe: str):
+    """The state written before the dates were kept holds counts: noted, not refetched."""
+    d = definition(universe)
+    state = weekly.review(payloads(), d, MONDAY)["state"]
+    state["last_review"]["dividends"] = {"PLOD": 7}
+    result = weekly.review(payloads(), d, MONDAY, state=state)
+    assert result["data"]["dividends_lost"] == [] and result["history_needed"] == []
+    assert any("counts, without dates" in note and "PLOD" in note for note in result["notes"])
+    assert isinstance(result["state"]["last_review"]["dividends"], dict)
 
 
 def test_a_rotation_chosen_from_part_of_the_universe_is_not_final(universe: str):

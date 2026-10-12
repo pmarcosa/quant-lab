@@ -43,6 +43,7 @@ dozen weekly returns can say.
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -210,7 +211,16 @@ class Prices:
 
     traded: pd.DataFrame
     total_return: pd.DataFrame
-    payouts: int
+    paid_on: tuple[date, ...] = ()
+
+    @property
+    def payouts(self) -> int:
+        return len(self.paid_on)
+
+    @property
+    def window_start(self) -> date:
+        """The first day the answer covers: the Monday of its first weekly bar."""
+        return self.traded.index[0].date() - timedelta(days=4)
 
 
 def _prices(payloads: Payloads, symbols: Sequence[str], as_of: datetime,
@@ -229,7 +239,8 @@ def _prices(payloads: Payloads, symbols: Sequence[str], as_of: datetime,
             continue
         payouts = connector.dividends(payload)
         actions.extend(f"{symbol}: {action}" for action in connector.other_actions(payload))
-        found[symbol] = Prices(traded, connector.adjusted(traded, payouts), len(payouts))
+        found[symbol] = Prices(traded, connector.adjusted(traded, payouts),
+                               tuple(p.ex_date for p in payouts))
     return found
 
 
@@ -241,6 +252,15 @@ def _next_rotation(strategy, after: datetime) -> date | None:
         if strategy.rotates_at(moment):
             return (moment + timedelta(days=3)).date()
     return None
+
+
+def _weeks_to_rotation(strategy, decision_time: datetime) -> int:
+    """Weekly bars from this decision to the next rotation's; zero at a rotation."""
+    cadence = int(getattr(getattr(strategy, "params", None), "rebalance_weeks", 0) or 0)
+    for ahead in range(max(1, cadence)):
+        if strategy.rotates_at(decision_time + timedelta(days=7 * ahead)):
+            return ahead
+    return 0
 
 
 def _round(value: float | None, places: int = 6) -> float | None:
@@ -381,7 +401,18 @@ def review(
 
     # -- what the strategy says --------------------------------------------------
     rotation = bool(strategy.rotates_at(decision_time))
-    table = strategy.rank(filtration, holdings)
+    # Between rotations the ranking previews the next rotation, so the freeze
+    # limit is read from the rotations before that one, not from this week.
+    ahead = _weeks_to_rotation(strategy, decision_time)
+    if ahead and "weeks_to_rotation" in inspect.signature(strategy.rank).parameters:
+        table = strategy.rank(filtration, holdings, weeks_to_rotation=ahead)
+    else:
+        table = strategy.rank(filtration, holdings)
+    cadence = int(getattr(strategy.params, "rebalance_weeks", 0) or 0)
+    freeze_bars = [
+        (decision_bar + timedelta(days=7 * (ahead - back * cadence))).date().isoformat()
+        for back in range(1, int(getattr(strategy.params, "freeze_rotations", 0) or 0) + 1)
+    ] if cadence else []
     limit = int(dict(definition.strategy.params).get("top_n", strategy.params.top_n))
     passing = table.loc[table["eligible"]] if not table.empty else table
     best = [str(i) for i in (passing.head(limit) if limit else passing)["instrument"]] \
@@ -472,18 +503,37 @@ def review(
     # A rotation chosen from part of the universe is a different rotation: the
     # stock that was not fetched may be the one that belonged among the best.
     history_needed = sorted({*missing, *stale}) if rotation else []
-    # A stock whose answer listed dividends last week and lists far fewer now did
-    # not stop paying in a week (the window moves by one): the answer came back
-    # without its corporate actions, and its signals would be on bare prices.
+    # A dividend the last review saw, whose ex-date this answer's window still
+    # covers, cannot have stopped existing: the answer came back without its
+    # corporate actions, and its signals would be on bare prices. Dividends whose
+    # ex-date the window has moved past are the calendar, not a failed fetch.
     paid_before = (kept.get("last_review") or {}).get("dividends") or {}
-    paying = {s: p.payouts for s, p in sorted(current.items()) if p.payouts}
-    dividends_lost = sorted(s for s, before in paid_before.items()
-                            if s in current and current[s].payouts < int(before) - 1)
-    for symbol in dividends_lost:
+    paying = {s: [d.isoformat() for d in p.paid_on] for s, p in sorted(current.items())
+              if p.payouts}
+    dividends_lost = []
+    counted_only = sorted(s for s, before in paid_before.items()
+                          if s in current and not isinstance(before, list))
+    if counted_only:
         notes.append(
-            f"{symbol}: {paid_before[symbol]} dividends in last review's history, "
-            f"{current[symbol].payouts} now; the answer is missing its corporate actions"
+            "dividends kept by the last review as counts, without dates, are not compared "
+            "this week: " + ", ".join(counted_only)
         )
+    for symbol, before in sorted(paid_before.items()):
+        if symbol not in current or not isinstance(before, list):
+            continue
+        prices_now = current[symbol]
+        covered = [date.fromisoformat(d) for d in before
+                   if date.fromisoformat(d) >= prices_now.window_start]
+        missing_days = [d for d in covered
+                        if not any(abs((d - now).days) <= 3 for now in prices_now.paid_on)]
+        if missing_days:
+            dividends_lost.append(symbol)
+            notes.append(
+                f"{symbol}: the answer covers {len(covered)} dividend(s) the last review saw "
+                f"but lists {len(covered) - len(missing_days)} of them (missing ex-dates "
+                f"{', '.join(d.isoformat() for d in missing_days)}); the answer is missing its "
+                f"corporate actions"
+            )
     history_needed = sorted({*history_needed, *dividends_lost})
     final = not quotes_needed and not history_needed and not behind
 
@@ -546,6 +596,7 @@ def review(
             "frozen": sorted(r["symbol"] for r in scan if r["status"] == "frozen"),
             "exits": sorted(r["symbol"] for r in scan if r["status"].startswith("exit")),
             "out_of_time": sorted(r["symbol"] for r in scan if r["status"] == "frozen too long"),
+            "freeze_checked_on": freeze_bars,
         },
         "scan": scan,
         "target": {s: _round(w, 6) for s, w in sorted(target.items())} if rotation else None,
@@ -993,6 +1044,8 @@ def summary(result: Mapping[str, Any]) -> str:
         add(f"  exits triggered: {', '.join(sel['exits'])}")
     if sel["out_of_time"]:
         add(f"  frozen more than its rotations: {', '.join(sel['out_of_time'])}")
+    if sel.get("freeze_checked_on") and (sel["frozen"] or sel["out_of_time"]):
+        add(f"  freeze limit read on the closes of {' and '.join(sel['freeze_checked_on'])}")
     watch = result["monitoring"]
     add(f"monitoring: {watch['state']}" + (f" (was {watch['state_before']})"
                                              if watch["state"] != watch["state_before"] else "")
@@ -1012,9 +1065,15 @@ def summary(result: Mapping[str, Any]) -> str:
     def named(symbols: list[str]) -> str:
         return ", ".join(f"{s} ({contracts[s]})" if s in contracts else s for s in symbols)
 
-    if result["history_needed"]:
+    lost = set(result["data"].get("dividends_lost") or ())
+    stale = [s for s in result["history_needed"] if s not in lost]
+    if stale:
         add("NOT FINAL — no current weekly history for these; fetch it, then run the "
-            "review again: " + named(result["history_needed"]))
+            "review again: " + named(stale))
+    if lost:
+        add("NOT FINAL — these histories came back without dividends the last review saw "
+            "inside the same window; fetch them again with include_corporate_actions, then "
+            "run the review again: " + named(sorted(lost)))
     if result["week"] == "rebalance":
         if result["quotes_needed"]:
             add("NOT FINAL — quote these, then run the review again: "

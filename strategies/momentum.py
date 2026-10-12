@@ -349,11 +349,29 @@ class WeeklyMomentum:
         """
         return ()
 
-    def rank(self, filtration: Filtration, held: Mapping[InstrumentId, float]) -> pd.DataFrame:
+    def rank(
+        self, filtration: Filtration, held: Mapping[InstrumentId, float], *,
+        weeks_to_rotation: int = 0,
+    ) -> pd.DataFrame:
         """Score and gate the whole eligible universe at the decision time.
+
+        Args:
+            filtration: What is known at the decision time.
+            held: The book, as weights.
+            weeks_to_rotation: Bars from this decision to the next rotation's.
+                Zero at a rotation. Between rotations a review still ranks, to
+                show what the next rotation is heading for, and the freeze limit
+                must then look back from that rotation, not from this week: four
+                and eight bars back from a week that is not a rotation are not
+                the rotations the rule names. The bars it needs are already known.
 
         Returns one row per available instrument, sorted by score descending.
         """
+        if not 0 <= weeks_to_rotation < max(1, self.params.rebalance_weeks):
+            raise ContractViolation(
+                f"weeks_to_rotation must be in [0, {self.params.rebalance_weeks}); "
+                f"got {weeks_to_rotation}"
+            )
         params = self.params
         depth = FULL_HISTORY
         gains = gains_of(held)
@@ -370,13 +388,15 @@ class WeeklyMomentum:
             reason = exit_reason(row, params, gains.get(instrument)) if is_held else None
             # Whether it qualified at one of the last few rotations: what a
             # limit on freezing asks. One bar per week, so a rotation back is
-            # ``rebalance_weeks`` rows back.
+            # ``rebalance_weeks`` rows back -- counted from the rotation this
+            # decision belongs to, which between rotations is still ahead.
             recently = True
             if is_held and params.freeze_rotations:
                 recently = any(
-                    entry_ok(table.iloc[-1 - back * params.rebalance_weeks], params)
+                    entry_ok(table.iloc[-1 - (back * params.rebalance_weeks - weeks_to_rotation)],
+                             params)
                     for back in range(1, params.freeze_rotations + 1)
-                    if len(table) > back * params.rebalance_weeks
+                    if len(table) > back * params.rebalance_weeks - weeks_to_rotation
                 )
             rows.append(
                 {

@@ -1,0 +1,169 @@
+# The momentum universe widened beyond technology (2026-10-16): the 53 stocks of
+# `momentum` and 97 large US companies from the other ten sectors, chosen by
+# size and length of history today -- so, like `momentum`, it carries
+# survivorship bias: no stock here failed. Two names asked for could not be used
+# (AVB has no primary US listing in IBKR; MMC and BK trade as MRSH and BNY).
+#
+# The sector ETFs are not in it: sector-momentum reads them as reference series
+# from `momentum-wide-gated` (this list plus the eleven funds).
+# -- the 53 of `momentum` --
+AAPL
+ABBV
+ADBE
+AMD
+AMT
+AMZN
+ASML
+AVGO
+AXP
+CAT
+COP
+COST
+CRCL
+CRM
+CVX
+DIS
+FCX
+GE
+GOOGL
+HON
+INTC
+JNJ
+JPM
+KO
+LIN
+LITE
+LLY
+MA
+MCD
+META
+MRVL
+MSFT
+MSTR
+NEE
+NOW
+NVDA
+O
+ORCL
+PANW
+PEP
+PG
+PLD
+PLTR
+QCOM
+SPCX
+TSM
+TXN
+UNH
+UNP
+V
+WMT
+XOM
+ZM
+# -- consumer discretionary --
+HD
+LOW
+NKE
+SBUX
+TJX
+BKNG
+CMG
+MAR
+ORLY
+AZO
+ROST
+TSLA
+# -- communication services --
+VZ
+T
+CMCSA
+TMUS
+NFLX
+# -- financials --
+BAC
+WFC
+GS
+MS
+C
+SCHW
+BLK
+SPGI
+CB
+PGR
+ICE
+CME
+BNY
+MRSH
+# -- energy --
+SLB
+EOG
+PSX
+MPC
+VLO
+OXY
+KMI
+WMB
+# -- health care --
+MRK
+PFE
+TMO
+ABT
+DHR
+AMGN
+ISRG
+SYK
+BMY
+GILD
+MDT
+CVS
+ELV
+VRTX
+REGN
+BSX
+# -- materials --
+SHW
+APD
+ECL
+NEM
+NUE
+VMC
+# -- industrials --
+RTX
+LMT
+BA
+DE
+ETN
+ITW
+EMR
+GD
+NOC
+WM
+CSX
+NSC
+UPS
+FDX
+MMM
+# -- consumer staples --
+CL
+MO
+PM
+MDLZ
+KMB
+GIS
+SYY
+KR
+HSY
+# -- utilities --
+DUK
+SO
+D
+AEP
+EXC
+SRE
+XEL
+ED
+# -- real estate --
+SPG
+EQIX
+PSA
+WELL

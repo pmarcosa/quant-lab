@@ -1,0 +1,167 @@
+# Which sector each stock of momentum-wide belongs to, as the Select Sector SPDR
+# that holds it (GICS sectors as of October 2026). Read by sector-momentum
+# (strategy param `sectors: momentum-wide`). The classification is today's for
+# the whole history: XLC (2018) and XLRE (2015) did not exist before, and
+# sector-momentum leaves a sector open while its fund has no history.
+symbol,sector
+# technology
+AAPL,XLK
+ADBE,XLK
+AMD,XLK
+ASML,XLK
+AVGO,XLK
+CRM,XLK
+INTC,XLK
+LITE,XLK
+MRVL,XLK
+MSFT,XLK
+NOW,XLK
+NVDA,XLK
+ORCL,XLK
+PANW,XLK
+PLTR,XLK
+QCOM,XLK
+TSM,XLK
+TXN,XLK
+ZM,XLK
+# consumer discretionary
+AMZN,XLY
+AZO,XLY
+BKNG,XLY
+CMG,XLY
+HD,XLY
+LOW,XLY
+MAR,XLY
+MCD,XLY
+NKE,XLY
+ORLY,XLY
+ROST,XLY
+SBUX,XLY
+TJX,XLY
+TSLA,XLY
+# communication services
+CMCSA,XLC
+DIS,XLC
+GOOGL,XLC
+META,XLC
+NFLX,XLC
+T,XLC
+TMUS,XLC
+VZ,XLC
+# financials
+AXP,XLF
+BAC,XLF
+BLK,XLF
+BNY,XLF
+C,XLF
+CB,XLF
+CME,XLF
+CRCL,XLF
+GS,XLF
+ICE,XLF
+JPM,XLF
+MA,XLF
+MRSH,XLF
+MS,XLF
+MSTR,XLF
+PGR,XLF
+SCHW,XLF
+SPGI,XLF
+V,XLF
+WFC,XLF
+# energy
+COP,XLE
+CVX,XLE
+EOG,XLE
+KMI,XLE
+MPC,XLE
+OXY,XLE
+PSX,XLE
+SLB,XLE
+VLO,XLE
+WMB,XLE
+XOM,XLE
+# health care
+ABBV,XLV
+ABT,XLV
+AMGN,XLV
+BMY,XLV
+BSX,XLV
+CVS,XLV
+DHR,XLV
+ELV,XLV
+GILD,XLV
+ISRG,XLV
+JNJ,XLV
+LLY,XLV
+MDT,XLV
+MRK,XLV
+PFE,XLV
+REGN,XLV
+SYK,XLV
+TMO,XLV
+UNH,XLV
+VRTX,XLV
+# materials
+APD,XLB
+ECL,XLB
+FCX,XLB
+LIN,XLB
+NEM,XLB
+NUE,XLB
+SHW,XLB
+VMC,XLB
+# industrials
+BA,XLI
+CAT,XLI
+CSX,XLI
+DE,XLI
+EMR,XLI
+ETN,XLI
+FDX,XLI
+GD,XLI
+GE,XLI
+HON,XLI
+ITW,XLI
+LMT,XLI
+MMM,XLI
+NOC,XLI
+NSC,XLI
+RTX,XLI
+SPCX,XLI
+UNP,XLI
+UPS,XLI
+WM,XLI
+# consumer staples
+CL,XLP
+COST,XLP
+GIS,XLP
+HSY,XLP
+KMB,XLP
+KO,XLP
+KR,XLP
+MDLZ,XLP
+MO,XLP
+PEP,XLP
+PG,XLP
+PM,XLP
+SYY,XLP
+WMT,XLP
+# utilities
+AEP,XLU
+D,XLU
+DUK,XLU
+ED,XLU
+EXC,XLU
+NEE,XLU
+SO,XLU
+SRE,XLU
+XEL,XLU
+# real estate
+AMT,XLRE
+EQIX,XLRE
+O,XLRE
+PLD,XLRE
+PSA,XLRE
+SPG,XLRE
+WELL,XLRE

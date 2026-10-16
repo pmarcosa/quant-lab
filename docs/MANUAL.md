@@ -364,7 +364,22 @@ ql data import NFLX=nflx.json ORCL=orcl.json --freq weekly
 
 The connector serves prices as traded but not the adjusted series, so imported
 symbols have no dividend factors: `ingest` lists them as price-only until they
-are fetched through the gateway.
+are fetched through the gateway. Two options change that for weekly payloads
+asked for with `include_corporate_actions`:
+
+```bash
+ql data import --from-dir var/incoming --freq weekly --dividends --clip-bad-prints
+```
+
+- `--dividends` builds each symbol's factor file from the cash dividends the
+  payload lists (the same arithmetic as `ql review`, so a backtest and the
+  review see the same total-return prices). A factor file that already exists,
+  made from IBKR's ADJUSTED_LAST through the gateway, is left alone.
+- `--clip-bad-prints` brings an isolated bad tick in a bar's high or low back to
+  its open or close: a low under half the week's body or a high over one and a
+  half times it. Long connector histories carry a few (a 0.01 low, a 10,000
+  high); a stop checked against one fires at a price that never traded. Every
+  bar changed is printed.
 
 Both paths validate before they write anything. Mismatched array lengths,
 non-positive prices, bars whose high is below their low, and duplicate
@@ -663,6 +678,52 @@ strategy's config set the cash buffer, the no-trade band, limit or market
 orders, the commission plan and the stop type. `ql backtest`, `ql monitor
 baseline` and the live proposal all read them, so after changing one, rebuild
 the baseline.
+
+### Step 5.6b — A wider universe, and a sector gate
+
+```bash
+python scripts/compare_sectors.py
+```
+
+`momentum-wide` is the 53 stocks of `momentum` plus 97 large companies from the
+other ten sectors; `momentum-wide.sectors.csv` gives each stock its sector fund.
+The strategy `sector-momentum` (`strategies/sector_momentum.py`) is the weekly
+momentum strategy with one rule more: a stock may enter only while its sector
+is open -- its Select Sector SPDR passes the stock entry filters
+(`sector_trend`), and/or ranks among the `sector_top_k` best sectors by 13-week
+return. The funds are read, never traded; a held stock in a closed sector is
+judged by its exits and the freeze limit as before.
+
+The script runs five variants on the four rotation calendars from late 2007:
+the 53 as traded, the 53 with the sector gate, the 150, the 150 with the sector
+gate, and the 150 with the best four sectors. It compares them on the weekly
+difference of returns (Newey-West t) and records every run in the study
+`sector-gate`.
+
+First run (2026-10-16, IBKR weekly histories through the connector, decisions
+2007-10-05 to 2026-10-09, 15,000 account, IBKR tiered costs; mean of the four
+calendars): the 53 as traded 13.1% a year, Sharpe 0.76, max drawdown -38.9%;
+the 150 14.3%, 0.82, -44.1% (+1.0 point a year, t 0.57: not distinguishable);
+the sector trend gate cost 3 points a year on either universe (t -1.9 on the
+53, -1.6 on the 150), ahead only in 2008 and behind in the rebounds of 2009 and
+2020; the top-4 sectors gate -1.8 points (t -1.25). Neither change was adopted.
+
+A config that deploys the gated strategy:
+
+```yaml
+strategy:
+  name: sector-momentum
+  params:
+    rebalance_weeks: 4
+    top_n: 5
+    freeze_rotations: 2
+    pace_ratio_min: 0.1231
+    cost_stop_loss: 0.0
+    sectors: momentum-wide      # data/universes/momentum-wide.sectors.csv
+    sector_trend: true
+    sector_top_k: 0
+  universe: momentum-wide-gated # the 150 and the eleven funds
+```
 
 ### Step 5.7 — Query the ledger directly
 

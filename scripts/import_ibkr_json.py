@@ -9,6 +9,12 @@ as JSON. This is the path that does not need IB Gateway running: the payload can
 come from anywhere that speaks to IBKR, including a connector, and the
 conversion and validation happen here rather than wherever it was fetched.
 
+With ``--dividends`` (weekly only), a payload that lists its cash dividends
+(``include_corporate_actions``) also gets a dividend factor file built from them
+(``data.adjustments.factors_from_dividends``), so the store holds total-return
+bars for it. A factor file that already exists is left alone: one made by
+``fetch_ibkr.py`` from IBKR's own ADJUSTED_LAST series is the better record.
+
 After importing, rebuild the store:
 
     python scripts/ingest_ibkr_cache.py --rebuild
@@ -29,10 +35,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from contracts.errors import ContractViolation  # noqa: E402
+from data.adjustments import (  # noqa: E402
+    factors_from_dividends,
+    factors_path,
+    write_factors,
+)
 from data.vendor import (  # noqa: E402
     bars_from_connector,
     cache_inventory,
     check_coverage,
+    clip_bad_prints,
+    connector_dividends,
     write_cache_csv,
 )
 
@@ -54,6 +67,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dry-run", action="store_true", help="Validate without writing anything."
     )
+    parser.add_argument(
+        "--clip-bad-prints", action="store_true",
+        help="Bring isolated bad ticks in a bar's high or low back to its open/close "
+             "(data.vendor.clip_bad_prints); every bar changed is listed.",
+    )
+    parser.add_argument(
+        "--dividends", action="store_true",
+        help="Weekly only: build dividend factors from the payload's cash dividends, "
+             "for symbols that have no factor file yet.",
+    )
     args = parser.parse_args(argv)
 
     jobs: list[tuple[str, Path]] = []
@@ -70,6 +93,9 @@ def main(argv: list[str] | None = None) -> int:
     if not jobs:
         parser.print_help()
         return 2
+    if args.dividends and args.freq != "weekly":
+        print("--dividends builds weekly factors; use it with --freq weekly", file=sys.stderr)
+        return 2
 
     written = 0
     for symbol, path in jobs:
@@ -80,13 +106,20 @@ def main(argv: list[str] | None = None) -> int:
             # One bad file does not stop the rest, but it is never silent.
             print(f"{symbol:<8} SKIPPED  {error}", file=sys.stderr)
             continue
+        if args.clip_bad_prints:
+            bars, changes = clip_bad_prints(bars)
+            for change in changes:
+                print(f"{symbol:<8} bad print {change}")
         span = f"{bars.index[0].date()} to {bars.index[-1].date()}"
         if args.dry_run:
             print(f"{symbol:<8} {len(bars):>5} bars  {span}  (dry run)")
             continue
         write_cache_csv(symbol, bars, CACHE, frequency=args.freq)
         written += 1
-        print(f"{symbol:<8} {len(bars):>5} bars  {span}")
+        note = ""
+        if args.dividends:
+            note = _dividend_factors(symbol, payload, bars)
+        print(f"{symbol:<8} {len(bars):>5} bars  {span}{note}")
 
     if args.dry_run:
         return 0
@@ -98,6 +131,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"too little history to be selectable yet: {', '.join(thin)}")
     print("\nRebuild the store:  python scripts/ingest_ibkr_cache.py --rebuild")
     return 0
+
+
+def _dividend_factors(symbol: str, payload: dict, bars) -> str:
+    """Write the symbol's factor file from the payload's dividends; say what was done."""
+    if factors_path(CACHE, symbol).exists():
+        return "  (factor file kept)"
+    paid = [(ex, amount) for ex, amount, _ in connector_dividends(payload)]
+    if not paid:
+        return "  (no dividends listed)"
+    write_factors(CACHE, symbol, factors_from_dividends(bars, paid))
+    return f"  ({len(paid)} dividends -> factors)"
 
 
 if __name__ == "__main__":

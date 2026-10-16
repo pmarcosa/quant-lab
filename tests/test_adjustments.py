@@ -161,3 +161,44 @@ def test_volume_is_not_adjusted():
     adjusted, _ = with_dividends(raw, EX, YIELDS)
     factors = factors_from(raw, adjusted)
     assert (adjust(raw, factors, BarInterval.DAY)["volume"] == raw["volume"]).all()
+
+
+def test_factors_from_listed_dividends_match_the_reviews_adjustment():
+    """Two routes to total return -- the store's factors and the review's -- agree.
+
+    The weekly review adjusts the connector's answer itself (``runtime.connector``);
+    a backtest reads the store, whose factors for a payload imported without
+    ADJUSTED_LAST are built from the same listed dividends. The signals of the two
+    must be computed on the same prices.
+    """
+    from datetime import date as _date
+
+    from data.adjustments import factors_from_dividends
+    from runtime import connector
+
+    weeks = pd.date_range("2024-01-01", periods=60, freq="W-MON", tz="UTC")
+    closes = np.linspace(50.0, 80.0, len(weeks))
+    bars = pd.DataFrame({"open": closes, "high": closes * 1.01, "low": closes * 0.99,
+                         "close": closes, "volume": 1000}, index=weeks)
+    paid = [(_date(2024, 3, 13), 0.8), (_date(2024, 9, 11), 0.9), (_date(2025, 1, 15), 1.0),
+            (_date(2023, 6, 1), 5.0)]          # the last one predates the history
+    factors = factors_from_dividends(bars, paid)
+    stored = adjust(bars, factors, BarInterval.WEEK)
+
+    friday_bars = bars.copy()
+    friday_bars.index = (weeks + pd.Timedelta(days=4)).tz_convert(None) + pd.Timedelta(hours=21)
+    friday_bars.index = friday_bars.index.tz_localize("UTC")
+    review = connector.adjusted(friday_bars, tuple(
+        connector.Dividend(ex_date=d, amount=a, currency="USD") for d, a in paid))
+    assert np.allclose(stored["close"].to_numpy(), review["close"].to_numpy())
+    assert factors.iloc[-1] == pytest.approx(1.0)
+    assert (factors.diff().dropna() >= -1e-12).all()
+
+
+def test_a_dividend_that_is_not_a_positive_amount_is_refused():
+    from data.adjustments import factors_from_dividends
+
+    weeks = pd.date_range("2024-01-01", periods=10, freq="W-MON", tz="UTC")
+    bars = pd.DataFrame({"close": np.full(10, 20.0)}, index=weeks)
+    with pytest.raises(ContractViolation):
+        factors_from_dividends(bars, [("2024-02-05", -0.5)])

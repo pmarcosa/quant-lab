@@ -118,17 +118,15 @@ def weekly_bars(payload: Mapping[str, Any], as_of: datetime) -> pd.DataFrame:
 
 
 def dividends(payload: Mapping[str, Any]) -> tuple[Dividend, ...]:
-    """The cash dividends a ``get_price_history`` answer lists, oldest first."""
-    found = []
-    for action in payload.get("corp_actions") or ():
-        if action.get("type") != "CashDividends":
-            continue
-        stamp = str(action["date"])
-        found.append(Dividend(
-            ex_date=date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8])),
-            amount=float(action["value"]), currency=str(action.get("currency", "USD")),
-        ))
-    return tuple(sorted(found, key=lambda d: d.ex_date))
+    """The cash dividends a ``get_price_history`` answer lists, oldest first.
+
+    Per share as the bars count shares: a dividend paid before a split is
+    divided by what the split made of each share (``data.vendor.connector_dividends``).
+    """
+    from data.vendor import connector_dividends
+
+    return tuple(Dividend(ex_date=ex, amount=amount, currency=currency)
+                 for ex, amount, currency in connector_dividends(payload))
 
 
 def other_actions(payload: Mapping[str, Any]) -> tuple[str, ...]:

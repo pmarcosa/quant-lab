@@ -132,6 +132,51 @@ def factors_from(trades: pd.DataFrame, adjusted: pd.DataFrame) -> pd.Series:
     return factors
 
 
+def factors_from_dividends(weekly: pd.DataFrame, dividends) -> pd.Series:
+    """Weekly dividend factors from a list of cash dividends, for bars without ADJUSTED_LAST.
+
+    The broker connector's weekly history lists each cash dividend (ex-date and
+    amount) beside TRADES bars, but has no ADJUSTED_LAST series to divide by. The
+    factor is then built the way IBKR builds it: a dividend that went ex in some
+    week multiplies every *earlier* week by ``1 - amount / close of the week
+    before``. The ex-week itself and everything after keep their prices, so the
+    latest factor is 1. Each factor is dated on its bar's own label, so every bar
+    is covered and :func:`factor_for` finds it from the week's end.
+
+    Args:
+        weekly: Weekly TRADES bars labelled by the week's first day, oldest first.
+        dividends: ``(ex_date, amount)`` pairs, in any order.
+
+    Returns:
+        One factor per bar, indexed by date (empty when there are no bars).
+
+    Raises:
+        ContractViolation: If a dividend is not a positive amount.
+    """
+    if weekly.empty:
+        return pd.Series(dtype=float, name="factor")
+    labels = session_dates(weekly.index)
+    starts = labels - pd.to_timedelta(labels.dayofweek, unit="D")   # the week's Monday
+    closes = weekly["close"].astype(float).to_numpy()
+    scale = np.ones(len(weekly))
+    for ex_date, amount in dividends:
+        amount = float(amount)
+        if not np.isfinite(amount) or amount <= 0:
+            raise ContractViolation(f"a dividend of {amount} on {ex_date} is not a positive amount")
+        ex = pd.Timestamp(ex_date).normalize()
+        ex_monday = ex - pd.Timedelta(days=int(ex.dayofweek))
+        earlier = starts < ex_monday
+        if not earlier.any() or ex_monday > starts[-1]:
+            continue    # paid before the first bar, or in a week not in the history yet
+        before = closes[np.flatnonzero(earlier)[-1]]
+        if before <= 0 or amount >= before:
+            continue
+        scale[earlier] *= 1.0 - amount / before
+    factors = pd.Series(scale, index=labels, name="factor")
+    factors.index.name = "date"
+    return factors.groupby(level=0).last()
+
+
 def merge_factors(stored: pd.Series | None, incoming: pd.Series) -> tuple[pd.Series, float]:
     """Stitch a newer factor download onto the stored table.
 

@@ -208,3 +208,77 @@ def test_a_dry_run_writes_nothing(tmp_path, monkeypatch):
     monkeypatch.setattr(importer, "CACHE", tmp_path / "cache")
     assert importer.main([f"XYZ={source}", "--dry-run"]) == 0
     assert not (tmp_path / "cache").exists()
+
+
+def test_isolated_bad_prints_are_brought_back_to_the_body():
+    """BSX's week of 2009-01-12 as IBKR lists it: a low of 0.01 under 7.65-7.87."""
+    import pandas as pd
+
+    from data.vendor import clip_bad_prints
+
+    index = pd.to_datetime(["2009-01-05", "2009-01-12", "2009-01-19", "2008-10-06"])
+    bars = pd.DataFrame({
+        "open": [7.50, 7.65, 7.80, 22.50], "high": [7.90, 7.95, 9000.0, 24.40],
+        "low": [7.40, 0.01, 7.70, 6.71], "close": [7.66, 7.87, 7.90, 9.68],
+        "volume": [1, 1, 1, 1]}, index=index)
+    fixed, changes = clip_bad_prints(bars)
+    assert fixed.loc["2009-01-12", "low"] == 7.65
+    assert fixed.loc["2009-01-19", "high"] == 7.90
+    # A genuine crash week (Morgan Stanley, October 2008) is left as it traded.
+    assert fixed.loc["2008-10-06", "low"] == 6.71
+    assert len(changes) == 2
+    assert fixed[["open", "close", "volume"]].equals(bars[["open", "close", "volume"]])
+
+
+def test_dividends_paid_before_a_split_are_counted_in_todays_shares():
+    """NVIDIA lists 0.04 a share in March 2024, three months before its 10-for-1."""
+    from datetime import date
+
+    from data.vendor import connector_dividends
+
+    payload = {"corp_actions": [
+        {"type": "CashDividends", "date": "20240305", "value": "0.04", "currency": "USD"},
+        {"type": "CashDividends", "date": "20240611", "value": "0.01", "currency": "USD"},
+        {"type": "CashDividends", "date": "20200601", "value": "0.16", "currency": "USD"},
+        {"type": "Splits", "date": "20240610", "value": "10.0"},
+        {"type": "StockDividends", "date": "20210720", "value": "4.0"},
+        {"type": "Splits", "date": "20110509", "value": "0.1"},       # a reverse split
+        {"type": "CashDividends", "date": "20110101", "value": "0.01", "currency": "USD"},
+    ]}
+    paid = {ex: amount for ex, amount, _ in connector_dividends(payload)}
+    assert paid[date(2024, 6, 11)] == pytest.approx(0.01)     # after the split: as listed
+    assert paid[date(2024, 3, 5)] == pytest.approx(0.004)
+    assert paid[date(2020, 6, 1)] == pytest.approx(0.004)     # 0.16 / 4 / 10
+    assert paid[date(2011, 1, 1)] == pytest.approx(0.01 / (0.1 * 4 * 10))
+    assert list(paid) == sorted(paid)
+
+
+def test_a_share_action_without_a_positive_ratio_is_refused():
+    from data.vendor import connector_dividends
+
+    with pytest.raises(ContractViolation):
+        connector_dividends({"corp_actions": [{"type": "Splits", "date": "20240610",
+                                               "value": "0"}]})
+
+
+def test_a_spin_off_listed_as_a_split_does_not_rescale_the_dividends():
+    """Honeywell 2026: 'Splits 0.5', yet the dividend went from 1.19 to 0.70."""
+    from datetime import date
+
+    from data.vendor import connector_dividends
+
+    spin = {"corp_actions": [
+        {"type": "CashDividends", "date": "20260515", "value": "1.19"},
+        {"type": "Splits", "date": "20260629", "value": "0.5"},
+        {"type": "CashDividends", "date": "20260814", "value": "0.7"},
+    ]}
+    paid = {ex: amount for ex, amount, _ in connector_dividends(spin)}
+    assert paid[date(2026, 5, 15)] == pytest.approx(1.19)
+
+    reverse = {"corp_actions": [                              # Duke Energy, 2012
+        {"type": "CashDividends", "date": "20120511", "value": "0.255"},
+        {"type": "Splits", "date": "20120703", "value": "0.3333"},
+        {"type": "CashDividends", "date": "20120814", "value": "0.765"},
+    ]}
+    paid = {ex: amount for ex, amount, _ in connector_dividends(reverse)}
+    assert paid[date(2012, 5, 11)] == pytest.approx(0.255 / 0.3333)

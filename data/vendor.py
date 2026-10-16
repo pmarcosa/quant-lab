@@ -20,9 +20,11 @@ a change in the data shows up in a review.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import date
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from contracts.errors import ContractViolation
@@ -88,6 +90,112 @@ def bars_from_connector(payload: Mapping[str, Any]) -> pd.DataFrame:
     if frame.index.duplicated().any():
         raise ContractViolation("payload contains two bars for the same timestamp")
     return frame
+
+
+#: Corporate actions that change the number of shares: their ``value`` is new
+#: shares per old one (a 10-for-1 split is 10.0, a 1-for-10 reverse split 0.1,
+#: NVIDIA's 2021 four-for-one, listed as a stock dividend, 4.0).
+SHARE_ACTIONS = ("Splits", "StockDividends")
+
+
+def connector_dividends(payload: Mapping[str, Any]) -> tuple[tuple[date, float, str], ...]:
+    """The cash dividends a price-history answer lists, per share as it trades today.
+
+    The answer lists each dividend per share *as it was paid*, while its bars are
+    adjusted for every split since. A dividend paid before a split is therefore
+    divided by the shares each old share became -- the product of the
+    ``SHARE_ACTIONS`` dated after its ex-date. Left as listed, NVIDIA's 0.16 of
+    2020 would be set against a split-adjusted price of about 0.60 and take a
+    quarter off every earlier bar.
+
+    Returns:
+        ``(ex_date, amount, currency)``, oldest first.
+
+    Raises:
+        ContractViolation: If a share action's ratio is not a positive number.
+    """
+    actions = payload.get("corp_actions") or ()
+    listed = sorted(
+        (_day(a["date"]), float(a["value"]), str(a.get("currency", "USD")))
+        for a in actions if a.get("type") == "CashDividends"
+    )
+    changes = []
+    for action in actions:
+        if action.get("type") in SHARE_ACTIONS:
+            ratio = float(action["value"])
+            if not np.isfinite(ratio) or ratio <= 0:
+                raise ContractViolation(
+                    f"{action.get('type')} on {action.get('date')} has ratio {ratio}")
+            day = _day(action["date"])
+            if ratio < 1.0 and not _reverse_split(day, ratio, listed):
+                continue
+            changes.append((day, ratio))
+    found = []
+    for ex, amount, currency in listed:
+        later = float(np.prod([ratio for day, ratio in changes if day > ex])) if changes else 1.0
+        found.append((ex, amount / later, currency))
+    return tuple(found)
+
+
+def _reverse_split(day: date, ratio: float, listed) -> bool:
+    """Whether a share action below 1 behaves like a reverse split in the dividends.
+
+    IBKR lists a spin-off's price adjustment as a split too (Honeywell, 0.5 on
+    2026-06-29), and a spin-off leaves each share a share. A reverse split of
+    1-for-n multiplies the dividend per share by about n; a spin-off cuts it. So
+    the last dividend before, scaled as if the shares had been consolidated, is
+    compared with the first one after: within a factor of 2.5 it was a reverse
+    split (Duke Energy 2012: 0.25 / 0.333 = 0.75 against 0.765 after); further
+    apart, or with no dividend on one side to compare, it is not counted.
+    """
+    before = [amount for ex, amount, _ in listed if ex < day]
+    after = [amount for ex, amount, _ in listed if ex >= day]
+    if not before or not after:
+        return not before and not after   # nothing to scale either way
+    scaled, first = before[-1] / ratio, after[0]
+    return max(scaled, first) / max(min(scaled, first), 1e-12) <= 2.5
+
+
+def _day(stamp: Any) -> date:
+    text = str(stamp).replace("-", "")
+    return date(int(text[:4]), int(text[4:6]), int(text[6:8]))
+
+
+def clip_bad_prints(
+    bars: pd.DataFrame, low_ratio: float = 0.5, high_ratio: float = 1.5
+) -> tuple[pd.DataFrame, list[str]]:
+    """Bars with isolated bad prints in their high or low brought back to the body.
+
+    IBKR's long weekly histories carry the odd bad tick in a bar's extremes -- a
+    low of 0.01 under a week that opened at 7.65 and closed at 7.87, a high of
+    10,000 above one that never left 25. The open and the close are fine; only
+    the extreme is not. A stop checked against such a low fires, and fills at a
+    price that never traded. A low below ``low_ratio`` times the lower of the
+    open and close, or a high above ``high_ratio`` times the higher, is set to
+    that body edge. Genuine crash weeks stay: the worst large-cap weeks of 2008
+    and March 2020 had lows above 0.55 of the body.
+
+    Returns:
+        The repaired bars and one line per bar changed, for the record.
+    """
+    if not 0.0 < low_ratio < 1.0 < high_ratio:
+        raise ContractViolation(
+            f"low_ratio must be in (0, 1) and high_ratio above 1; got {low_ratio}, {high_ratio}")
+    out = bars.copy()
+    body_low = out[["open", "close"]].min(axis=1)
+    body_high = out[["open", "close"]].max(axis=1)
+    low_bad = out["low"] < low_ratio * body_low
+    high_bad = out["high"] > high_ratio * body_high
+    changes = [
+        f"{pd.Timestamp(stamp).date()}: low {out.at[stamp, 'low']:g} -> {body_low[stamp]:g}"
+        for stamp in out.index[low_bad]
+    ] + [
+        f"{pd.Timestamp(stamp).date()}: high {out.at[stamp, 'high']:g} -> {body_high[stamp]:g}"
+        for stamp in out.index[high_bad]
+    ]
+    out.loc[low_bad, "low"] = body_low[low_bad]
+    out.loc[high_bad, "high"] = body_high[high_bad]
+    return out, changes
 
 
 def write_cache_csv(

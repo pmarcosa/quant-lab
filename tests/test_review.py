@@ -666,6 +666,18 @@ def test_stop_checks_name_what_is_wrong(universe: str):
     assert len(result["stops"]["cancel"]) == 4, "a rotation replaces every stop, strays included"
 
 
+def test_a_stop_the_price_went_through_without_filling_is_a_problem(universe: str):
+    held = {"RISE": (10, 200.0), "PLOD": (4, 100.0)}
+    orders = [stop_order("RISE", 10, 176.0, 1), stop_order("PLOD", 4, 125.97, 2)]
+    result = weekly.review(payloads(held=held, cash=5_620.0, orders=orders),
+                           definition(universe), MONDAY)
+    problems = "\n".join(result["stop_checks"]["problems"])
+    assert "PLOD: price" in problems and "has triggered and has not filled" in problems
+    assert "order 2" in problems
+    assert "RISE" not in problems, "a stop below the price is resting as it should"
+    assert result["stop_checks"]["ok"] is False
+
+
 # -- monitoring ------------------------------------------------------------------------------
 
 

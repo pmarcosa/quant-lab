@@ -470,7 +470,11 @@ def review(
     sells = sum(o["quantity"] * o["limit"] for o in orders if o["side"] == "SELL")
 
     # -- stops -------------------------------------------------------------------
-    checks = _stop_checks({p.symbol: p.quantity for p in managed}, working)
+    checks = _stop_checks(
+        {p.symbol: p.quantity for p in managed}, working,
+        prices={p.symbol: quotes.get(p.symbol) or p.market_price or closes.get(p.symbol)
+                for p in managed},
+    )
     stops: dict[str, Any] = {"replace": False, "cancel": [], "place": []}
     rule = definition.risk.stop()
     if rotation and rule is not None and ladder is not DegradationState.HALTED:
@@ -648,8 +652,18 @@ def _scan(table: pd.DataFrame, best: Sequence[str], target: Mapping[str, float],
     return rows
 
 
-def _stop_checks(held: Mapping[str, float], working: Sequence[connector.OpenOrder]) -> dict[str, Any]:
-    """Whether every position has one resting stop for all of its shares."""
+def _stop_checks(held: Mapping[str, float], working: Sequence[connector.OpenOrder],
+                 prices: Mapping[str, float | None] | None = None) -> dict[str, Any]:
+    """Whether every position has one resting stop for all of its shares.
+
+    A stop limit whose trigger the price has already gone through, and that is
+    still resting, has triggered without filling: the market opened or fell
+    below its limit. The position is then unprotected even though a stop is
+    "there", so it is named as a problem. ``prices`` is the latest price of
+    each position (a quote, else the broker's mark, else the week's close).
+    What to do about it is not decided here.
+    """
+    prices = prices or {}
     stops = [o for o in working if o.is_stop and o.side == "SELL"]
     by_symbol: dict[str, list[connector.OpenOrder]] = {}
     for order in stops:
@@ -673,6 +687,15 @@ def _stop_checks(held: Mapping[str, float], working: Sequence[connector.OpenOrde
             problems.append(f"{symbol}: the stop is for {covered:g} shares, the position is {quantity:g}")
         if any(not o.good_till_cancelled for o in mine):
             problems.append(f"{symbol}: its stop is not good-till-cancelled")
+        price = prices.get(symbol)
+        for order in mine:
+            if price and order.stop_price is not None and price <= order.stop_price:
+                limit = f"{order.limit_price:.2f}" if order.limit_price is not None else "?"
+                problems.append(
+                    f"{symbol}: price {price:.2f} is at or below its stop {order.stop_price:.2f}; "
+                    f"the stop has triggered and has not filled (limit {limit}, order "
+                    f"{order.order_id}): the position is not protected"
+                )
     for symbol, orders in sorted(by_symbol.items()):
         if symbol not in held:
             label = symbol or "an order whose description could not be read"
